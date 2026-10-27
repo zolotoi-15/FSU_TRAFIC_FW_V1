@@ -1,0 +1,326 @@
+{
+  "meta": {
+    "version": 1.0,
+    "id": 5555,
+    "name": "Тестовая мастерская — 2 направления + дублёр + пешеход (MESH)"
+  },
+
+  "espnow": {
+    "enabled": true,
+    "channel": 3,
+    "slave_mac": "",
+    "status_period_ms": 1000
+  },
+
+  "wifi": {
+    "ssid": "Keenetic-4251",
+    "password": "VTuVMHPi"
+  },
+
+  "timezone": "MSK-3",
+
+  "mqtt": {
+    "enabled": true,
+    "uri": "mqtt://m2.wqtt.ru",
+    "port": 13257,
+    "user": "u_GGENLB",
+    "password": "LTHNW22D",
+    "base_topic": "FSU_Trafic",
+    "timepause_min": 5
+  },
+
+  "signalGroups": {
+    "default": {
+      "amber": 3,
+      "amberBlink": 4,
+      "greenBlink": 3,
+      "minGreen": 4,
+      "minRed": 3,
+      "redAmber": 2
+    },
+    "items": [
+      { "id": 1, "name": "Направление 1",        "type": "traffic" },
+      { "id": 2, "name": "Направление 2",        "type": "traffic" },
+      { "id": 3, "name": "Дублёр (напр. 3)",     "type": "traffic", "minRed": 1 },
+      { "id": 4, "name": "Пешеходный (напр. 4)", "type": "pedestrian", "minRed": 1 }
+    ]
+  },
+
+  "IGM": [
+    {
+      "id": 1,
+      "name": "Матрица. 1",
+      "safety": true,
+      "default": true,
+      "items": [
+        { "clearing": 1, "entering": 2, "time": 6.00 },
+        { "clearing": 1, "entering": 3, "time": 6.00 },
+        { "clearing": 1, "entering": 4, "time": 4.00 },
+        { "clearing": 2, "entering": 1, "time": 6.00 },
+        { "clearing": 2, "entering": 3, "time": 6.00 },
+        { "clearing": 2, "entering": 4, "time": 4.00 },
+        { "clearing": 3, "entering": 1, "time": 4.00 },
+        { "clearing": 3, "entering": 2, "time": 4.00 },
+        { "clearing": 3, "entering": 4, "time": 4.00 },
+        { "clearing": 4, "entering": 1, "time": 3.00 },
+        { "clearing": 4, "entering": 2, "time": 3.00 },
+        { "clearing": 4, "entering": 3, "time": 3.00 }
+      ]
+    }
+  ],
+
+  "stages": [
+    { "id": 1, "name": "Фаза.1 (все красные)",       "groups": [1, 2, 3] },
+    { "id": 2, "name": "Фаза.2 (все зелёные)",       "groups": [1, 2, 3] },
+    { "id": 3, "name": "Фаза.3 (все жёлтые)",        "groups": [1, 2, 3] },
+    { "id": 4, "name": "Фаза.4 (пешеходный)",         "groups": [4] }
+  ],
+
+  "detectors": [
+    { "id": 1, "name": "Детектор.1" }
+  ],
+
+  "plans": [
+    { "id": 2, "name": "Программа.2", "algorithm": { "type": "Special", "mode": "AB" } },
+    {
+      "id": 1,
+      "name": "Программа.1",
+      "algorithm": {
+        "type": "StageRing",
+        "matrix": 1,
+        "sequence": [1, 2, 3, 4],
+        "coordinated": false,
+        "phases": [
+          { "id": 1, "stage": 1, "recall": "min", "passage": 3, "minGreen": 15, "maxGreen": 15 },
+          { "id": 2, "stage": 2, "recall": "min", "passage": 3, "minGreen": 15, "maxGreen": 15 },
+          { "id": 3, "stage": 3, "recall": "min", "passage": 3, "minGreen": 15, "maxGreen": 15 },
+          { "id": 4, "stage": 4, "recall": "min", "minGreen": 15, "maxGreen": 15 }
+        ],
+        "conditions": [
+          { "phase": 1, "control": true, "detector": 1 }
+        ]
+      }
+    }
+  ],
+
+  "schedule": {
+    "days": [
+      { "id": 1, "plans": [ { "plan": 1, "time": "0:0:0", "sparePlan": 2 } ] }
+    ],
+    "weeks": [
+      { "id": 1, "days": [1, 1, 1, 1, 1, 1, 1] }
+    ]
+  },
+
+  "controlSources": [
+    { "id": 2, "name": "JsonRpc-tcp", "priority": 14, "type": "JsonRPC",   "url": "tcp-listen://127.0.0.1:15557/" },
+    { "id": 3, "name": "tcp",         "priority": 15, "type": "JsConsole", "url": "tcp-listen://127.0.0.1:15555/" },
+    { "id": 8, "name": "its",         "priority": 11 },
+    { "id": 9, "name": "emergency",   "priority": 9999 }
+  ],
+
+  "modules": {
+    "SystemBus": {
+      "port": {
+        "baudRate": 921600,
+        "portName": "/dev/ttyO1",
+        "rs485enabled": true,
+        "rs485rtsAfterSend": true
+      },
+      "devices": {
+        "KSK1": {
+          "switches": {
+            "default": { "type": "SP2_SW4" },
+            "items": [
+              { "id": 1,  "name": "1-1",  "addr": 0,  "signalGroup": 1, "control": true,  "heads": 1, "color": "red" },
+              { "id": 2,  "name": "1-2",  "addr": 1,  "signalGroup": 1, "control": false, "heads": 1, "color": "amber" },
+              { "id": 3,  "name": "1-3",  "addr": 2,  "signalGroup": 1, "control": false, "heads": 1, "color": "green" },
+              { "id": 4,  "name": "1-4",  "addr": 3,  "signalGroup": 2, "control": true,  "heads": 1, "color": "red" },
+              { "id": 5,  "name": "1-5",  "addr": 4,  "signalGroup": 2, "control": false, "heads": 1, "color": "amber" },
+              { "id": 6,  "name": "1-6",  "addr": 5,  "signalGroup": 2, "control": false, "heads": 1, "color": "green" },
+              { "id": 7,  "name": "1-7",  "addr": 6,  "signalGroup": 3, "control": true,  "heads": 1, "color": "red" },
+              { "id": 8,  "name": "1-8",  "addr": 7,  "signalGroup": 3, "control": false, "heads": 1, "color": "amber" },
+              { "id": 9,  "name": "1-9",  "addr": 8,  "signalGroup": 3, "control": false, "heads": 1, "color": "green" },
+              { "id": 10, "name": "1-10", "addr": 9,  "signalGroup": 4, "control": true,  "heads": 1, "color": "red" },
+              { "id": 11, "name": "1-11", "addr": 10, "signalGroup": 4, "control": false, "heads": 1, "color": "green" },
+              { "id": 12, "name": "1-12", "addr": 11, "signalGroup": 4, "control": false, "heads": 1, "color": "screen_walk" }
+            ]
+          }
+        }
+      }
+    },
+    "Keyboard": {
+      "deviceName": "/dev/extbuttons",
+      "channels": [
+        { "keyCode": 513 },
+        { "keyCode": 514 },
+        { "keyCode": 515 },
+        { "keyCode": 516 }
+      ]
+    },
+    "SpectrITS": {
+      "controlSource": "its",
+      "controlTimeout": 120,
+      "url": "tcp://81.30.126.14:49500/"
+    },
+    "TrafiCam": [
+      {
+        "ti_host": "172.16.16.234",
+        "ti_port": 6070,
+        "channels": [ { "channel": 1, "detector": 1 } ]
+      }
+    ],
+    "TrafficStream": [
+      { "url": "" },
+      { "url": null }
+    ]
+  },
+
+  "traffic": {
+    "mode": 3,
+    "enabled": true,
+    "auto_start": true,
+
+    "pins": {
+      "single": { "red": 0, "yellow": 1, "green": 2 },
+      "cross": {
+        "a_north": { "red": 0, "yellow": 1, "green": 2 },
+        "a_south": { "red": 3, "yellow": 4, "green": 5 },
+        "b_west":  { "red": 6, "yellow": 7, "green": 8 },
+        "b_east":  { "red": 9, "yellow": 10, "green": 11 }
+      },
+      "cross_ped": {
+        "axis_a":  { "red": 0, "yellow": 1, "green": 2 },
+        "axis_a2": { "red": 3, "yellow": 4, "green": 5 },
+        "axis_a3": { "red": 6, "yellow": 7, "green": 8 },
+        "ped":     { "red": 9, "green": 10 }
+      }
+    },
+
+    "phases_ms": {
+      "red": 8000,
+      "red_yellow": 2000,
+      "green": 10000,
+      "green_blink": 3000,
+      "yellow": 2000,
+      "yellow_blink": 2000,
+      "ped_green": 10000,
+      "ped_blink": 4000,
+      "fault_blink_period": 500,
+      "phase_blink_period": 500
+    },
+
+    "fault": {
+      "imin_mv": 10,
+      "vin_on_min_v": 5.0,
+      "vin_off_min_v": 5.0,
+      "phase_grace_ms": 2500,
+      "recovery_ms": 2000,
+      "vin_off_confirmations": 3
+    },
+
+    "pedestrian": {
+      "button_enabled": true,
+      "request_mode": "min_recall",
+      "insert_timeout_ms": 1000,
+      "min_recall_s": 5
+    },
+
+    "stages_dd": [
+      {
+        "id": 1,
+        "name": "Фаза.1 (все красные: напр.1+2+дублёр+пешеход)",
+        "groups": [1],
+        "duration_kind": "red",
+        "outputs_on": [0, 3, 6, 9],
+        "outputs_blink": []
+      },
+      {
+        "id": 2,
+        "name": "Фаза.2 (все красный+жёлтый: напр.1+2+дублёр)",
+        "groups": [2],
+        "duration_kind": "red_yellow",
+        "outputs_on": [0, 1, 3, 4, 6, 7, 9],
+        "outputs_blink": []
+      },
+      {
+        "id": 3,
+        "name": "Фаза.3 (все зелёные: напр.1+2+дублёр)",
+        "groups": [3],
+        "duration_kind": "green",
+        "outputs_on": [2, 5, 8, 9],
+        "outputs_blink": []
+      },
+      {
+        "id": 4,
+        "name": "Фаза.4 (все зелёные мигающие: напр.1+2+дублёр)",
+        "groups": [4],
+        "duration_kind": "green_blink",
+        "outputs_on": [9],
+        "outputs_blink": [2, 5, 8]
+      },
+      {
+        "id": 5,
+        "name": "Фаза.5 (все жёлтые: напр.1+2+дублёр)",
+        "groups": [5],
+        "duration_kind": "yellow",
+        "outputs_on": [1, 4, 7, 9],
+        "outputs_blink": []
+      },
+      {
+        "id": 6,
+        "name": "Фаза.6 (пешеходный зелёный)",
+        "groups": [6],
+        "duration_kind": "ped_green",
+        "outputs_on": [0, 3, 6, 10],
+        "outputs_blink": []
+      },
+      {
+        "id": 7,
+        "name": "Фаза.7 (пешеходный мигающий)",
+        "groups": [7],
+        "duration_kind": "ped_blink",
+        "outputs_on": [0, 3, 6],
+        "outputs_blink": [10]
+      }
+    ],
+
+    "sequence": [1, 2, 3, 4, 5, 6, 7],
+
+    "transitions": [
+      { "clearing": 1, "entering": 2, "time": 6.00 },
+      { "clearing": 1, "entering": 3, "time": 6.00 },
+      { "clearing": 1, "entering": 4, "time": 4.00 },
+      { "clearing": 2, "entering": 1, "time": 6.00 },
+      { "clearing": 2, "entering": 3, "time": 6.00 },
+      { "clearing": 2, "entering": 4, "time": 4.00 },
+      { "clearing": 3, "entering": 1, "time": 4.00 },
+      { "clearing": 3, "entering": 2, "time": 4.00 },
+      { "clearing": 3, "entering": 4, "time": 4.00 },
+      { "clearing": 4, "entering": 1, "time": 3.00 },
+      { "clearing": 4, "entering": 2, "time": 3.00 },
+      { "clearing": 4, "entering": 3, "time": 3.00 }
+    ]
+  },
+
+  "shift_register": {
+    "outputs": [
+      { "ch": 0,  "name": "1-1",   "active": true },
+      { "ch": 1,  "name": "1-2",   "active": true },
+      { "ch": 2,  "name": "1-3",   "active": true },
+      { "ch": 3,  "name": "1-4",   "active": true },
+      { "ch": 4,  "name": "1-5",   "active": true },
+      { "ch": 5,  "name": "1-6",   "active": true },
+      { "ch": 6,  "name": "1-7",   "active": true },
+      { "ch": 7,  "name": "1-8",   "active": true },
+      { "ch": 8,  "name": "1-9",   "active": true },
+      { "ch": 9,  "name": "1-10",  "active": true },
+      { "ch": 10, "name": "1-11",  "active": true },
+      { "ch": 11, "name": "1-12",  "active": true },
+      { "ch": 12, "name": "spare", "active": false },
+      { "ch": 13, "name": "spare", "active": false },
+      { "ch": 14, "name": "spare", "active": false },
+      { "ch": 15, "name": "spare", "active": false }
+    ]
+  }
+}

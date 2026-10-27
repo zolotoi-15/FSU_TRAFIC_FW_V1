@@ -1,0 +1,15 @@
+# Сборка ESP-IDF
+build/
+build_*_*/
+sdkconfig
+sdkconfig.old
+
+# Сгенерированные файлы
+dependencies.lock
+managed_components/
+
+# Файлы IDE и ОС
+.vscode/
+.idea/
+.DS_Store
+*.log
