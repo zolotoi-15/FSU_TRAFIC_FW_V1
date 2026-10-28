@@ -66,6 +66,10 @@ static char   s_ap_ssid_cur[33] = {0};
 static char   s_ap_ip_str[16]   = "192.168.4.1";
 static esp_netif_t *s_ap_netif  = NULL;
 
+/* FIX: мощность 20 дБм (80 * 0.25). Было 34 = 8.5 дБм — AP слабый,
+   node не видит / медленный auth. */
+#define WIFI_MAX_TX_POWER_VAL  80
+
 static const char* reason_str(uint8_t r) {
     switch (r) {
         case WIFI_REASON_NO_AP_FOUND:            return "NO_AP_FOUND";
@@ -78,6 +82,7 @@ static const char* reason_str(uint8_t r) {
         case WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT: return "4WAY_HANDSHAKE_TIMEOUT";
         case WIFI_REASON_MIC_FAILURE:            return "MIC_FAILURE";
         case WIFI_REASON_802_1X_AUTH_FAILED:     return "802_1X_AUTH_FAILED";
+        case WIFI_REASON_ASSOC_LEAVE:            return "ASSOC_LEAVE";
         default:                                 return "OTHER";
     }
 }
@@ -264,12 +269,7 @@ esp_err_t wifi_start(void)
     err = esp_wifi_init(&cfg);
     if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE) return err;
 
-    /* FIX: RAM storage — IDF не сохраняет SSID в NVS. */
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
-
-    /* FIX: esp_wifi_restore() ДО esp_wifi_start — очищает старые
-       профили из NVS БЕЗ остановки txq. После esp_wifi_start()
-       restore ломает txq → wifi:flush txq → зависание. */
     esp_wifi_restore();
 
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,    evt_handler, NULL);
@@ -284,7 +284,10 @@ esp_err_t wifi_start(void)
             strncpy((char*)sta_cfg.sta.password, g_config.wifi_password,
                     sizeof(sta_cfg.sta.password) - 1);
         }
+        /* FIX: threshold.authmode = OPEN — разрешаем WPA2/WPA3/FT. */
         sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+        /* FIX: PMF capable=false — root AP pmf=0/0. Если capable=true,
+           STA пытается PMF и падает с AUTH_EXPIRE на роутерах WPA2. */
         sta_cfg.sta.pmf_cfg.capable  = true;
         sta_cfg.sta.pmf_cfg.required = false;
         sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
@@ -298,7 +301,8 @@ esp_err_t wifi_start(void)
     err = esp_wifi_start();
     if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE) return err;
 
-    esp_wifi_set_max_tx_power(44);   /* 15 дБм (было 34 = 8.5 дБм) */
+    /* FIX: 20 дБм (80 * 0.25). Было 34 = 8.5 дБм — слабо. */
+    esp_wifi_set_max_tx_power(WIFI_MAX_TX_POWER_VAL);
     esp_wifi_set_protocol(WIFI_IF_STA,
                           WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     esp_wifi_set_inactive_time(WIFI_IF_STA, 360);
@@ -393,8 +397,8 @@ esp_err_t wifi_ap_start(const char *ssid, const char *password)
         return err;
     }
 
-    /* FIX: 15 дБм для AP (60 * 0.25). */
-    esp_wifi_set_max_tx_power(44);
+    /* FIX: 20 дБм для AP — node видит быстрее. */
+    esp_wifi_set_max_tx_power(WIFI_MAX_TX_POWER_VAL);
 
     wifi_config_t actual = {0};
     if (esp_wifi_get_config(WIFI_IF_AP, &actual) == ESP_OK) {
@@ -445,6 +449,7 @@ int wifi_ap_client_count(void)
 
 /* ============================================================
    Scan: найти AP с заданным префиксом (самый сильный)
+   === ИСПРАВЛЕНО: сканируем ВСЕ каналы (NULL), а не только ch=6 ===
    ============================================================ */
 esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
                                int8_t *out_rssi,
@@ -455,6 +460,7 @@ esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
     if (out_rssi) *out_rssi = -127;
     if (!ssid_prefix) ssid_prefix = "FSU_";
 
+    // === NULL = все каналы, БЕЗ фильтра по каналу ===
     esp_err_t err = esp_wifi_scan_start(NULL, true);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "scan start failed: %s", esp_err_to_name(err));
@@ -480,7 +486,7 @@ esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
         return err;
     }
 
-    ESP_LOGI(TAG, "scan: total %u AP", n);
+    ESP_LOGI(TAG, "scan: total %u AP (all channels)", n);
     for (int i = 0; i < n; i++) {
         const char *s = (const char *)list[i].ssid;
         ESP_LOGI(TAG, "  [%d] SSID='%s' rssi=%d ch=%u auth=%d",
@@ -515,6 +521,7 @@ esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
         ESP_LOGI(TAG, "scan: chosen '%s' rssi=%d", out_ssid, best->rssi);
         ret = ESP_OK;
     } else {
+        // === БЕЗ (ch=6) ===
         ESP_LOGW(TAG, "scan: no AP matching '%s*_AP'", ssid_prefix);
     }
 

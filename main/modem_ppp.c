@@ -58,6 +58,9 @@ static volatile bool s_connected = false;
 static char          s_ip[16]    = "0.0.0.0";
 static char          s_apn[64]   = {0};
 
+// === SIM READY: флаг, что модем ответил +CPIN: READY ===
+static volatile bool s_sim_ready = false;
+
 
 /* Прямой UART-тест: шлём "AT\r\n", ждём "OK".
    Возвращает baud, на котором модем ответил OK, или 0. */
@@ -101,6 +104,20 @@ static uint32_t modem_uart_find_baud(void)
             if (n > 0) {
                 ESP_LOGW(TAG, "  rx %d bytes: '%.*s'",
                          n, n, (char *)rx);
+
+                // === SIM READY: парсим +CPIN: READY в ответе модема ===
+                // Ответ может быть: "AT\r\nOK\r\n\r\n+CPIN: READY\r\n"
+                // Используем memmem, т.к. rx может содержать \0.
+                if (memmem(rx, n, "+CPIN: READY", 12) != NULL) {
+    if (!s_sim_ready) {
+        ESP_LOGI(TAG, "SIM ready (+CPIN: READY) → PPPoS preferred over WiFi STA");
+        s_sim_ready = true;
+        // === НОВОЕ: мгновенно отключаем STA, чтобы IDF не спамил ===
+        
+       
+    }
+}
+
                 if (memmem(rx, n, "OK", 2)) {
                     ok = true;
                 }
@@ -163,6 +180,17 @@ static int modem_uart_probe(uint32_t baud)
             total_rx += n;
             ESP_LOGW(TAG, "probe attempt %d: rx %d bytes: '%.*s'",
                      attempt + 1, n, n, (char *)rx);
+
+            // === SIM READY: тоже парсим здесь (на случай, если
+            // modem_uart_find_baud не увидел +CPIN) ===
+            if (memmem(rx, n, "+CPIN: READY", 12) != NULL) {
+                if (!s_sim_ready) {
+                    ESP_LOGI(TAG, "SIM ready (+CPIN: READY) → "
+                                  "PPPoS preferred over WiFi STA");
+                    s_sim_ready = true;
+                }
+            }
+
             if (memchr(rx, 'O', n) || memchr(rx, 'K', n)) {
                 ESP_LOGW(TAG, "probe: OK detected at baud=%lu",
                          (unsigned long)baud);
@@ -409,4 +437,10 @@ bool modem_ppp_is_connected(void)
 const char *modem_ppp_get_ip(void)
 {
     return s_ip;
+}
+
+// === SIM READY: публичный геттер ===
+bool modem_ppp_sim_ready(void)
+{
+    return s_sim_ready;
 }

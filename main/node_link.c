@@ -30,6 +30,9 @@ static volatile bool s_running    = false;
 static SemaphoreHandle_t s_send_mutex        = NULL;
 static SemaphoreHandle_t s_client_send_mutex = NULL;
 
+// === ВАРИАНТ B: семафор для ожидания подключения node (root) ===
+static SemaphoreHandle_t s_client_connected_sem = NULL;
+
 #define NODE_LINK_MAX_MSG 32768
 
 #define NODE_LINK_SNDTIMEO_S  2
@@ -155,6 +158,12 @@ static void server_task(void *arg)
             }
         }
 
+        // === ВАРИАНТ B: сигналим, что node подключён и cfg отправлен ===
+        if (!s_client_connected_sem)
+            s_client_connected_sem = xSemaphoreCreateBinary();
+        if (s_client_connected_sem)
+            xSemaphoreGive(s_client_connected_sem);
+
         size_t acc = 0;
         while (s_running) {
             int n = recv(cfd, buf + acc, NODE_LINK_MAX_MSG - acc - 1, 0);
@@ -197,6 +206,8 @@ esp_err_t node_link_server_start(uint16_t port)
     if (!s_send_mutex) s_send_mutex = xSemaphoreCreateMutex();
     if (!s_send_mutex) return ESP_ERR_NO_MEM;
     if (!s_client_send_mutex) s_client_send_mutex = xSemaphoreCreateMutex();
+    // === ВАРИАНТ B: создаём семафор ожидания node ===
+    if (!s_client_connected_sem) s_client_connected_sem = xSemaphoreCreateBinary();
     s_running = true;
     xTaskCreate(server_task, "node_srv", 6144, NULL, 6, NULL);
     return ESP_OK;
@@ -463,4 +474,25 @@ void node_link_stop(void)
     if (s_client_sock >= 0) { close(s_client_sock); s_client_sock = -1; }
     if (s_root_client_sock >= 0) { close(s_root_client_sock); s_root_client_sock = -1; }
     s_client_connected = false;
+}
+
+// === ВАРИАНТ B: новые функции ===
+
+bool node_link_wait_for_client(uint32_t timeout_ms)
+{
+    if (s_root_client_sock >= 0) return true;
+    if (!s_client_connected_sem)
+        s_client_connected_sem = xSemaphoreCreateBinary();
+    if (!s_client_connected_sem) return false;
+    TickType_t ticks = (timeout_ms == 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+    return xSemaphoreTake(s_client_connected_sem, ticks) == pdTRUE;
+}
+
+void node_link_force_reconnect(void)
+{
+    ESP_LOGW(TAG, "force_reconnect: closing node socket");
+    if (s_root_client_sock >= 0) {
+        close(s_root_client_sock);
+        s_root_client_sock = -1;
+    }
 }

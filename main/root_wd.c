@@ -175,7 +175,8 @@ static void phase_sync_task(void *arg)
                     }
                 }
                 traffic_fault_t f = traffic_light_get_fault();
-                uint32_t interval = (f == TRAFFIC_FAULT_YELLOW_BLINK) ? 100 : 250;
+                uint32_t interval = (f == TRAFFIC_FAULT_YELLOW_BLINK) ? 100 : 500;
+
                 bool need = (phase != last_phase) || (now - last_ms >= interval);
                 if (need) {
                     wifi_mqtt_notify_phase(phase, pm, dur);

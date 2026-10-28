@@ -18,6 +18,7 @@ esp_err_t modem_ppp_stop(void);
 /* Состояние / IP. */
 bool        modem_ppp_is_connected(void);
 const char *modem_ppp_get_ip(void);
+bool modem_ppp_sim_ready(void);
 
 #ifdef __cplusplus
 }

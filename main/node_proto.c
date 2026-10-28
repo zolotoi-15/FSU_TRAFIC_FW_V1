@@ -27,10 +27,17 @@ static const char *TAG = "node_proto";
 #define NODE_COMM_CHECK_MS    500
 #define RTT_MAX_VALID_US      200000
 
-//#define AP_RETRY_MIN_INTERVAL_US  (30000000LL)
-#define AP_RETRY_MIN_INTERVAL_US  (5000000LL)   // 5 с (было 30 с)
-#define AP_RETRY_POLL_MS          2000          // 2 с (было 10000)
-#define NODE_AP_REBOOT_MS   (60 * 1000)   // 60 с
+#define AP_RETRY_MIN_INTERVAL_US  (5000000LL)   // 5 с
+#define AP_RETRY_POLL_MS          2000          // 2 с
+
+// === ВАРИАНТ B: 120 с (было 60) — запас на смену канала AP ===
+#define NODE_AP_REBOOT_MS   (120 * 1000)
+
+// === НОВОЕ: лимит попыток STA-подключения ===
+#define NODE_AP_MAX_ATTEMPTS  5
+
+// === ВАРИАНТ B: флаг форсированного переподключения Wi-Fi ===
+static volatile bool s_force_wifi_reconnect = false;
 
 volatile bool s_fault_from_remote_ex = false;
 
@@ -281,13 +288,15 @@ static void on_cmd_from_root(const char *cmd, size_t len)
                 return;
             }
             uint32_t delay_us = s_node_delay_us;
-            uint32_t corrected_pm = pm + delay_us / 1000;
-            if (dur > 0 && corrected_pm >= dur) {
-                ESP_LOGD(TAG, "sync: pm_corr=%lu >= dur=%lu (skip)",
-                         (unsigned long)corrected_pm, (unsigned long)dur);
-                return;
-            }
-            traffic_light_force_phase((uint8_t)ph, corrected_pm, dur);
+uint32_t corrected_pm = pm + delay_us / 1000;
+if (dur > 0 && corrected_pm >= dur) {
+    // === FIX: не skip, а clamp к dur-1, чтобы force_phase сбросил phase_ms ===
+    ESP_LOGD(TAG, "sync: pm_corr=%lu >= dur=%lu → clamp to %lu",
+             (unsigned long)corrected_pm, (unsigned long)dur,
+             (unsigned long)(dur - 1));
+    corrected_pm = dur - 1;
+}
+traffic_light_force_phase((uint8_t)ph, corrected_pm, dur);
             return;
         }
     }
@@ -561,22 +570,39 @@ static void node_send_task(void *arg)
 
 /* ============================================================
    node_ap_retry_task
+   === ВАРИАНТ B FIX: убран esp_wifi_restore() ===
+   === НОВОЕ: лимит попыток + vTaskDelay перед первым сканом ===
    ============================================================ */
 static void node_ap_retry_task(void *arg)
 {
-    ESP_LOGI(TAG, "node_ap_retry_task started (reboot if not connected in %d ms)",
-             NODE_AP_REBOOT_MS);
-    int64_t  s_last_connect_us = 0;
-    bool     s_nvs_restored    = false;
-    int64_t  s_first_attempt_us = 0;   // ← когда начали попытки
+    ESP_LOGI(TAG, "node_ap_retry_task started (max %d attempts, "
+                  "then stop until reboot)",
+             NODE_AP_MAX_ATTEMPTS);
+
+    // === НОВОЕ: дать Wi-Fi время на инициализацию перед первым сканом ===
+    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    int64_t  s_last_connect_us   = 0;
+    int64_t  s_first_attempt_us  = 0;
+    int      s_attempts          = 0;
+    bool     s_stopped           = false;
 
     while (1) {
+        if (s_force_wifi_reconnect) {
+            ESP_LOGW(TAG, "force Wi-Fi reconnect (TCP lost, AP channel may have changed)");
+            s_force_wifi_reconnect = false;
+            esp_wifi_disconnect();
+            s_first_attempt_us = 0;
+            s_last_connect_us  = 0;
+            s_attempts         = 0;
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
         if (!wifi_sta_connected()) {
             if (!wifi_sta_connecting()) {
                 int64_t now = esp_timer_get_time();
                 if (s_first_attempt_us == 0) s_first_attempt_us = now;
 
-                /* FIX: если не подключились за 60 с — reboot. */
                 if ((now - s_first_attempt_us) > (NODE_AP_REBOOT_MS * 1000LL)) {
                     ESP_LOGE(TAG, "NODE: not connected to root AP for %d s → REBOOT",
                              NODE_AP_REBOOT_MS / 1000);
@@ -586,16 +612,25 @@ static void node_ap_retry_task(void *arg)
 
                 if (s_last_connect_us == 0 ||
                     (now - s_last_connect_us) > AP_RETRY_MIN_INTERVAL_US) {
+
+                    if (s_attempts >= NODE_AP_MAX_ATTEMPTS && !s_stopped) {
+                        ESP_LOGE(TAG, "NODE: %d STA connect attempts failed → "
+                                      "STOP scanning until reboot",
+                                 s_attempts);
+                        s_stopped = true;
+                        esp_wifi_disconnect();
+                        vTaskDelete(NULL);
+                    }
+
                     char   ap_ssid[33] = {0};
                     int8_t ap_rssi = -127;
                     if (wifi_scan_for_fsu_ap(ap_ssid, sizeof(ap_ssid),
                                              &ap_rssi, "FSU_") == ESP_OK) {
-                        ESP_LOGI(TAG, "retry: found '%s' rssi=%d, connecting",
-                                 ap_ssid, ap_rssi);
-                        if (!s_nvs_restored) {
-                            esp_wifi_restore();
-                            s_nvs_restored = true;
-                        }
+                        s_attempts++;
+                        ESP_LOGI(TAG, "retry: found '%s' rssi=%d, connecting "
+                                      "(attempt %d/%d)",
+                                 ap_ssid, ap_rssi,
+                                 s_attempts, NODE_AP_MAX_ATTEMPTS);
                         wifi_config_t sta_cfg = {0};
                         strncpy((char*)sta_cfg.sta.ssid, ap_ssid,
                                 sizeof(sta_cfg.sta.ssid) - 1);
@@ -608,13 +643,19 @@ static void node_ap_retry_task(void *arg)
                         esp_wifi_connect();
                         s_last_connect_us = now;
                     } else {
+                        s_attempts++;
+                        ESP_LOGW(TAG, "retry: no FSU_*_AP found "
+                                      "(attempt %d/%d, root may still be "
+                                      "switching channel or off)",
+                                 s_attempts, NODE_AP_MAX_ATTEMPTS);
                         s_last_connect_us = 0;
                     }
                 }
             }
         } else {
-            s_last_connect_us = 0;
-            s_first_attempt_us = 0;   // ← подключились — сбрасываем таймер
+            s_last_connect_us  = 0;
+            s_first_attempt_us = 0;
+            s_attempts         = 0;
         }
         vTaskDelay(pdMS_TO_TICKS(AP_RETRY_POLL_MS));
     }
@@ -623,6 +664,7 @@ static void node_ap_retry_task(void *arg)
 
 /* ============================================================
    FIX: node_link_watchdog_task — потеря TCP.
+   === ВАРИАНТ B: при разрыве TCP устанавливаем s_force_wifi_reconnect ===
    ============================================================ */
 static void node_link_watchdog_task(void *arg)
 {
@@ -642,10 +684,12 @@ static void node_link_watchdog_task(void *arg)
             s_last_sync_ms = 0;
             s_comm_lost = false;
         } else if (!connected && was_connected) {
-            ESP_LOGW(TAG, "NODE: root TCP disconnected → stop");
+            ESP_LOGW(TAG, "NODE: root TCP disconnected → stop + force Wi-Fi reconnect");
             was_connected = false;
             if (traffic_light_get_state() == TRAFFIC_STATE_RUNNING)
                 traffic_light_stop();
+
+            s_force_wifi_reconnect = true;
         }
 
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);

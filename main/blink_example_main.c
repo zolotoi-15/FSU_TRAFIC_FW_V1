@@ -12,6 +12,10 @@
    FIX: при старте NVS приоритет. Embedded config.json грузится
         ТОЛЬКО если NVS пуст (первая прошивка / после erase-flash).
         Обновление NVS — через /SetJson (MQTT) или erase-flash.
+
+   FIX: STA-first, потом AP. Порядок:
+        1. wifi_start()    — STA (к роутеру / idle)
+        2. wifi_ap_start() — AP (режим APSTA), STA продолжает работать
    ============================================================ */
 
 #include <stdio.h>
@@ -83,7 +87,8 @@ void blink_reset_rtt(void)
     traffic_light_set_sync_delay_us(0);
 }
 
-/* FIX: SNTP по событию IP_EVENT_STA_GOT_IP. */
+/* FIX: SNTP по событию IP_EVENT_STA_GOT_IP (а не в app_main),
+   чтобы стартовать при первом IP, даже если он пришёл позже 15 с. */
 static void on_sta_got_ip(void *arg, esp_event_base_t base,
                           int32_t id, void *data)
 {
@@ -207,12 +212,17 @@ void app_main(void)
     mux_app_task_start();
 
     if (is_root) {
+        /* FIX: регистрируем обработчик GOT_IP ДО wifi_start(). */
         esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                    &on_sta_got_ip, NULL);
 
+        /* FIX: STA-first. */
         esp_err_t err = wifi_start();
         if (err != ESP_OK) ESP_LOGE(TAG, "wifi_start: %s", esp_err_to_name(err));
 
+        /* FIX: AP вторым. set_mode(APSTA) — AP поднимается,
+           STA продолжает работать (переподключится к роутеру
+           автоматически через wifi_monitor_task). */
         const char *ap_ssid = "FSU_Traffic_AP";
         wifi_ap_start(ap_ssid, AP_PASSWORD);
 

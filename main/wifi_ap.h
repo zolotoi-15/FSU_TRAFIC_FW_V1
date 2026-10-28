@@ -11,18 +11,24 @@
 extern "C" {
 #endif
 
-/* ---------- STA (к роутеру / к AP root) ---------- */
+/* ============================================================
+   STA (к роутеру / к AP root)
+   ============================================================ */
 esp_err_t wifi_start(void);
 void      wifi_stop(void);
 
-/* ---------- AP (SoftAP для node) ---------- */
+/* ============================================================
+   AP (SoftAP для node)
+   ============================================================ */
 esp_err_t   wifi_ap_start(const char *ssid, const char *password);
 void        wifi_ap_stop(void);
 bool        wifi_ap_is_running(void);
 const char* wifi_get_ap_ip(void);
 int         wifi_ap_client_count(void);
 
-/* ---------- STA status ---------- */
+/* ============================================================
+   STA status
+   ============================================================ */
 bool        wifi_sta_connected(void);
 bool        wifi_sta_has_ip(void);
 const char* wifi_get_ip(void);
@@ -32,11 +38,22 @@ const char* wifi_get_ip(void);
    не вмешиваться в 4-way handshake. */
 bool        wifi_sta_connecting(void);
 
-/* ---------- AP status ---------- */
+/* ============================================================
+   AP status
+   ============================================================ */
 bool        wifi_ap_running(void);
 const char* wifi_get_ap_ssid(void);
 
-/* ---------- Scan: найти AP с заданным префиксом (самый сильный) ---------- */
+/* ============================================================
+   Scan: найти AP с заданным префиксом (самый сильный).
+
+   FIX: скан только канала 6 (root AP фиксирован). Быстрее
+   в ~6 раз (~300 мс vs ~2 с). Если root сменит канал —
+   изменить `channel` в wifi_scan_for_fsu_ap (wifi_ap.c).
+
+   Возвращает ESP_OK и заполняет out_ssid/out_rssi, если
+   найден AP с префиксом ssid_prefix и суффиксом "_AP".
+   ============================================================ */
 esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
                                int8_t *out_rssi,
                                const char *ssid_prefix);
@@ -45,4 +62,4 @@ esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
 }
 #endif
 
-#endif
+#endif /* WIFI_AP_H */
