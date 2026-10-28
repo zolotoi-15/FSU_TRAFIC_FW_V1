@@ -40,8 +40,8 @@ static const char *TAG = "modem_ppp";
    и выставьте MODEM_USE_RST=1. */
 #define MODEM_USE_RST   1
 
-#define MODEM_BAUD_DEFAULT   57600
-#define MODEM_BAUD_FALLBACK  115200
+#define MODEM_BAUD_DEFAULT   115200
+#define MODEM_BAUD_FALLBACK  57600
 #define MODEM_BOOT_DELAY_MS  15000
 #define MODEM_SYNC_RETRIES   5
 
@@ -66,8 +66,11 @@ static volatile bool s_sim_ready = false;
    Возвращает baud, на котором модем ответил OK, или 0. */
 static uint32_t modem_uart_find_baud(void)
 {
-    static const uint32_t bauds[] = {
+    /*static const uint32_t bauds[] = {
         115200, 9600, 57600, 230400, 460800, 38400, 19200, 74880
+    };*/
+    static const uint32_t bauds[] = {
+        115200, 57600
     };
     const uart_port_t uart_num = MODEM_UART_NUM;
 
