@@ -3,6 +3,7 @@
 #include "config_manager.h"
 #include "modem_ppp.h"
 #include "esp_wifi.h"
+#include "esp_wifi_types.h"   // для wifi_sta_list_t (IDF v6.1+)
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -24,7 +25,6 @@ static const char *TAG = "WIFI";
    ============================================================ */
 static bool s_sta_connected = false;
 static volatile bool s_sta_connecting = false;
-
 static char s_ip[16]        = "0.0.0.0";
 
 static esp_timer_handle_t s_reconnect_timer = NULL;
@@ -66,11 +66,9 @@ static char   s_ap_ssid_cur[33] = {0};
 static char   s_ap_ip_str[16]   = "192.168.4.1";
 static esp_netif_t *s_ap_netif  = NULL;
 
-/* FIX: раздельные TX power для STA и AP.
-   STA: 60 (15 дБм) — меньше помех самому себе (AP+STA на одном канале).
-   AP:  80 (20 дБм) — максимальная дальность для node. */
-#define WIFI_STA_TX_POWER_VAL  34   /* 15 дБм */
-#define WIFI_AP_TX_POWER_VAL   80   /* 20 дБм */
+#define WIFI_STA_TX_POWER_VAL  34
+#define WIFI_AP_TX_POWER_VAL   34
+#define AP_MAX_STA_CONN        4
 
 static const char* reason_str(uint8_t r) {
     switch (r) {
@@ -101,7 +99,6 @@ static esp_err_t wifi_connect_start(void)
 }
 
 static void reconnect_timer_cb(void *arg) {
-    if (modem_ppp_is_connected()) return;
     if (!s_sta_connected && !s_sta_connecting && s_has_saved_ssid) {
         ESP_LOGI(TAG, "Attempting STA reconnect...");
         wifi_connect_start();
@@ -115,7 +112,7 @@ static void ensure_reconnect_timer(void) {
 }
 
 /* ============================================================
-   Общий event handler STA + AP
+   Event handler
    ============================================================ */
 static void evt_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -147,7 +144,7 @@ static void evt_handler(void *arg, esp_event_base_t base, int32_t id, void *data
                  evt->reason, reason_str(evt->reason), evt->rssi);
         if (s_wifi_evt) xEventGroupClearBits(s_wifi_evt, WIFI_CONNECTED_BIT | WIFI_GOT_IP_BIT);
 
-        if (s_has_saved_ssid && !modem_ppp_is_connected()) {
+        if (s_has_saved_ssid) {
             ensure_reconnect_timer();
             esp_timer_stop(s_reconnect_timer);
             esp_timer_start_once(s_reconnect_timer, (uint64_t)s_retry_delay_sec * 1000000ULL);
@@ -204,14 +201,6 @@ static void wifi_monitor_task(void *arg)
     while (1) {
         vTaskDelayUntil(&last, pdMS_TO_TICKS(WIFI_MONITOR_PERIOD_MS));
 
-        if (modem_ppp_is_connected()) {
-            if (s_sta_connected) {
-                ESP_LOGI(TAG, "PPPoS up → disconnect WiFi STA (не нужен)");
-                esp_wifi_disconnect();
-            }
-            continue;
-        }
-
         int64_t now = esp_timer_get_time();
 
         if (s_has_saved_ssid) {
@@ -254,28 +243,41 @@ static void wifi_monitor_task(void *arg)
 }
 
 /* ============================================================
-   wifi_start — STA (к роутеру или к AP root)
+   wifi_init — однократная инициализация.
    ============================================================ */
-esp_err_t wifi_start(void)
+void wifi_init(void)
 {
     esp_err_t err = esp_netif_init();
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_netif_init: %s", esp_err_to_name(err));
+    }
     esp_event_loop_create_default();
 
-    if (!esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"))
+    if (!esp_netif_get_handle_from_ifkey("WIFI_STA_DEF")) {
         esp_netif_create_default_wifi_sta();
+    }
 
     if (!s_wifi_evt) s_wifi_evt = xEventGroupCreate();
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     err = esp_wifi_init(&cfg);
-    if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE) return err;
+    if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE) {
+        ESP_LOGE(TAG, "esp_wifi_init: %s", esp_err_to_name(err));
+    }
 
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
     esp_wifi_restore();
 
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,    evt_handler, NULL);
     esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, evt_handler, NULL);
+}
+
+/* ============================================================
+   wifi_start — STA (для node или резерв на root)
+   ============================================================ */
+esp_err_t wifi_start(void)
+{
+    esp_err_t err;
 
     s_has_saved_ssid = (strlen(g_config.wifi_ssid) > 0);
 
@@ -286,10 +288,7 @@ esp_err_t wifi_start(void)
             strncpy((char*)sta_cfg.sta.password, g_config.wifi_password,
                     sizeof(sta_cfg.sta.password) - 1);
         }
-        /* FIX: threshold.authmode = OPEN — разрешаем WPA2/WPA3/FT. */
         sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-        /* FIX: PMF capable=true — разрешаем PMF, если роутер требует.
-           required=false — не требуем PMF. */
         sta_cfg.sta.pmf_cfg.capable  = true;
         sta_cfg.sta.pmf_cfg.required = false;
         sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
@@ -303,7 +302,6 @@ esp_err_t wifi_start(void)
     err = esp_wifi_start();
     if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE) return err;
 
-    /* FIX: STA 15 дБм (60 * 0.25) — меньше помех AP на том же канале. */
     esp_wifi_set_max_tx_power(WIFI_STA_TX_POWER_VAL);
     esp_wifi_set_protocol(WIFI_IF_STA,
                           WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
@@ -317,8 +315,7 @@ esp_err_t wifi_start(void)
         if (bits & WIFI_GOT_IP_BIT) {
             ESP_LOGI(TAG, "STA ready, IP=%s", s_ip);
         } else {
-            ESP_LOGW(TAG, "STA connect timeout — IP may arrive later "
-                          "(SNTP will start on GOT_IP)");
+            ESP_LOGW(TAG, "STA connect timeout — IP may arrive later");
         }
     }
 
@@ -346,77 +343,127 @@ void wifi_stop(void)
 }
 
 /* ============================================================
-   wifi_ap_start — SoftAP
+   wifi_ap_start_only — только AP (WIFI_MODE_AP), канал 6.
+   Используется на root при старте, пока PPPoS не подтверждён.
+   Beacon «разбужен» для ESP32-S3 (IDF v6.1+).
    ============================================================ */
-esp_err_t wifi_ap_start(const char *ssid, const char *password)
+esp_err_t wifi_ap_start_only(const char *ssid, const char *password)
 {
     if (s_ap_is_running) {
-        ESP_LOGW(TAG, "wifi_ap_start: already running (SSID='%s'), skip",
-                 s_ap_ssid_cur);
+        ESP_LOGW(TAG, "wifi_ap_start_only: already running, skip");
         return ESP_OK;
     }
-    ESP_LOGW(TAG, "wifi_ap_start: called (SSID='%s')", ssid ? ssid : "?");
-
-    if (!ssid || strlen(ssid) == 0) { ESP_LOGE(TAG, "AP: empty SSID"); return ESP_ERR_INVALID_ARG; }
-    if (strlen(ssid) > 32)          { ESP_LOGE(TAG, "AP: SSID too long"); return ESP_ERR_INVALID_ARG; }
-    if (password && strlen(password) > 0 &&
-        (strlen(password) < 8 || strlen(password) > 64)) {
-        ESP_LOGE(TAG, "AP: password must be 8..64 or empty");
-        return ESP_ERR_INVALID_ARG;
-    }
+    if (!ssid || strlen(ssid) == 0) return ESP_ERR_INVALID_ARG;
+    if (strlen(ssid) > 32)          return ESP_ERR_INVALID_ARG;
 
     snprintf(s_ap_ssid_cur, sizeof(s_ap_ssid_cur), "%s", ssid);
 
     if (!s_ap_netif) {
-        s_ap_netif = esp_netif_create_default_wifi_ap();
-        if (!s_ap_netif) { ESP_LOGE(TAG, "AP: netif create failed"); return ESP_FAIL; }
+        s_ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (!s_ap_netif) s_ap_netif = esp_netif_create_default_wifi_ap();
+        if (!s_ap_netif) return ESP_FAIL;
     }
 
-    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "AP: set_mode APSTA failed: %s", esp_err_to_name(err));
-        return err;
-    }
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_AP);
+    if (err != ESP_OK) return err;
+
+    // Country Code — обязателен для ESP32-S3
+    wifi_country_t country = {
+        .cc = "RU", .schan = 1, .nchan = 13,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL
+    };
+    esp_wifi_set_country(&country);
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW20);   // IDF v6.1: WIFI_BW20
 
     wifi_config_t ap_cfg = {0};
     strncpy((char*)ap_cfg.ap.ssid, s_ap_ssid_cur, sizeof(ap_cfg.ap.ssid) - 1);
     ap_cfg.ap.ssid_len       = strlen(s_ap_ssid_cur);
     ap_cfg.ap.channel        = 6;
-    ap_cfg.ap.max_connection = 4;
+    ap_cfg.ap.max_connection = AP_MAX_STA_CONN;
     ap_cfg.ap.authmode       = WIFI_AUTH_WPA2_PSK;
     ap_cfg.ap.pmf_cfg.capable  = false;
     ap_cfg.ap.pmf_cfg.required = false;
+    ap_cfg.ap.beacon_interval = 100;
 
-    if (password && strlen(password) >= 8) {
+    if (password && strlen(password) >= 8)
         strncpy((char*)ap_cfg.ap.password, password, sizeof(ap_cfg.ap.password) - 1);
-    } else {
+    else
         ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
-    }
 
     err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "AP: set_config failed: %s", esp_err_to_name(err));
-        return err;
-    }
+    if (err != ESP_OK) return err;
 
-    /* FIX: AP 20 дБм (80 * 0.25) — максимальная дальность для node. */
     esp_wifi_set_max_tx_power(WIFI_AP_TX_POWER_VAL);
 
-    wifi_config_t actual = {0};
-    if (esp_wifi_get_config(WIFI_IF_AP, &actual) == ESP_OK) {
-        ESP_LOGI(TAG, "AP actual: auth=%d pmf=%d/%d",
-                 actual.ap.authmode,
-                 actual.ap.pmf_cfg.capable,
-                 actual.ap.pmf_cfg.required);
+    err = esp_wifi_start();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE) return err;
+
+    // «Пробуждение» beacon для ESP32-S3 (IDF v6.1+)
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    wifi_sta_list_t *sta_list = calloc(1, sizeof(wifi_sta_list_t) +
+                                          AP_MAX_STA_CONN * sizeof(wifi_ap_record_t));
+    if (sta_list) {
+        esp_err_t list_err = esp_wifi_ap_get_sta_list(sta_list);
+        if (list_err == ESP_OK) {
+            ESP_LOGI(TAG, "AP initialized: %d stations (beacon active)", sta_list->num);
+        }
+        free(sta_list);
     }
 
-    esp_netif_ip_info_t ip_info;
-    if (esp_netif_get_ip_info(s_ap_netif, &ip_info) == ESP_OK) {
-        snprintf(s_ap_ip_str, sizeof(s_ap_ip_str), IPSTR, IP2STR(&ip_info.ip));
+    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);   // refresh beacon buffer
+
+    s_ap_is_running = true;
+    ESP_LOGI(TAG, "AP-only started: SSID='%s' ch=6 (beacon awake, country=RU)",
+             s_ap_ssid_cur);
+    return ESP_OK;
+}
+
+/* ============================================================
+   wifi_ap_start — APSTA (legacy)
+   ============================================================ */
+esp_err_t wifi_ap_start(const char *ssid, const char *password)
+{
+    if (s_ap_is_running) return ESP_OK;
+    if (!ssid || strlen(ssid) == 0) return ESP_ERR_INVALID_ARG;
+
+    snprintf(s_ap_ssid_cur, sizeof(s_ap_ssid_cur), "%s", ssid);
+
+    if (!s_ap_netif) {
+        s_ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+        if (!s_ap_netif) s_ap_netif = esp_netif_create_default_wifi_ap();
+        if (!s_ap_netif) return ESP_FAIL;
     }
-    ESP_LOGI(TAG, "AP starting: SSID='%s' auth=%d req_ch=%u IP=%s pmf=%d/%d",
-             s_ap_ssid_cur, ap_cfg.ap.authmode, ap_cfg.ap.channel, s_ap_ip_str,
-             ap_cfg.ap.pmf_cfg.capable, ap_cfg.ap.pmf_cfg.required);
+
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) return err;
+
+    wifi_config_t ap_cfg = {0};
+    strncpy((char*)ap_cfg.ap.ssid, s_ap_ssid_cur, sizeof(ap_cfg.ap.ssid) - 1);
+    ap_cfg.ap.ssid_len       = strlen(s_ap_ssid_cur);
+    ap_cfg.ap.channel        = 6;
+    ap_cfg.ap.max_connection = AP_MAX_STA_CONN;
+    ap_cfg.ap.authmode       = WIFI_AUTH_WPA2_PSK;
+    ap_cfg.ap.pmf_cfg.capable  = false;
+    ap_cfg.ap.pmf_cfg.required = false;
+    ap_cfg.ap.beacon_interval = 100;
+
+    if (password && strlen(password) >= 8)
+        strncpy((char*)ap_cfg.ap.password, password, sizeof(ap_cfg.ap.password) - 1);
+    else
+        ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
+
+    err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
+    if (err != ESP_OK) return err;
+
+    esp_wifi_set_max_tx_power(WIFI_AP_TX_POWER_VAL);
+    vTaskDelay(pdMS_TO_TICKS(150));
+    wifi_sta_list_t *sta_list = calloc(1, sizeof(wifi_sta_list_t) +
+                                          AP_MAX_STA_CONN * sizeof(wifi_ap_record_t));
+    if (sta_list) { esp_wifi_ap_get_sta_list(sta_list); free(sta_list); }
+
+    s_ap_is_running = true;
+    ESP_LOGI(TAG, "AP started (APSTA): SSID='%s'", s_ap_ssid_cur);
     return ESP_OK;
 }
 
@@ -426,6 +473,49 @@ void wifi_ap_stop(void)
     esp_wifi_set_mode(WIFI_MODE_STA);
     s_ap_is_running = false;
     ESP_LOGW(TAG, "AP stopped, mode=STA");
+}
+
+/* ============================================================
+   wifi_sta_start_after_ppp_fail — STA fallback, если PPPoS не поднялся.
+   ============================================================ */
+esp_err_t wifi_sta_start_after_ppp_fail(void)
+{
+    s_has_saved_ssid = (strlen(g_config.wifi_ssid) > 0);
+    if (!s_has_saved_ssid) {
+        ESP_LOGW(TAG, "STA fallback: no saved SSID");
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "PPPoS failed → STA fallback: connecting to '%s'",
+             g_config.wifi_ssid);
+
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) return err;
+
+    wifi_config_t sta_cfg = {0};
+    strncpy((char*)sta_cfg.sta.ssid, g_config.wifi_ssid, sizeof(sta_cfg.sta.ssid) - 1);
+    if (strlen(g_config.wifi_password) >= 8) {
+        strncpy((char*)sta_cfg.sta.password, g_config.wifi_password,
+                sizeof(sta_cfg.sta.password) - 1);
+    }
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    sta_cfg.sta.pmf_cfg.capable  = true;
+    sta_cfg.sta.pmf_cfg.required = false;
+    sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    sta_cfg.sta.threshold.rssi = -127;
+
+    err = esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
+    if (err != ESP_OK) return err;
+
+    s_sta_connecting = true;
+    esp_wifi_connect();
+
+    if (!s_monitor_task)
+        xTaskCreate(wifi_monitor_task, "wifi_mon", 4096, NULL, 4, &s_monitor_task);
+
+    ESP_LOGI(TAG, "STA fallback started: SSID='%s'", g_config.wifi_ssid);
+    return ESP_OK;
 }
 
 /* ============================================================
@@ -444,25 +534,28 @@ const char* wifi_get_ap_ip(void)  { return s_ap_ip_str; }
 
 int wifi_ap_client_count(void)
 {
-    wifi_sta_list_t list;
-    if (esp_wifi_ap_get_sta_list(&list) != ESP_OK) return -1;
-    return list.num;
+    wifi_sta_list_t *list = calloc(1, sizeof(wifi_sta_list_t) +
+                                      AP_MAX_STA_CONN * sizeof(wifi_ap_record_t));
+    if (!list) return -1;
+    int n = -1;
+    if (esp_wifi_ap_get_sta_list(list) == ESP_OK) n = list->num;
+    free(list);
+    return n;
 }
 
 /* ============================================================
    Scan: найти AP с заданным префиксом (самый сильный)
-   === ИСПРАВЛЕНО: сканируем ВСЕ каналы (NULL), а не только ch=6 ===
    ============================================================ */
 esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
-                               int8_t *out_rssi,
+                               int8_t *out_rssi, uint8_t *out_channel,
                                const char *ssid_prefix)
 {
     if (!out_ssid || out_len == 0) return ESP_ERR_INVALID_ARG;
     out_ssid[0] = '\0';
     if (out_rssi) *out_rssi = -127;
+    if (out_channel) *out_channel = 0;
     if (!ssid_prefix) ssid_prefix = "FSU_";
 
-    // === NULL = все каналы, БЕЗ фильтра по каналу ===
     esp_err_t err = esp_wifi_scan_start(NULL, true);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "scan start failed: %s", esp_err_to_name(err));
@@ -489,12 +582,6 @@ esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
     }
 
     ESP_LOGI(TAG, "scan: total %u AP (all channels)", n);
-    for (int i = 0; i < n; i++) {
-        const char *s = (const char *)list[i].ssid;
-        ESP_LOGI(TAG, "  [%d] SSID='%s' rssi=%d ch=%u auth=%d",
-                 i, s[0] ? s : "<hidden>", list[i].rssi,
-                 list[i].primary, list[i].authmode);
-    }
 
     int      best_rssi = -127;
     const wifi_ap_record_t *best = NULL;
@@ -507,8 +594,6 @@ esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
         if (strncmp(s, ssid_prefix, plen) != 0) continue;
         if (slen < 3 || strcmp(s + slen - 3, "_AP") != 0) continue;
 
-        ESP_LOGI(TAG, "scan: candidate '%s' rssi=%d ch=%u",
-                 s, list[i].rssi, list[i].primary);
         if (list[i].rssi > best_rssi) {
             best_rssi = list[i].rssi;
             best = &list[i];
@@ -520,10 +605,11 @@ esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
         strncpy(out_ssid, (const char *)best->ssid, out_len - 1);
         out_ssid[out_len - 1] = '\0';
         if (out_rssi) *out_rssi = best->rssi;
-        ESP_LOGI(TAG, "scan: chosen '%s' rssi=%d", out_ssid, best->rssi);
+        if (out_channel) *out_channel = best->primary;
+        ESP_LOGI(TAG, "scan: chosen '%s' rssi=%d ch=%u",
+                 out_ssid, best->rssi, best->primary);
         ret = ESP_OK;
     } else {
-        // === БЕЗ (ch=6) ===
         ESP_LOGW(TAG, "scan: no AP matching '%s*_AP'", ssid_prefix);
     }
 

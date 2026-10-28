@@ -10,41 +10,35 @@
 extern "C" {
 #endif
 
-/* Expanders (file-scope в board_hw.c, extern здесь). */
 extern pi4ioe5v6408_config_t expander_a;
 extern pi4ioe5v6408_config_t expander_b;
 
-/* Флаг «fault пришёл от remote» — используется везде. */
 extern volatile bool s_fault_from_remote_ex;
 
-/* RTT-метрики (node_proto.c пишет, root_wd.c читает). */
 int32_t  blink_get_rtt_samples(void);
 uint32_t blink_get_rtt_us(void);
 uint32_t blink_get_rtt_delay_us(void);
 void     blink_reset_rtt(void);
 
-/* node_link watchdog: доступ к s_last_sync_ms / s_comm_lost. */
 extern volatile uint32_t s_last_sync_ms;
 extern volatile bool     s_comm_lost;
-
-/* RTT stale (для phase_sync). */
 extern volatile uint32_t s_last_pong_ms;
 
-/* Диагностика (из board_hw.c). */
 esp_err_t board_diag_en_set(uint8_t channel, bool enable);
 void      board_diag_en_all_off(void);
 int       board_read_iload_raw(uint8_t channel,
                                imon_state_t *out_state,
                                int *out_mv);
 
-/* Wi-Fi getters из wifi_ap.c */
 const char *wifi_get_ip(void);
 bool        wifi_sta_connected(void);
 bool        wifi_sta_has_ip(void);
 int         wifi_ap_client_count(void);
-esp_err_t   wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
-                                 int8_t *out_rssi,
-                                 const char *ssid_prefix);
+
+/* === FIX: out_channel добавлен === */
+esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
+                               int8_t *out_rssi, uint8_t *out_channel,
+                               const char *ssid_prefix);
 
 #ifdef __cplusplus
 }

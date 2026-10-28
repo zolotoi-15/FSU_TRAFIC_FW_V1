@@ -7,29 +7,61 @@
 #include "can_bus.h"
 #include "config_manager.h"
 #include "esp_log.h"
+#include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
 static const char *TAG = "connectivity";
 
 #define MODEM_APN             "internet"
-#define MODEM_PPP_TIMEOUT_MS  30000
-#define MODEM_RETRY_PERIOD_MS 30000
+#define MODEM_PPP_TIMEOUT_MS  8000
+#define MODEM_RETRY_PERIOD_MS 5000
+
+#define MODEM_MAX_FAILED_ATTEMPTS  3
 
 static void modem_retry_task(void *arg)
 {
-    ESP_LOGI(TAG, "modem_retry_task started");
+    ESP_LOGI(TAG, "modem_retry_task started (max %d failed attempts, "
+                  "then STA fallback)",
+             MODEM_MAX_FAILED_ATTEMPTS);
+
+    int failed_attempts = 0;
+
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(MODEM_RETRY_PERIOD_MS));
+
         bool wifi_ok = wifi_sta_has_ip();
         bool ppp_ok  = modem_ppp_is_connected();
-        if (wifi_ok || ppp_ok) continue;
+        if (wifi_ok || ppp_ok) {
+            failed_attempts = 0;
+            continue;
+        }
 
-        ESP_LOGW(TAG, "no IP → try PPPoS");
+        if (failed_attempts >= MODEM_MAX_FAILED_ATTEMPTS) {
+            ESP_LOGE(TAG, "modem_retry_task: %d failed attempts → "
+                          "STOP PPPoS, enable STA fallback",
+                     failed_attempts);
+            // === FIX: включить STA как резерв ===
+            wifi_sta_start_after_ppp_fail();
+            vTaskDelete(NULL);
+        }
+
+        ESP_LOGW(TAG, "no IP → try PPPoS (attempt %d/%d)",
+                 failed_attempts + 1, MODEM_MAX_FAILED_ATTEMPTS);
         esp_err_t mret = modem_ppp_start(MODEM_APN, MODEM_PPP_TIMEOUT_MS);
         if (mret == ESP_OK) {
+            failed_attempts = 0;
+            esp_netif_t *ppp_netif = esp_netif_get_handle_from_ifkey("PPP_DEF");
+            if (ppp_netif) {
+                esp_netif_set_default_netif(ppp_netif);
+                ESP_LOGI(TAG, "Default netif → PPPoS (AP continues on ch=6)");
+            }
             if (g_config.role == DEVICE_ROLE_MASTER && !wifi_mqtt_is_connected())
                 wifi_mqtt_init();
+        } else {
+            failed_attempts++;
+            ESP_LOGW(TAG, "PPPoS failed (attempt %d/%d)",
+                     failed_attempts, MODEM_MAX_FAILED_ATTEMPTS);
         }
     }
 }
@@ -63,5 +95,10 @@ void connectivity_register_rs485_can(void)
 
 void connectivity_start_tasks(void)
 {
-    xTaskCreate(modem_retry_task, "modem_retry", 4096, NULL, 3, NULL);
+    // === FIX: modem_retry_task только на ROOT (MASTER) ===
+    if (g_config.role == DEVICE_ROLE_MASTER) {
+        xTaskCreate(modem_retry_task, "modem_retry", 4096, NULL, 3, NULL);
+    } else {
+        ESP_LOGI(TAG, "NODE: modem_retry_task NOT started (no PPPoS on node)");
+    }
 }

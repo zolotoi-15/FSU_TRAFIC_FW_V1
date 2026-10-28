@@ -3,11 +3,14 @@
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
 #include "cJSON.h"
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
 #include <stdio.h>
+#include "esp_system.h"
+
 
 static const char *TAG = "CFG";
 #define NVS_NS       "app_cfg"
@@ -18,6 +21,26 @@ static const char *TAG = "CFG";
 #define NVS_KEY_LOCK  "role_lock"
 
 app_config_t g_config;
+
+/* ============================================================
+   === FIX: кэш JSON-конфига ===
+   cJSON_PrintUnformatted для 7.6 КБ конфига требует ~15 КБ heap.
+   При частых accept() (node переподключается) heap фрагментируется,
+   и Print падает. Кэшируем результат один раз, инвалидируем при
+   изменении конфига (config_load_json / config_save / reset).
+   ============================================================ */
+static char  *s_cfg_json_cache = NULL;
+static size_t s_cfg_json_len   = 0;
+
+static void config_cache_invalidate(void)
+{
+    if (s_cfg_json_cache) {
+        free(s_cfg_json_cache);
+        s_cfg_json_cache = NULL;
+        s_cfg_json_len = 0;
+        ESP_LOGD(TAG, "config cache invalidated");
+    }
+}
 
 /* ============================================================ */
 static void set_defaults(void)
@@ -170,6 +193,8 @@ void config_save(void)
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
     if (err == ESP_OK) {
+        // === FIX: конфиг изменился → инвалидировать кэш ===
+        config_cache_invalidate();
         ESP_LOGI(TAG, "Config saved to NVS (version=%.2f, %u bytes, ped_mode=%u)",
                  g_config.version, (unsigned)sizeof(g_config),
                  g_config.traffic.pedestrian.request_mode);
@@ -629,6 +654,21 @@ bool config_export_json(char *buf, size_t *len)
 {
     if (!buf || !len || *len < 256) return false;
 
+    // === FIX: если кэш есть — вернуть его (без cJSON_PrintUnformatted) ===
+    if (s_cfg_json_cache) {
+        if (s_cfg_json_len + 1 > *len) {
+            ESP_LOGE(TAG, "config_export_json: cache too big (%u > %u)",
+                     (unsigned)(s_cfg_json_len + 1), (unsigned)*len);
+            return false;
+        }
+        memcpy(buf, s_cfg_json_cache, s_cfg_json_len);
+        buf[s_cfg_json_len] = '\0';
+        *len = s_cfg_json_len;
+        ESP_LOGD(TAG, "config_export_json: from cache (%u bytes)",
+                 (unsigned)s_cfg_json_len);
+        return true;
+    }
+
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         ESP_LOGE(TAG, "config_export_json: cJSON_CreateObject failed");
@@ -814,7 +854,8 @@ bool config_export_json(char *buf, size_t *len)
     char *out = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!out) {
-        ESP_LOGE(TAG, "config_export_json: cJSON_PrintUnformatted failed");
+        ESP_LOGE(TAG, "config_export_json: cJSON_PrintUnformatted failed "
+                      "(free heap=%u)", (unsigned)esp_get_free_heap_size());
         return false;
     }
 
@@ -828,9 +869,13 @@ bool config_export_json(char *buf, size_t *len)
     memcpy(buf, out, n);
     buf[n] = '\0';
     *len = n;
+
+    // === FIX: сохранить в кэш ===
+    s_cfg_json_cache = strdup(out);
+    s_cfg_json_len = n;
     free(out);
 
-    ESP_LOGI(TAG, "config_export_json: OK (%u bytes, ped_mode=%u)",
+    ESP_LOGI(TAG, "config_export_json: OK (%u bytes, ped_mode=%u, cached)",
              (unsigned)n, g_config.traffic.pedestrian.request_mode);
     return true;
 }

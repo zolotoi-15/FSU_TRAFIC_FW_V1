@@ -1,21 +1,6 @@
 /* ============================================================
    blink_example_main.c — ТОЛЬКО app_main().
-   Логика разнесена по модулям:
-     board_hw.c        — i2c, expanders, diag_en, P7
-     mux_task.c        — измерения V_IN/I_LOAD
-     fault_handler.c   — on_fault_changed, on_phase_change
-     node_proto.c      — TCP-клиент к root, cmd:/cfg:, status:/evt:
-     root_wd.c         — root AP watchdog, phase_sync
-     buttons.c         — BOOT (роль), P7 (пешеход), LED
-     connectivity.c    — modem_ppp, RS485/CAN callbacks
-
-   FIX: при старте NVS приоритет. Embedded config.json грузится
-        ТОЛЬКО если NVS пуст (первая прошивка / после erase-flash).
-        Обновление NVS — через /SetJson (MQTT) или erase-flash.
-
-   FIX: STA-first, потом AP. Порядок:
-        1. wifi_start()    — STA (к роутеру / idle)
-        2. wifi_ap_start() — AP (режим APSTA), STA продолжает работать
+   === ROOT: старт только AP (ch=6). STA включится, если PPPoS fail. ===
    ============================================================ */
 
 #include <stdio.h>
@@ -60,7 +45,6 @@ static const char *TAG = "board";
 #define AP_PASSWORD          "fsu12345678"
 #define NODE_LINK_PORT_FIX   3333
 
-/* Общие extern-переменные */
 ds1307_handle_t rtc_handle = NULL;
 
 volatile uint32_t s_last_sync_ms     = 0;
@@ -73,7 +57,6 @@ volatile int32_t  s_rtt_samples      = 0;
 volatile uint32_t s_last_node_msg_ms    = 0;
 volatile uint32_t s_last_fault_clear_ms = 0;
 
-/* RTT геттеры */
 int32_t  blink_get_rtt_samples(void)  { return s_rtt_samples; }
 uint32_t blink_get_rtt_us(void)       { return s_rtt_us; }
 uint32_t blink_get_rtt_delay_us(void) { return s_rtt_delay_us; }
@@ -87,8 +70,6 @@ void blink_reset_rtt(void)
     traffic_light_set_sync_delay_us(0);
 }
 
-/* FIX: SNTP по событию IP_EVENT_STA_GOT_IP (а не в app_main),
-   чтобы стартовать при первом IP, даже если он пришёл позже 15 с. */
 static void on_sta_got_ip(void *arg, esp_event_base_t base,
                           int32_t id, void *data)
 {
@@ -106,9 +87,6 @@ static void on_sta_got_ip(void *arg, esp_event_base_t base,
     }
 }
 
-/* ============================================================
-   FIX: проверка наличия конфига в NVS.
-   ============================================================ */
 static bool nvs_app_cfg_exists(void)
 {
     nvs_handle_t nvs;
@@ -128,16 +106,6 @@ static bool nvs_app_cfg_exists(void)
     return ok;
 }
 
-/* ============================================================
-   FIX: при старте грузим сохранённую в NVS конфигурацию.
-   Embedded config.json — только если NVS пуст (первая прошивка
-   или после idf.py erase-flash).
-
-   Обновление NVS:
-     - /SetJson через MQTT → config_load_json → config_save
-     - nvs:erase → reboot → NVS пуст → firmware config.json
-     - idf.py erase-flash + flash → NVS пуст → firmware config.json
-   ============================================================ */
 static void load_embedded_config_if_needed(void)
 {
     size_t len = (size_t)(config_json_end - config_json_start);
@@ -165,7 +133,6 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_ret);
 
-    /* FIX: NVS приоритет. Firmware config.json — только если NVS пуст. */
     load_embedded_config_if_needed();
     config_init();
 
@@ -211,29 +178,20 @@ void app_main(void)
     buttons_start_tasks();
     mux_app_task_start();
 
+    wifi_init();
+
     if (is_root) {
-        /* FIX: регистрируем обработчик GOT_IP ДО wifi_start(). */
         esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
                                    &on_sta_got_ip, NULL);
 
-        /* FIX: STA-first. */
-        esp_err_t err = wifi_start();
-        if (err != ESP_OK) ESP_LOGE(TAG, "wifi_start: %s", esp_err_to_name(err));
-
-        /* FIX: AP вторым. set_mode(APSTA) — AP поднимается,
-           STA продолжает работать (переподключится к роутеру
-           автоматически через wifi_monitor_task). */
-        const char *ap_ssid = "FSU_Traffic_AP";
-        wifi_ap_start(ap_ssid, AP_PASSWORD);
+        // === FIX: root стартует ТОЛЬКО AP (STA включится, если PPPoS fail) ===
+        ESP_LOGI(TAG, "ROOT: starting AP-only mode (ch=6, beacon awake)");
+        esp_err_t err = wifi_ap_start_only("FSU_Traffic_AP", AP_PASSWORD);
+        if (err != ESP_OK) ESP_LOGE(TAG, "wifi_ap_start_only: %s",
+                                    esp_err_to_name(err));
 
         node_proto_register_callbacks();
         node_link_server_start(NODE_LINK_PORT_FIX);
-
-        if (wifi_sta_has_ip()) {
-            ESP_LOGI(TAG, "IP already present after wifi_start → init MQTT+SNTP");
-            time_sync_start_sntp();
-            wifi_mqtt_init();
-        }
 
         root_wd_start_tasks();
     } else {
@@ -242,13 +200,21 @@ void app_main(void)
         g_config.wifi_password[0] = '\0';
         wifi_start();
 
-        char   ap_ssid[33] = {0};
-        int8_t ap_rssi = -127;
-        if (wifi_scan_for_fsu_ap(ap_ssid, sizeof(ap_ssid), &ap_rssi, "FSU_") == ESP_OK) {
-            ESP_LOGI(TAG, "NODE: connecting to '%s' (rssi=%d)", ap_ssid, ap_rssi);
+        char    ap_ssid[33] = {0};
+        int8_t  ap_rssi = -127;
+        uint8_t ap_ch   = 0;
+        if (wifi_scan_for_fsu_ap(ap_ssid, sizeof(ap_ssid),
+                                 &ap_rssi, &ap_ch, "FSU_") == ESP_OK) {
+            ESP_LOGI(TAG, "NODE: connecting to '%s' (rssi=%d ch=%u)",
+                     ap_ssid, ap_rssi, ap_ch);
+
+            esp_wifi_set_channel(ap_ch, WIFI_SECOND_CHAN_NONE);
+
             wifi_config_t sta_cfg = {0};
-            strncpy((char*)sta_cfg.sta.ssid, ap_ssid, sizeof(sta_cfg.sta.ssid) - 1);
-            strncpy((char*)sta_cfg.sta.password, AP_PASSWORD, sizeof(sta_cfg.sta.password) - 1);
+            strncpy((char*)sta_cfg.sta.ssid, ap_ssid,
+                    sizeof(sta_cfg.sta.ssid) - 1);
+            strncpy((char*)sta_cfg.sta.password, AP_PASSWORD,
+                    sizeof(sta_cfg.sta.password) - 1);
             sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
             sta_cfg.sta.pmf_cfg.capable  = true;
             sta_cfg.sta.pmf_cfg.required = false;
