@@ -66,9 +66,11 @@ static char   s_ap_ssid_cur[33] = {0};
 static char   s_ap_ip_str[16]   = "192.168.4.1";
 static esp_netif_t *s_ap_netif  = NULL;
 
-/* FIX: мощность 20 дБм (80 * 0.25). Было 34 = 8.5 дБм — AP слабый,
-   node не видит / медленный auth. */
-#define WIFI_MAX_TX_POWER_VAL  80
+/* FIX: раздельные TX power для STA и AP.
+   STA: 60 (15 дБм) — меньше помех самому себе (AP+STA на одном канале).
+   AP:  80 (20 дБм) — максимальная дальность для node. */
+#define WIFI_STA_TX_POWER_VAL  34   /* 15 дБм */
+#define WIFI_AP_TX_POWER_VAL   80   /* 20 дБм */
 
 static const char* reason_str(uint8_t r) {
     switch (r) {
@@ -286,8 +288,8 @@ esp_err_t wifi_start(void)
         }
         /* FIX: threshold.authmode = OPEN — разрешаем WPA2/WPA3/FT. */
         sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-        /* FIX: PMF capable=false — root AP pmf=0/0. Если capable=true,
-           STA пытается PMF и падает с AUTH_EXPIRE на роутерах WPA2. */
+        /* FIX: PMF capable=true — разрешаем PMF, если роутер требует.
+           required=false — не требуем PMF. */
         sta_cfg.sta.pmf_cfg.capable  = true;
         sta_cfg.sta.pmf_cfg.required = false;
         sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
@@ -301,8 +303,8 @@ esp_err_t wifi_start(void)
     err = esp_wifi_start();
     if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE) return err;
 
-    /* FIX: 20 дБм (80 * 0.25). Было 34 = 8.5 дБм — слабо. */
-    esp_wifi_set_max_tx_power(WIFI_MAX_TX_POWER_VAL);
+    /* FIX: STA 15 дБм (60 * 0.25) — меньше помех AP на том же канале. */
+    esp_wifi_set_max_tx_power(WIFI_STA_TX_POWER_VAL);
     esp_wifi_set_protocol(WIFI_IF_STA,
                           WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     esp_wifi_set_inactive_time(WIFI_IF_STA, 360);
@@ -397,8 +399,8 @@ esp_err_t wifi_ap_start(const char *ssid, const char *password)
         return err;
     }
 
-    /* FIX: 20 дБм для AP — node видит быстрее. */
-    esp_wifi_set_max_tx_power(WIFI_MAX_TX_POWER_VAL);
+    /* FIX: AP 20 дБм (80 * 0.25) — максимальная дальность для node. */
+    esp_wifi_set_max_tx_power(WIFI_AP_TX_POWER_VAL);
 
     wifi_config_t actual = {0};
     if (esp_wifi_get_config(WIFI_IF_AP, &actual) == ESP_OK) {

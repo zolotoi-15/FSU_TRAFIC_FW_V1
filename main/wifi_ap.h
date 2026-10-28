@@ -46,13 +46,7 @@ const char* wifi_get_ap_ssid(void);
 
 /* ============================================================
    Scan: найти AP с заданным префиксом (самый сильный).
-
-   FIX: скан только канала 6 (root AP фиксирован). Быстрее
-   в ~6 раз (~300 мс vs ~2 с). Если root сменит канал —
-   изменить `channel` в wifi_scan_for_fsu_ap (wifi_ap.c).
-
-   Возвращает ESP_OK и заполняет out_ssid/out_rssi, если
-   найден AP с префиксом ssid_prefix и суффиксом "_AP".
+   === Сканирует ВСЕ каналы (esp_wifi_scan_start(NULL, true)). ===
    ============================================================ */
 esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
                                int8_t *out_rssi,
