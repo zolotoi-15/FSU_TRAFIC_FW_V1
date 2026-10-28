@@ -28,6 +28,8 @@
 #define LORA_RST            GPIO_NUM_41
 #define LORA_RF_EN          GPIO_NUM_5
 #define LORA_DIO0           GPIO_NUM_42
+#define LORA_BUSY           GPIO_NUM_47
+
 
 /* ============ 4G Modem (SIM7681E) — UART1 =========== */
 #define MODEM_UART_NUM      UART_NUM_1

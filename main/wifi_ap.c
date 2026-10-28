@@ -20,6 +20,10 @@
 
 static const char *TAG = "WIFI";
 
+#define WIFI_STA_TX_POWER_VAL  34
+#define WIFI_AP_TX_POWER_VAL   34
+#define AP_MAX_STA_CONN        2
+
 /* ============================================================
    STA state
    ============================================================ */
@@ -66,9 +70,7 @@ static char   s_ap_ssid_cur[33] = {0};
 static char   s_ap_ip_str[16]   = "192.168.4.1";
 static esp_netif_t *s_ap_netif  = NULL;
 
-#define WIFI_STA_TX_POWER_VAL  34
-#define WIFI_AP_TX_POWER_VAL   34
-#define AP_MAX_STA_CONN        4
+
 
 static const char* reason_str(uint8_t r) {
     switch (r) {
@@ -266,7 +268,7 @@ void wifi_init(void)
     }
 
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
-    esp_wifi_restore();
+   // esp_wifi_restore();
 
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,    evt_handler, NULL);
     esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, evt_handler, NULL);
@@ -288,8 +290,8 @@ esp_err_t wifi_start(void)
             strncpy((char*)sta_cfg.sta.password, g_config.wifi_password,
                     sizeof(sta_cfg.sta.password) - 1);
         }
-        sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-        sta_cfg.sta.pmf_cfg.capable  = true;
+        sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        sta_cfg.sta.pmf_cfg.capable  = false;
         sta_cfg.sta.pmf_cfg.required = false;
         sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
         sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
@@ -373,7 +375,7 @@ esp_err_t wifi_ap_start_only(const char *ssid, const char *password)
         .policy = WIFI_COUNTRY_POLICY_MANUAL
     };
     esp_wifi_set_country(&country);
-    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW20);   // IDF v6.1: WIFI_BW20
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);   // IDF v6.1: WIFI_BW20
 
     wifi_config_t ap_cfg = {0};
     strncpy((char*)ap_cfg.ap.ssid, s_ap_ssid_cur, sizeof(ap_cfg.ap.ssid) - 1);
@@ -498,8 +500,8 @@ esp_err_t wifi_sta_start_after_ppp_fail(void)
         strncpy((char*)sta_cfg.sta.password, g_config.wifi_password,
                 sizeof(sta_cfg.sta.password) - 1);
     }
-    sta_cfg.sta.threshold.authmode = WIFI_AUTH_OPEN;
-    sta_cfg.sta.pmf_cfg.capable  = true;
+    sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    sta_cfg.sta.pmf_cfg.capable  = false;
     sta_cfg.sta.pmf_cfg.required = false;
     sta_cfg.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
