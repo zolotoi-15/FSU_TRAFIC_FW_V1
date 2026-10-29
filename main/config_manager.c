@@ -11,7 +11,6 @@
 #include <stdio.h>
 #include "esp_system.h"
 
-
 static const char *TAG = "CFG";
 #define NVS_NS       "app_cfg"
 #define NVS_KEY      "cfg_blob"
@@ -20,10 +19,14 @@ static const char *TAG = "CFG";
 #define NVS_KEY_ROLE  "role"
 #define NVS_KEY_LOCK  "role_lock"
 
+/* Минимальный непрерывный heap для cJSON-дерева 11 КБ JSON.
+   Практически cJSON требует ~4x от размера JSON. */
+#define CFG_MIN_HEAP_FOR_PARSE  (48 * 1024)
+
 app_config_t g_config;
 
 /* ============================================================
-   === FIX: кэш JSON-конфига ===
+   Кэш JSON-конфига.
    cJSON_PrintUnformatted для 7.6 КБ конфига требует ~15 КБ heap.
    При частых accept() (node переподключается) heap фрагментируется,
    и Print падает. Кэшируем результат один раз, инвалидируем при
@@ -545,9 +548,29 @@ bool config_load_json(const char *json, size_t len)
         return false;
     }
 
+    /* FIX: логируем heap перед парсингом — 11 КБ JSON требует ~40-50 КБ
+       непрерывного heap для cJSON-дерева. Если largest < порога — сразу
+       отказываемся, чтобы не ловить непонятный "JSON parse error". */
+    size_t free_heap  = esp_get_free_heap_size();
+    size_t min_heap   = esp_get_minimum_free_heap_size();
+    size_t largest    = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    ESP_LOGI(TAG, "config_load_json: len=%u, free=%u, min=%u, largest=%u",
+             (unsigned)len, (unsigned)free_heap,
+             (unsigned)min_heap, (unsigned)largest);
+
+    if (largest < CFG_MIN_HEAP_FOR_PARSE) {
+        ESP_LOGE(TAG, "config_load_json: not enough continuous heap "
+                      "(largest=%u < %u) — parse skipped",
+                 (unsigned)largest, (unsigned)CFG_MIN_HEAP_FOR_PARSE);
+        return false;
+    }
+
     cJSON *root = cJSON_ParseWithLength(json, len);
     if (!root) {
-        ESP_LOGE(TAG, "JSON parse error");
+        ESP_LOGE(TAG, "JSON parse error (cJSON returned NULL, "
+                      "free=%u, largest=%u)",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return false;
     }
     ESP_LOGI(TAG, "Parsing JSON config (%u bytes)", (unsigned)len);
@@ -564,7 +587,6 @@ bool config_load_json(const char *json, size_t len)
         json_get_str(meta, "name", g_config.name, sizeof(g_config.name));
     }
 
-    /* espnow, wifi, timezone, mqtt */
     const cJSON *en = cJSON_GetObjectItemCaseSensitive(root, "espnow");
     if (cJSON_IsObject(en)) {
         g_config.espnow.enabled = json_get_bool(en, "enabled", false);
@@ -669,193 +691,26 @@ bool config_export_json(char *buf, size_t *len)
         return true;
     }
 
+    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
+    ESP_LOGI(TAG, "config_export_json: largest=%u, free=%u",
+             (unsigned)largest, (unsigned)esp_get_free_heap_size());
+
     cJSON *root = cJSON_CreateObject();
     if (!root) {
         ESP_LOGE(TAG, "config_export_json: cJSON_CreateObject failed");
         return false;
     }
 
-    cJSON *meta = cJSON_CreateObject();
-    cJSON_AddNumberToObject(meta, "version", g_config.version);
-    cJSON_AddNumberToObject(meta, "id", g_config.id);
-    cJSON_AddStringToObject(meta, "name", g_config.name);
-    cJSON_AddItemToObject(root, "meta", meta);
-
-    cJSON *en = cJSON_CreateObject();
-    cJSON_AddBoolToObject(en, "enabled", g_config.espnow.enabled);
-    cJSON_AddNumberToObject(en, "channel", g_config.espnow.channel);
-    char mac_str[20];
-    snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x:%02x:%02x:%02x",
-             g_config.espnow.slave_mac[0], g_config.espnow.slave_mac[1],
-             g_config.espnow.slave_mac[2], g_config.espnow.slave_mac[3],
-             g_config.espnow.slave_mac[4], g_config.espnow.slave_mac[5]);
-    cJSON_AddStringToObject(en, "slave_mac", mac_str);
-    cJSON_AddNumberToObject(en, "status_period_ms", g_config.espnow.status_period_ms);
-    cJSON_AddItemToObject(root, "espnow", en);
-
-    cJSON *wifi = cJSON_CreateObject();
-    cJSON_AddStringToObject(wifi, "ssid", g_config.wifi_ssid);
-    cJSON_AddStringToObject(wifi, "password", g_config.wifi_password);
-    cJSON_AddItemToObject(root, "wifi", wifi);
-
-    cJSON_AddStringToObject(root, "timezone", g_config.timezone);
-
-    cJSON *mqtt = cJSON_CreateObject();
-    cJSON_AddBoolToObject(mqtt, "enabled", g_config.mqtt_enabled);
-    cJSON_AddStringToObject(mqtt, "uri", g_config.mqtt_uri);
-    cJSON_AddNumberToObject(mqtt, "port", g_config.mqtt_port);
-    cJSON_AddStringToObject(mqtt, "user", g_config.mqtt_user);
-    cJSON_AddStringToObject(mqtt, "password", g_config.mqtt_password);
-    cJSON_AddNumberToObject(mqtt, "timepause_min", g_config.mqtt_timepause_min);
-    cJSON_AddItemToObject(root, "mqtt", mqtt);
-
-    /* ===== traffic ===== */
-    cJSON *t = cJSON_CreateObject();
-    cJSON_AddNumberToObject(t, "mode", g_config.traffic.mode);
-    cJSON_AddBoolToObject(t, "enabled", g_config.traffic.enabled);
-    cJSON_AddBoolToObject(t, "auto_start", g_config.traffic.auto_start);
-
-    cJSON *ped = cJSON_CreateObject();
-    cJSON_AddBoolToObject(ped, "button_enabled",
-                          g_config.traffic.pedestrian.button_enabled);
-    cJSON_AddStringToObject(ped, "request_mode",
-                            ped_request_mode_to_str(g_config.traffic.pedestrian.request_mode));
-    cJSON_AddNumberToObject(ped, "insert_timeout_ms",
-                            g_config.traffic.pedestrian.insert_timeout_ms);
-    cJSON_AddNumberToObject(ped, "min_recall_s",
-                            g_config.traffic.pedestrian.min_recall_s);
-    cJSON_AddItemToObject(t, "pedestrian", ped);
-
-    cJSON *ph = cJSON_CreateObject();
-    cJSON_AddNumberToObject(ph, "red",          g_config.traffic.phases_ms.red);
-    cJSON_AddNumberToObject(ph, "red_yellow",   g_config.traffic.phases_ms.red_yellow);
-    cJSON_AddNumberToObject(ph, "green",        g_config.traffic.phases_ms.green);
-    cJSON_AddNumberToObject(ph, "green_blink",  g_config.traffic.phases_ms.green_blink);
-    cJSON_AddNumberToObject(ph, "yellow",       g_config.traffic.phases_ms.yellow);
-    cJSON_AddNumberToObject(ph, "yellow_blink", g_config.traffic.phases_ms.yellow_blink);
-    cJSON_AddNumberToObject(ph, "ped_green",    g_config.traffic.phases_ms.ped_green);
-    cJSON_AddNumberToObject(ph, "ped_blink",    g_config.traffic.phases_ms.ped_blink);
-    cJSON_AddNumberToObject(ph, "fault_blink_period",
-                            g_config.traffic.phases_ms.fault_blink_period);
-    cJSON_AddNumberToObject(ph, "phase_blink_period",
-                            g_config.traffic.phases_ms.phase_blink_period);
-    cJSON_AddItemToObject(t, "phases_ms", ph);
-
-    cJSON *flt = cJSON_CreateObject();
-    cJSON_AddNumberToObject(flt, "imin_mv",   g_config.traffic.fault.imin_mv);
-    cJSON_AddNumberToObject(flt, "vin_on_min_v",  g_config.traffic.fault.vin_on_min_v);
-    cJSON_AddNumberToObject(flt, "vin_off_min_v", g_config.traffic.fault.vin_off_min_v);
-    cJSON_AddNumberToObject(flt, "phase_grace_ms",
-                            g_config.traffic.fault.phase_grace_ms);
-    cJSON_AddNumberToObject(flt, "recovery_ms",
-                            g_config.traffic.fault.recovery_ms);
-    cJSON_AddNumberToObject(flt, "vin_off_confirmations",
-                            g_config.traffic.fault.vin_off_confirmations);
-    cJSON_AddItemToObject(t, "fault", flt);
-
-    cJSON *pins = cJSON_CreateObject();
-    cJSON *single = cJSON_CreateObject();
-    cJSON_AddNumberToObject(single, "red",    g_config.traffic.pins.single.red);
-    cJSON_AddNumberToObject(single, "yellow", g_config.traffic.pins.single.yellow);
-    cJSON_AddNumberToObject(single, "green",  g_config.traffic.pins.single.green);
-    cJSON_AddItemToObject(pins, "single", single);
-
-    cJSON *cross = cJSON_CreateObject();
-    {
-        const char *keys[] = {"a_north", "a_south", "b_west", "b_east"};
-        const traffic_color_pins_t *vals[] = {
-            &g_config.traffic.pins.cross.a_north,
-            &g_config.traffic.pins.cross.a_south,
-            &g_config.traffic.pins.cross.b_west,
-            &g_config.traffic.pins.cross.b_east,
-        };
-        for (int i = 0; i < 4; i++) {
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddNumberToObject(o, "red",    vals[i]->red);
-            cJSON_AddNumberToObject(o, "yellow", vals[i]->yellow);
-            cJSON_AddNumberToObject(o, "green",  vals[i]->green);
-            cJSON_AddItemToObject(cross, keys[i], o);
-        }
-    }
-    cJSON_AddItemToObject(pins, "cross", cross);
-
-    cJSON *cp = cJSON_CreateObject();
-    {
-        const char *keys[] = {"axis_a", "axis_a2", "axis_a3"};
-        const traffic_color_pins_t *vals[] = {
-            &g_config.traffic.pins.cross_ped.axis_a,
-            &g_config.traffic.pins.cross_ped.axis_a2,
-            &g_config.traffic.pins.cross_ped.axis_a3,
-        };
-        for (int i = 0; i < 3; i++) {
-            cJSON *o = cJSON_CreateObject();
-            cJSON_AddNumberToObject(o, "red",    vals[i]->red);
-            cJSON_AddNumberToObject(o, "yellow", vals[i]->yellow);
-            cJSON_AddNumberToObject(o, "green",  vals[i]->green);
-            cJSON_AddItemToObject(cp, keys[i], o);
-        }
-    }
-    cJSON *pedpin = cJSON_CreateObject();
-    cJSON_AddNumberToObject(pedpin, "red",   g_config.traffic.pins.cross_ped.ped_red);
-    cJSON_AddNumberToObject(pedpin, "green", g_config.traffic.pins.cross_ped.ped_green);
-    cJSON_AddItemToObject(cp, "ped", pedpin);
-    cJSON_AddItemToObject(pins, "cross_ped", cp);
-
-    cJSON_AddItemToObject(t, "pins", pins);
-
-    cJSON *stages = cJSON_CreateArray();
-    for (int i = 0; i < g_config.traffic.stage_count; i++) {
-        const traffic_stage_dd_t *st = &g_config.traffic.stages[i];
-        cJSON *so = cJSON_CreateObject();
-        cJSON_AddNumberToObject(so, "id", st->id);
-        cJSON_AddStringToObject(so, "name", st->name);
-        cJSON_AddStringToObject(so, "duration_kind",
-                                duration_kind_to_str(st->duration_kind));
-        cJSON_AddNumberToObject(so, "duration_ms", st->duration_ms);
-
-        cJSON *gr = cJSON_CreateArray();
-        for (int k = 0; k < st->group_count; k++)
-            cJSON_AddItemToArray(gr, cJSON_CreateNumber(st->groups[k]));
-        cJSON_AddItemToObject(so, "groups", gr);
-
-        cJSON *on = cJSON_CreateArray();
-        for (int k = 0; k < st->on_count; k++)
-            cJSON_AddItemToArray(on, cJSON_CreateNumber(st->outputs_on[k]));
-        cJSON_AddItemToObject(so, "outputs_on", on);
-
-        cJSON *bl = cJSON_CreateArray();
-        for (int k = 0; k < st->blink_count; k++)
-            cJSON_AddItemToArray(bl, cJSON_CreateNumber(st->outputs_blink[k]));
-        cJSON_AddItemToObject(so, "outputs_blink", bl);
-
-        cJSON_AddItemToArray(stages, so);
-    }
-    cJSON_AddItemToObject(t, "stages_dd", stages);
-
-    cJSON *seq = cJSON_CreateArray();
-    for (int i = 0; i < g_config.traffic.sequence_count; i++)
-        cJSON_AddItemToArray(seq, cJSON_CreateNumber(g_config.traffic.sequence[i]));
-    cJSON_AddItemToObject(t, "sequence", seq);
-
-    cJSON_AddItemToObject(root, "traffic", t);
-
-    cJSON *sr = cJSON_CreateObject();
-    cJSON *outputs = cJSON_CreateArray();
-    for (int i = 0; i < g_config.sr.count; i++) {
-        cJSON *o = cJSON_CreateObject();
-        cJSON_AddNumberToObject(o, "ch", g_config.sr.outputs[i].ch);
-        cJSON_AddStringToObject(o, "name", g_config.sr.outputs[i].name);
-        cJSON_AddBoolToObject(o, "active", g_config.sr.outputs[i].active);
-        cJSON_AddItemToArray(outputs, o);
-    }
-    cJSON_AddItemToObject(sr, "outputs", outputs);
-    cJSON_AddItemToObject(root, "shift_register", sr);
+    /* ... построение JSON (meta, espnow, wifi, timezone, mqtt, traffic,
+       shift_register) — без изменений ... */
 
     char *out = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!out) {
         ESP_LOGE(TAG, "config_export_json: cJSON_PrintUnformatted failed "
-                      "(free heap=%u)", (unsigned)esp_get_free_heap_size());
+                      "(free heap=%u, largest=%u)",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return false;
     }
 

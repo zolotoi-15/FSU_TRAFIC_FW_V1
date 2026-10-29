@@ -1,5 +1,7 @@
 /* ============================================================
    mqtt_cmd.c — обработка MQTT-команд (/Set) и JSON-конфига (/SetJson).
+   /SetJson сохраняется в NVS чанками и применяется при следующей
+   загрузке — до старта PPPoS/MQTT, когда heap свободен.
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -7,12 +9,15 @@
 #include "traffic_light.h"
 #include "wifi_ap.h"
 #include "node_link.h"
+#include "transport.h"
 #include "rs485.h"
 #include "can_bus.h"
 #include "shift_register.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include "esp_wifi.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -22,6 +27,12 @@
 #include <stdio.h>
 
 static const char *TAG = "mqtt_cmd";
+
+/* NVS namespace для pending-конфига (применяется при следующей загрузке) */
+#define NVS_NS_PENDING   "pending_cfg"
+#define NVS_KEY_LEN      "len"
+#define NVS_KEY_CHUNK    "chunk_%d"
+#define PENDING_CHUNK_SZ 4096
 
 /* ============================================================
    JSON accumulator для /SetJson (многочастные сообщения).
@@ -39,7 +50,6 @@ void mqtt_json_accum_reset(void)
     s_json_accum_active = false;
 }
 
-/* Возвращает true, если сообщение полностью собрано. */
 bool mqtt_json_accum_feed(const char *data, int data_len,
                           int offset, int total)
 {
@@ -66,29 +76,130 @@ bool mqtt_json_accum_feed(const char *data, int data_len,
     return (s_json_accum_len >= s_json_accum_total);
 }
 
-void mqtt_json_accum_process(void)
+/* ============================================================
+   FIX: сохранение /SetJson в NVS чанками.
+   При следующей загрузке blink_example_main.c парсит pending_cfg
+   ДО старта PPPoS/MQTT, когда heap свободен (~188 КБ largest).
+   ============================================================ */
+static esp_err_t save_pending_cfg_to_nvs(const char *data, int data_len)
 {
-    if (!s_json_accum) return;
-    s_json_accum[s_json_accum_total] = '\0';
-    mqtt_handle_json_config(s_json_accum, s_json_accum_total);
-    mqtt_json_accum_reset();
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NS_PENDING, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save_pending_cfg: nvs_open failed: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    /* Очищаем старый pending (если был) */
+    nvs_erase_all(nvs);
+
+    err = nvs_set_u32(nvs, NVS_KEY_LEN, (uint32_t)data_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "save_pending_cfg: set len failed: %s",
+                 esp_err_to_name(err));
+        nvs_close(nvs);
+        return err;
+    }
+
+    char key[16];
+    int n_chunks = 0;
+    for (int off = 0; off < data_len; off += PENDING_CHUNK_SZ) {
+        int chunk = (data_len - off > PENDING_CHUNK_SZ)
+                    ? PENDING_CHUNK_SZ : (data_len - off);
+        snprintf(key, sizeof(key), NVS_KEY_CHUNK, off / PENDING_CHUNK_SZ);
+        err = nvs_set_blob(nvs, key, data + off, chunk);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "save_pending_cfg: set %s failed: %s",
+                     key, esp_err_to_name(err));
+            nvs_close(nvs);
+            return err;
+        }
+        n_chunks++;
+    }
+
+    err = nvs_commit(nvs);
+    nvs_close(nvs);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "save_pending_cfg: OK (%d bytes, %d chunks) → reboot to apply",
+                 data_len, n_chunks);
+    } else {
+        ESP_LOGE(TAG, "save_pending_cfg: commit failed: %s",
+                 esp_err_to_name(err));
+    }
+    return err;
 }
 
 /* ============================================================
-   handle_json_config — /SetJson
-   FIX: config_load_json ВСЕГДА сохраняет в NVS (config_save).
-   Затем root экспортирует и шлёт cfg: node.
+   FIX: mqtt_json_accum_process — вызывается из wifi_mqtt.c
+   после того, как /SetJson полностью собран в s_json_accum.
+   Вместо парсинга (который падает из-за фрагментации heap)
+   сохраняем в NVS и перезагружаемся.
+   ============================================================ */
+void mqtt_json_accum_process(void)
+{
+    if (!s_json_accum || s_json_accum_total <= 0) {
+        ESP_LOGW(TAG, "mqtt_json_accum_process: no data");
+        mqtt_json_accum_reset();
+        return;
+    }
+
+    /* Фильтр коротких сообщений — ACK от брокера и прочий мусор. */
+   /* if (s_json_accum_total < 100) {
+        ESP_LOGW(TAG, "mqtt_json_accum_process: too short (%d bytes), skip",
+                 s_json_accum_total);
+        mqtt_json_accum_reset();
+        return;
+    }*/
+
+    ESP_LOGI(TAG, "mqtt_json_accum_process: %d bytes, saving to NVS "
+                  "(heap free=%u, largest=%u)",
+             s_json_accum_total,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+
+    esp_err_t err = save_pending_cfg_to_nvs(s_json_accum, s_json_accum_total);
+    mqtt_json_accum_reset();
+
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "mqtt_json_accum_process: save to NVS failed");
+        if (s_mqtt_connected && g_mqtt_client) {
+            esp_mqtt_client_publish(g_mqtt_client, s_topic,
+                "{\"error\":\"nvs_save\"}", 0, 1, 0);
+        }
+        return;
+    }
+
+    if (s_mqtt_connected && g_mqtt_client) {
+        esp_mqtt_client_publish(g_mqtt_client, s_topic,
+            "{\"config\":\"pending\",\"reboot\":true}", 0, 1, 0);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    ESP_LOGW(TAG, "mqtt_json_accum_process: rebooting to apply config");
+    esp_restart();
+}
+
+/* ============================================================
+   handle_json_config — /SetJson (прямой путь, если приходит
+   одним сообщением без фрагментации).
    ============================================================ */
 void mqtt_handle_json_config(const char *data, int data_len)
 {
     if (data_len <= 0) { ESP_LOGW(TAG, "/SetJson: empty"); return; }
     if (data_len > MQTT_JSON_INPUT_SIZE) {
-        ESP_LOGE(TAG, "/SetJson: too big");
+        ESP_LOGE(TAG, "/SetJson: too big (%d > %d)",
+                 data_len, MQTT_JSON_INPUT_SIZE);
         return;
     }
 
-    /* FIX: дебаунс — если тот же размер приходит повторно < 2 с,
-       игнорируем. Защита от MQTT-retain/reconnect-шторма. */
+    if (data_len < 100) {
+        ESP_LOGW(TAG, "/SetJson: too short (%d bytes), skip (not a config)",
+                 data_len);
+        return;
+    }
+
     static uint32_t s_last_json_ms  = 0;
     static int      s_last_json_len = 0;
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -102,63 +213,34 @@ void mqtt_handle_json_config(const char *data, int data_len)
     s_last_json_ms  = now_ms;
     s_last_json_len = data_len;
 
-    ESP_LOGI(TAG, "/SetJson: parsing %d bytes...", data_len);
+    ESP_LOGI(TAG, "/SetJson: %d bytes, saving to NVS for next boot "
+                  "(heap free=%u, largest=%u)",
+             data_len,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 
-    /* FIX: остановить traffic перед config_load_json, иначе
-       traffic_task_loop читает полу-обновлённый stages[] во время
-       парсинга и объявляет ложный stuck → YELLOW_BLINK. */
-    bool was_running = (traffic_light_get_state() == TRAFFIC_STATE_RUNNING);
-    traffic_light_stop();
-
-    /* FIX: config_load_json ВСЕГДА сохраняет в NVS (config_save внутри).
-       Это гарантирует, что новый конфиг (например min_recall) сохранён
-       в NVS root и переживёт перезагрузку. */
-    bool ok = config_load_json(data, data_len);
-    if (ok) {
-        ESP_LOGI(TAG, "/SetJson: config saved to NVS "
-                      "(version=%.2f, ped_mode=%u)",
-                 g_config.version,
-                 g_config.traffic.pedestrian.request_mode);
-
-        mqtt_apply_config_runtime();
-
-        esp_mqtt_client_publish(g_mqtt_client, s_topic,
-            "{\"config\":\"loaded\",\"nvs\":\"ok\"}", 0, 1, 0);
-
-        /* FIX: root → cfg: → node. config_export_json берёт NVS root,
-           шлёт node, node делает config_load_json → NVS node. */
-        if (g_config.role == DEVICE_ROLE_MASTER) {
-            if (!node_link_server_has_client()) {
-                ESP_LOGI(TAG, "node not connected → skip config forward");
-            } else {
-                extern bool config_export_json(char *b, size_t *l);
-                char *buf = malloc(16384);
-                size_t blen = 16384;
-                if (buf && config_export_json(buf, &blen)) {
-                    esp_err_t err = node_link_server_send_config(buf, blen);
-                    if (err == ESP_OK) ESP_LOGI(TAG, "config forwarded: %u bytes",
-                                                (unsigned)blen);
-                    else ESP_LOGW(TAG, "config forward failed: %s",
-                                  esp_err_to_name(err));
-                }
-                free(buf);
-            }
+    esp_err_t err = save_pending_cfg_to_nvs(data, data_len);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "/SetJson: save to NVS failed, skip");
+        if (s_mqtt_connected && g_mqtt_client) {
+            esp_mqtt_client_publish(g_mqtt_client, s_topic,
+                "{\"error\":\"nvs_save\"}", 0, 1, 0);
         }
-    } else {
-        ESP_LOGE(TAG, "/SetJson: parse FAILED");
-        if (was_running) {
-            esp_err_t mr = traffic_light_set_mode((traffic_mode_t)g_config.traffic.mode);
-            if (mr != ESP_OK) ESP_LOGW(TAG, "set_mode: %s", esp_err_to_name(mr));
-            traffic_light_reset();
-            traffic_light_start();
-        }
-        esp_mqtt_client_publish(g_mqtt_client, s_topic,
-            "{\"error\":\"json_parse\"}", 0, 1, 0);
+        return;
     }
+
+    if (s_mqtt_connected && g_mqtt_client) {
+        esp_mqtt_client_publish(g_mqtt_client, s_topic,
+            "{\"config\":\"pending\",\"reboot\":true}", 0, 1, 0);
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
+    ESP_LOGW(TAG, "/SetJson: rebooting to apply config");
+    esp_restart();
 }
 
 /* ============================================================
-   handle_command — /Set
+   handle_command — /Set (без изменений)
    ============================================================ */
 void mqtt_handle_command(const char *data, int data_len)
 {
@@ -167,14 +249,13 @@ void mqtt_handle_command(const char *data, int data_len)
     memcpy(cmd, data, len); cmd[len] = '\0';
     ESP_LOGI(TAG, "CMD: %s", cmd);
 
-    /* Проксирование в node (кроме локальных команд root). */
     if (g_config.role == DEVICE_ROLE_MASTER &&
         strncmp(cmd, "nvs:erase",     9) != 0 &&
         strncmp(cmd, "role:",         5) != 0 &&
         strncmp(cmd, "config:reload", 13) != 0 &&
         strncmp(cmd, "sync:",         5) != 0 &&
         strncmp(cmd, "fault:",        6) != 0) {
-        node_link_server_send_cmd(cmd, strlen(cmd));
+        transport_send_cmd(cmd, strlen(cmd));
     }
 
     int relay = -1, state = -1;
@@ -191,9 +272,24 @@ void mqtt_handle_command(const char *data, int data_len)
         int   rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
         uint8_t ch = 0; wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
         esp_wifi_get_channel(&ch, &sec);
-        ESP_LOGI(TAG, "NET info: sta=%d ip=%s rssi=%d ch=%u ap_clients=%d",
+        ESP_LOGI(TAG, "NET info: sta=%d ip=%s rssi=%d ch=%u ap_clients=%d "
+                      "transport=%s",
                  wifi_sta_connected(), wifi_get_ip(), rssi, ch,
-                 wifi_ap_client_count());
+                 wifi_ap_client_count(),
+                 transport_is_lora() ? "LoRa" : "TCP");
+        changed = true;
+        goto publish;
+    }
+
+    if (strcmp(cmd, "transport:lora") == 0) {
+        transport_force_lora();
+        ESP_LOGW(TAG, "transport → LoRa");
+        changed = true;
+        goto publish;
+    }
+    if (strcmp(cmd, "transport:tcp") == 0) {
+        transport_force_tcp();
+        ESP_LOGW(TAG, "transport → TCP");
         changed = true;
         goto publish;
     }
@@ -271,8 +367,7 @@ void mqtt_handle_command(const char *data, int data_len)
     }
 
     if (strcmp(cmd, "pedestrian:request") == 0) {
-        ESP_LOGI(TAG, "pedestrian:request (P7) mode=%u "
-                      "(0=stage, 1=insert, 2=min_recall)",
+        ESP_LOGI(TAG, "pedestrian:request (P7) mode=%u",
                  g_config.traffic.pedestrian.request_mode);
         traffic_light_request_pedestrian();
         changed = true;
@@ -424,11 +519,6 @@ void mqtt_handle_command(const char *data, int data_len)
     }
 
     if (strcmp(cmd, "config:reload") == 0) {
-        /* FIX: config:reload перечитывает NVS (не firmware config.json).
-           NVS приоритет: firmware config.json грузится только при
-           пустом NVS (первый старт / erase-flash).
-
-           Если нужен firmware config.json — nvs:erase + reboot. */
         ESP_LOGI(TAG, "config:reload → reading NVS");
         traffic_light_stop();
         config_load();
@@ -436,12 +526,12 @@ void mqtt_handle_command(const char *data, int data_len)
                  g_config.version,
                  g_config.traffic.pedestrian.request_mode);
         mqtt_apply_config_runtime();
-        if (g_config.role == DEVICE_ROLE_MASTER && node_link_server_has_client()) {
+        if (g_config.role == DEVICE_ROLE_MASTER) {
             extern bool config_export_json(char *b, size_t *l);
             char *buf = malloc(16384);
             size_t blen = 16384;
             if (buf && config_export_json(buf, &blen)) {
-                node_link_server_send_config(buf, blen);
+                transport_send_cfg(buf, blen);
             }
             free(buf);
         }
@@ -450,9 +540,7 @@ void mqtt_handle_command(const char *data, int data_len)
     }
 
     if (strcmp(cmd, "nvs:erase") == 0) {
-        /* FIX: nvs:erase + reboot → NVS пуст → firmware config.json
-           загрузится при следующем старте. */
-        ESP_LOGW(TAG, "nvs:erase → reboot (next boot loads embedded config.json)");
+        ESP_LOGW(TAG, "nvs:erase → reboot");
         esp_mqtt_client_publish(g_mqtt_client, s_topic,
             "{\"nvs\":\"erasing\"}", 0, 1, 0);
         vTaskDelay(pdMS_TO_TICKS(200));

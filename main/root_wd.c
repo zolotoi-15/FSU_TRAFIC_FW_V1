@@ -1,6 +1,7 @@
 #include "root_wd.h"
 #include "app_shared.h"
 #include "node_link.h"
+#include "transport.h"            /* transport_is_lora() */
 #include "traffic_light.h"
 #include "wifi_mqtt.h"
 #include "time_sync.h"
@@ -14,10 +15,14 @@
 static const char *TAG = "root_wd";
 
 #define ROOT_AP_CHECK_MS      2000
-#define NODE_COMM_LOST_MS     15000   // было 30000 — потеря AP-клиента > 15 с → ALL_OFF
-#define PING_INTERVAL_MS      2000
+#define NODE_COMM_LOST_MS     15000   /* потеря AP-клиента > 15 с → ALL_OFF */
+#define PING_INTERVAL_MS      5000    /* TCP ping: раз в 5 с (LoRa не шлёт) */
 #define RTT_PING_PERIOD_MS    2000
 #define RTT_STALE_MS          10000
+
+/* Для LoRa sync: реже, чтобы не занимать эфир */
+#define LORA_SYNC_INTERVAL_MS 2000    /* sync через LoRa: раз в 2 с */
+#define TCP_SYNC_INTERVAL_MS  500     /* sync через TCP: раз в 500 мс */
 
 extern volatile uint32_t s_last_fault_clear_ms;
 
@@ -81,7 +86,6 @@ static void root_ap_client_watchdog_task(void *arg)
             was_running = false;
             lost_since_ms = now;
         } else if (!has_node && !was_running && lost_since_ms != 0) {
-            /* FIX: потеря AP-клиента > 15 с → ALL_OFF (все 16 каналов OFF). */
             if (!in_comm_lost_all_off &&
                 (now - lost_since_ms) >= (uint32_t)NODE_COMM_LOST_MS) {
                 if (traffic_light_get_fault() != TRAFFIC_FAULT_ALL_OFF) {
@@ -100,7 +104,11 @@ static void root_ap_client_watchdog_task(void *arg)
 }
 
 /* ============================================================ */
-/* phase_sync_task — без изменений (sync: не шлётся при ALL_OFF) */
+/* phase_sync_task — RTT ping/pong + sync                       */
+/*                                                              */
+/* Через TCP: ping: раз в 5 с, sync: раз в 500 мс.              */
+/* Через LoRa: ping: НЕ шлём (выбивает радио из приёма),        */
+/*             sync: раз в 2 с — достаточно для traffic.        */
 /* ============================================================ */
 static void phase_sync_task(void *arg)
 {
@@ -117,6 +125,7 @@ static void phase_sync_task(void *arg)
             uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
             bool has_client = node_link_server_has_client();
             bool in_all_off = (traffic_light_get_fault() == TRAFFIC_FAULT_ALL_OFF);
+            bool is_lora = transport_is_lora();
 
             if (has_client && !was_client) {
                 ESP_LOGI(TAG, "phase_sync: node connected → immediate sync");
@@ -134,7 +143,9 @@ static void phase_sync_task(void *arg)
             }
             was_client = has_client;
 
-            if (has_client && (now - last_rtt_ping_ms >= RTT_PING_PERIOD_MS)) {
+            /* RTT ping — только через TCP, не через LoRa */
+            if (has_client && !is_lora &&
+                (now - last_rtt_ping_ms >= RTT_PING_PERIOD_MS)) {
                 last_rtt_ping_ms = now;
                 char cmd[64];
                 int n = snprintf(cmd, sizeof(cmd), "ping:%lu",
@@ -144,16 +155,19 @@ static void phase_sync_task(void *arg)
             if (s_last_pong_ms > 0 && (now - s_last_pong_ms) > RTT_STALE_MS) {
                 blink_reset_rtt();
             }
-            if (st != TRAFFIC_STATE_RUNNING && !in_all_off &&
+
+            /* TCP ping: раз в PING_INTERVAL_MS, только когда st != RUNNING */
+            if (has_client && !is_lora && st != TRAFFIC_STATE_RUNNING && !in_all_off &&
                 (now - last_ping_ms >= PING_INTERVAL_MS)) {
                 last_ping_ms = now;
-                if (has_client) node_link_server_send_cmd("ping", 4);
+                node_link_server_send_cmd("ping", 4);
             }
-            if (has_client) {
+
+            if (has_client && !is_lora) {
                 time_sync_root_push(blink_get_rtt_us());
             }
 
-            /* FIX: sync: шлётся ТОЛЬКО если st == RUNNING && !in_all_off. */
+            /* sync: шлём только если st == RUNNING && !in_all_off */
             if (st == TRAFFIC_STATE_RUNNING && !in_all_off) {
                 uint8_t  phase = traffic_light_get_phase();
                 uint32_t dur   = traffic_light_get_phase_duration_ms();
@@ -176,6 +190,13 @@ static void phase_sync_task(void *arg)
                 }
                 traffic_fault_t f = traffic_light_get_fault();
                 uint32_t interval = (f == TRAFFIC_FAULT_YELLOW_BLINK) ? 100 : 500;
+
+                /* Для LoRa — реже (2 с), чтобы радио успевало принимать */
+                if (is_lora) {
+                    interval = LORA_SYNC_INTERVAL_MS;
+                } else {
+                    interval = TCP_SYNC_INTERVAL_MS;
+                }
 
                 bool need = (phase != last_phase) || (now - last_ms >= interval);
                 if (need) {

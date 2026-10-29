@@ -1,6 +1,8 @@
 /* ============================================================
    blink_example_main.c — ТОЛЬКО app_main().
-   === ROOT: старт только AP (ch=6). STA включится, если PPPoS fail. ===
+   ТЕСТОВЫЙ РЕЖИМ: только LoRa.
+   ROOT шлёт "PING" раз в 2 секунды, NODE принимает через callback
+   (с polling через lora_poll()).
    ============================================================ */
 
 #include <stdio.h>
@@ -13,6 +15,7 @@
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 
@@ -27,13 +30,15 @@
 #include "wifi_ap.h"
 #include "wifi_mqtt.h"
 #include "node_link.h"
+#include "node_proto.h"
+#include "transport.h"
+#include "lora.h"
 #include "time_sync.h"
 #include "ds1307.h"
 #include "i2c_bus.h"
 #include "connectivity.h"
 #include "fault_handler.h"
 #include "buttons.h"
-#include "node_proto.h"
 #include "root_wd.h"
 #include "app_shared.h"
 
@@ -41,9 +46,16 @@ extern const uint8_t config_json_start[] asm("_binary_config_json_start");
 extern const uint8_t config_json_end[]   asm("_binary_config_json_end");
 
 static const char *TAG = "board";
+static const char *TAG_LORA_TEST = "LORA_TEST";
 
 #define AP_PASSWORD          "fsu12345678"
 #define NODE_LINK_PORT_FIX   3333
+
+/* NVS namespace для pending-конфига (см. mqtt_cmd.c) */
+#define NVS_NS_PENDING   "pending_cfg"
+#define NVS_KEY_LEN      "len"
+#define NVS_KEY_CHUNK    "chunk_%d"
+#define PENDING_CHUNK_SZ 4096
 
 ds1307_handle_t rtc_handle = NULL;
 
@@ -106,6 +118,80 @@ static bool nvs_app_cfg_exists(void)
     return ok;
 }
 
+static bool apply_pending_cfg_from_nvs(void)
+{
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(NVS_NS_PENDING, NVS_READONLY, &nvs);
+    if (err != ESP_OK) {
+        ESP_LOGI(TAG, "pending_cfg: not found (normal at first boot)");
+        return false;
+    }
+
+    uint32_t len = 0;
+    err = nvs_get_u32(nvs, NVS_KEY_LEN, &len);
+    if (err != ESP_OK || len == 0 || len > 32768) {
+        ESP_LOGW(TAG, "pending_cfg: no len or bad size (%u), skip",
+                 (unsigned)len);
+        nvs_close(nvs);
+        return false;
+    }
+
+    ESP_LOGI(TAG, "pending_cfg: found %u bytes, "
+                  "heap free=%u, largest=%u",
+             (unsigned)len,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+
+    char *buf = malloc(len + 1);
+    if (!buf) {
+        ESP_LOGE(TAG, "pending_cfg: malloc %u failed", (unsigned)(len + 1));
+        nvs_close(nvs);
+        return false;
+    }
+
+    char key[16];
+    size_t got = 0;
+    for (int off = 0; off < (int)len; off += PENDING_CHUNK_SZ) {
+        int chunk = (len - off > PENDING_CHUNK_SZ)
+                    ? PENDING_CHUNK_SZ : (int)(len - off);
+        snprintf(key, sizeof(key), NVS_KEY_CHUNK, off / PENDING_CHUNK_SZ);
+        size_t sz = chunk;
+        err = nvs_get_blob(nvs, key, buf + off, &sz);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "pending_cfg: get %s failed: %s",
+                     key, esp_err_to_name(err));
+            free(buf);
+            nvs_close(nvs);
+            return false;
+        }
+        got += sz;
+    }
+    buf[len] = '\0';
+
+    ESP_LOGI(TAG, "pending_cfg: loaded %u/%u bytes, parsing...",
+             (unsigned)got, (unsigned)len);
+
+    bool ok = config_load_json(buf, len);
+    free(buf);
+    nvs_close(nvs);
+
+    if (nvs_open(NVS_NS_PENDING, NVS_READWRITE, &nvs) == ESP_OK) {
+        nvs_erase_all(nvs);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+
+    if (ok) {
+        ESP_LOGI(TAG, "pending_cfg: applied OK "
+                      "(version=%.2f, ped_mode=%u)",
+                 g_config.version,
+                 g_config.traffic.pedestrian.request_mode);
+    } else {
+        ESP_LOGE(TAG, "pending_cfg: parse FAILED");
+    }
+    return ok;
+}
+
 static void load_embedded_config_if_needed(void)
 {
     size_t len = (size_t)(config_json_end - config_json_start);
@@ -121,9 +207,56 @@ static void load_embedded_config_if_needed(void)
     config_load_json((const char *)config_json_start, len);
 }
 
+static void log_heap(const char *stage)
+{
+    ESP_LOGI(TAG, "HEAP[%s]: free=%u, min=%u, largest=%u",
+             stage,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)esp_get_minimum_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+}
+
+/* ============================================================
+   ТЕСТОВЫЙ CALLBACK LoRa RX
+   ============================================================ */
+static void lora_test_rx_cb(const uint8_t *data, size_t len)
+{
+    ESP_LOGI(TAG_LORA_TEST, "RX (%u bytes): %.*s",
+             (unsigned)len, (int)len, (const char *)data);
+}
+
+/* ============================================================
+   ТЕСТОВЫЙ ЦИКЛ LoRa
+   ============================================================ */
+static void lora_test_root(void)
+{
+    ESP_LOGI(TAG_LORA_TEST, "ROOT: starting LoRa TX test (PING every 2s)");
+    while (1) {
+        uint8_t test[] = "PING";
+        if (lora_send_packet(test, 4) == ESP_OK) {
+            ESP_LOGI(TAG_LORA_TEST, "PING sent OK");
+        } else {
+            ESP_LOGE(TAG_LORA_TEST, "PING send FAILED");
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+}
+
+static void lora_test_node(void)
+{
+    ESP_LOGI(TAG_LORA_TEST, "NODE: starting LoRa RX test (polling)");
+    lora_set_rx_callback(lora_test_rx_cb);
+    lora_receive();  // войти в режим приёма
+
+    while (1) {
+        lora_poll();  // FIX: опрос IRQ
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Board bring-up (root/node)");
+    ESP_LOGI(TAG, "Board bring-up (root/node) — LoRa TEST MODE");
 
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -133,106 +266,45 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_ret);
 
-    load_embedded_config_if_needed();
+    log_heap("app_main start");
+
+    bool pending_applied = apply_pending_cfg_from_nvs();
+    if (pending_applied) {
+        log_heap("after pending_cfg applied");
+    }
+
+    if (!pending_applied) {
+        load_embedded_config_if_needed();
+    }
     config_init();
 
     bool is_root = (g_config.role == DEVICE_ROLE_MASTER);
     ESP_LOGI(TAG, "role = %s", is_root ? "ROOT" : "NODE");
 
+    /* Минимальная инициализация железа */
     board_hw_init();
-
-    ds1307_config_t ds1307_cfg = {
-        .ds1307_device.scl_speed_hz = 100000,
-        .ds1307_device.device_address = DS1307_ADDRESS,
-    };
-    if (ds1307_init(g_i2c_bus, &ds1307_cfg, &rtc_handle) != ESP_OK) {
-        rtc_handle = NULL;
-    } else if (i2c_master_probe(g_i2c_bus, DS1307_ADDRESS, 50) != ESP_OK) {
-        rtc_handle = NULL;
-    }
-    time_sync_init();
-
-    if (sr_init() == ESP_OK) {
-        sr_all_off();
-        connectivity_register_rs485_can();
-    }
-
+    sr_init();
+    sr_all_off();
     mux_init();
     mux_data_init();
 
-    esp_err_t mr = traffic_light_set_mode((traffic_mode_t)g_config.traffic.mode);
-    if (mr != ESP_OK) ESP_LOGW(TAG, "set_mode: %s", esp_err_to_name(mr));
+    log_heap("before lora_init");
 
-    traffic_light_init();
-
-    ESP_LOGI(TAG, "Traffic state after init: %s (all outputs OFF)",
-             traffic_light_state_str());
-
-    fault_handler_register();
-    if (!is_root) traffic_light_set_follow_root(true);
-
-    if (is_root) {
-        wifi_mqtt_apply_config_runtime();
-    }
-
-    buttons_start_tasks();
-    mux_app_task_start();
-
-    wifi_init();
-
-    if (is_root) {
-        esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                   &on_sta_got_ip, NULL);
-
-        // === FIX: root стартует ТОЛЬКО AP (STA включится, если PPPoS fail) ===
-        ESP_LOGI(TAG, "ROOT: starting AP-only mode (ch=6, beacon awake)");
-        esp_err_t err = wifi_ap_start_only("FSU_Traffic_AP", AP_PASSWORD);
-        if (err != ESP_OK) ESP_LOGE(TAG, "wifi_ap_start_only: %s",
-                                    esp_err_to_name(err));
-
-        node_proto_register_callbacks();
-        node_link_server_start(NODE_LINK_PORT_FIX);
-
-        root_wd_start_tasks();
+    /* ── ТЕСТ: ТОЛЬКО LoRa ── */
+    esp_err_t lora_ret = lora_init();
+    if (lora_ret != ESP_OK) {
+        ESP_LOGE(TAG_LORA_TEST, "lora_init failed: %s",
+                 esp_err_to_name(lora_ret));
     } else {
-        ESP_LOGI(TAG, "NODE: scanning for FSU_*_AP ...");
-        g_config.wifi_ssid[0] = '\0';
-        g_config.wifi_password[0] = '\0';
-        wifi_start();
-
-        char    ap_ssid[33] = {0};
-        int8_t  ap_rssi = -127;
-        uint8_t ap_ch   = 0;
-        if (wifi_scan_for_fsu_ap(ap_ssid, sizeof(ap_ssid),
-                                 &ap_rssi, &ap_ch, "FSU_") == ESP_OK) {
-            ESP_LOGI(TAG, "NODE: connecting to '%s' (rssi=%d ch=%u)",
-                     ap_ssid, ap_rssi, ap_ch);
-
-            esp_wifi_set_channel(ap_ch, WIFI_SECOND_CHAN_NONE);
-
-            wifi_config_t sta_cfg = {0};
-            strncpy((char*)sta_cfg.sta.ssid, ap_ssid,
-                    sizeof(sta_cfg.sta.ssid) - 1);
-            strncpy((char*)sta_cfg.sta.password, AP_PASSWORD,
-                    sizeof(sta_cfg.sta.password) - 1);
-            sta_cfg.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-            sta_cfg.sta.pmf_cfg.capable  = true;
-            sta_cfg.sta.pmf_cfg.required = false;
-            esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
-            esp_wifi_connect();
-        } else {
-            ESP_LOGW(TAG, "NODE: no FSU_*_AP found, will retry");
-        }
-
-        node_proto_register_callbacks();
-        node_proto_client_start("192.168.4.1", NODE_LINK_PORT_FIX);
-
-        ESP_LOGI(TAG, "NODE: waiting for root (traffic STOPPED until cfg from root)");
-
-        node_proto_start_tasks();
+        ESP_LOGI(TAG_LORA_TEST, "lora_init OK");
     }
 
-    connectivity_start_tasks();
+    log_heap("after lora_init");
 
-    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+    /* Запускаем тестовый цикл */
+    if (is_root) {
+        lora_test_root();
+    } else {
+        lora_test_node();
+    }
 }

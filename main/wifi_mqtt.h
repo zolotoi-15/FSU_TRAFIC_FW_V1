@@ -27,8 +27,8 @@ extern mqtt_config_t g_mqtt_config;
 #define MQTT_STUCK_TIMEOUT_MS       (5 * 60 * 1000)
 #define MQTT_PUBLISH_FAIL_THRESHOLD 3
 
-#define MQTT_JSON_BUFFER_SIZE       8192
-#define MQTT_JSON_INPUT_SIZE        32768
+#define MQTT_JSON_BUFFER_SIZE       4096   // было 8192
+#define MQTT_JSON_INPUT_SIZE        16384  // было 32768 — 11 КБ JSON влезает
 
 esp_err_t wifi_mqtt_init(void);
 void      wifi_mqtt_stop(void);

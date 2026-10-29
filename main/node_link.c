@@ -1,3 +1,12 @@
+/* ============================================================
+   node_link.c — TCP-транспорт root↔node.
+
+   Используется как РЕЗЕРВНЫЙ канал, когда LoRa недоступна.
+   Основной канал — transport.c (LoRa через espp/sx126x).
+
+   Протокол: line-based, префиксы cfg: / cmd: / evt: / status:
+   ============================================================ */
+
 #include "node_link.h"
 #include "esp_log.h"
 #include "esp_wifi.h"
@@ -29,8 +38,6 @@ static volatile bool s_running    = false;
 
 static SemaphoreHandle_t s_send_mutex        = NULL;
 static SemaphoreHandle_t s_client_send_mutex = NULL;
-
-// === ВАРИАНТ B: семафор для ожидания подключения node (root) ===
 static SemaphoreHandle_t s_client_connected_sem = NULL;
 
 #define NODE_LINK_MAX_MSG 32768
@@ -72,29 +79,25 @@ static void dispatch_line(const char *line, size_t len)
 
     if (len > 4 && strncmp(line, "cfg:", 4) == 0) {
         if (s_cfg_cb) s_cfg_cb(line + 4, len - 4);
-        else ESP_LOGW(TAG, "cfg: but s_cfg_cb == NULL");
         return;
     }
     if (len > 4 && strncmp(line, "cmd:", 4) == 0) {
         if (s_cmd_cb) s_cmd_cb(line + 4, len - 4);
-        else ESP_LOGW(TAG, "cmd: but s_cmd_cb == NULL");
         return;
     }
     if (len > 4 && strncmp(line, "evt:", 4) == 0) {
         if (s_evt_cb) s_evt_cb(line + 4, len - 4);
-        else ESP_LOGE(TAG, "EVT but s_evt_cb == NULL!");
         return;
     }
     if (len > 7 && strncmp(line, "status:", 7) == 0) {
         if (s_cb) s_cb(line + 7, len - 7);
         return;
     }
-
     ESP_LOGW(TAG, "dispatch_line: unknown line, drop '%.*s'", (int)len, line);
 }
 
 /* ============================================================
-   ROOT: TCP-сервер. При accept — СРАЗУ cfg: (initial config).
+   ROOT: TCP-сервер. При accept — сразу отправляем cfg:.
    ============================================================ */
 static void server_task(void *arg)
 {
@@ -135,30 +138,23 @@ static void server_task(void *arg)
         ESP_LOGI(TAG, "node connected from %s:%d", ip, ntohs(cli.sin_port));
         s_root_client_sock = cfd;
 
-        /* ===== FIX: initial cfg ===== */
+        /* initial cfg */
         {
             extern bool config_export_json(char *b, size_t *l);
             char  *cbuf = malloc(16384);
             size_t clen = 16384;
             esp_err_t cfg_err = ESP_FAIL;
             if (cbuf && config_export_json(cbuf, &clen)) {
-                ESP_LOGI(TAG, "→ node: initial cfg %u bytes", (unsigned)clen);
                 cfg_err = send_line_to_node("cfg:", cbuf, clen, SEND_LOCK_TIMEOUT_MS);
-            } else {
-                ESP_LOGW(TAG, "initial cfg export failed");
             }
             free(cbuf);
-
             if (cfg_err != ESP_OK) {
-                ESP_LOGE(TAG, "initial cfg send failed (%s) → close, wait reconnect",
-                         esp_err_to_name(cfg_err));
-                close(cfd);
-                s_root_client_sock = -1;
+                ESP_LOGE(TAG, "initial cfg send failed → close");
+                close(cfd); s_root_client_sock = -1;
                 continue;
             }
         }
 
-        // === ВАРИАНТ B: сигналим, что node подключён и cfg отправлен ===
         if (!s_client_connected_sem)
             s_client_connected_sem = xSemaphoreCreateBinary();
         if (s_client_connected_sem)
@@ -167,13 +163,9 @@ static void server_task(void *arg)
         size_t acc = 0;
         while (s_running) {
             int n = recv(cfd, buf + acc, NODE_LINK_MAX_MSG - acc - 1, 0);
-            if (n == 0) {
-                ESP_LOGW(TAG, "node closed connection");
-                break;
-            }
+            if (n == 0) break;
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                ESP_LOGW(TAG, "recv errno=%d", errno);
                 break;
             }
             acc += n;
@@ -206,7 +198,6 @@ esp_err_t node_link_server_start(uint16_t port)
     if (!s_send_mutex) s_send_mutex = xSemaphoreCreateMutex();
     if (!s_send_mutex) return ESP_ERR_NO_MEM;
     if (!s_client_send_mutex) s_client_send_mutex = xSemaphoreCreateMutex();
-    // === ВАРИАНТ B: создаём семафор ожидания node ===
     if (!s_client_connected_sem) s_client_connected_sem = xSemaphoreCreateBinary();
     s_running = true;
     xTaskCreate(server_task, "node_srv", 6144, NULL, 6, NULL);
@@ -226,9 +217,7 @@ static esp_err_t send_line_to_node(const char *prefix,
     if (!s_send_mutex) return ESP_ERR_INVALID_STATE;
 
     TickType_t wait = (lock_timeout_ms == 0) ? 0 : pdMS_TO_TICKS(lock_timeout_ms);
-    if (xSemaphoreTake(s_send_mutex, wait) != pdTRUE) {
-        return ESP_ERR_TIMEOUT;
-    }
+    if (xSemaphoreTake(s_send_mutex, wait) != pdTRUE) return ESP_ERR_TIMEOUT;
 
     size_t plen = strlen(prefix);
     char *out = malloc(plen + len + 2);
@@ -238,30 +227,19 @@ static esp_err_t send_line_to_node(const char *prefix,
     out[plen + len] = '\n';
     int total = (int)(plen + len + 1);
 
-    int sent = 0;
-    int waited_ms = 0;
+    int sent = 0, waited_ms = 0;
     esp_err_t result = ESP_OK;
-
     while (sent < total) {
         int n = send(s_root_client_sock, out + sent, total - sent, 0);
         if (n <= 0) {
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                if (waited_ms >= SEND_RETRY_MAX_MS) {
-                    ESP_LOGW(TAG, "send to node: EAGAIN after %d ms (sent=%d/%d)",
-                             waited_ms, sent, total);
-                    result = ESP_FAIL;
-                    break;
-                }
+                if (waited_ms >= SEND_RETRY_MAX_MS) { result = ESP_FAIL; break; }
                 vTaskDelay(pdMS_TO_TICKS(SEND_RETRY_STEP_MS));
                 waited_ms += SEND_RETRY_STEP_MS;
                 continue;
             }
-            ESP_LOGW(TAG, "send to node failed (sent=%d/%d errno=%d)",
-                     sent, total, errno);
-            close(s_root_client_sock);
-            s_root_client_sock = -1;
-            result = ESP_FAIL;
-            break;
+            close(s_root_client_sock); s_root_client_sock = -1;
+            result = ESP_FAIL; break;
         }
         sent += n;
         waited_ms = 0;
@@ -289,7 +267,7 @@ esp_err_t node_link_server_send_cmd_nonblock(const char *cmd, size_t len)
 }
 
 /* ============================================================
-   NODE: TCP-клиент.
+   NODE: TCP-клиент
    ============================================================ */
 static bool connect_once(void)
 {
@@ -315,7 +293,6 @@ static void client_task(void *arg)
 {
     char *buf = malloc(NODE_LINK_MAX_MSG);
     if (!buf) { vTaskDelete(NULL); return; }
-
     size_t acc = 0;
 
     while (s_running) {
@@ -328,25 +305,18 @@ static void client_task(void *arg)
         }
         int n = recv(s_client_sock, buf + acc, NODE_LINK_MAX_MSG - acc - 1, 0);
         if (n == 0) {
-            ESP_LOGW(TAG, "client: peer closed, reconnect");
             s_client_connected = false;
-            close(s_client_sock);
-            s_client_sock = -1;
-            acc = 0;
-            continue;
+            close(s_client_sock); s_client_sock = -1;
+            acc = 0; continue;
         }
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-            ESP_LOGW(TAG, "client: recv errno=%d, reconnect", errno);
             s_client_connected = false;
-            close(s_client_sock);
-            s_client_sock = -1;
-            acc = 0;
-            continue;
+            close(s_client_sock); s_client_sock = -1;
+            acc = 0; continue;
         }
         acc += n;
         buf[acc] = '\0';
-
         char *line = buf;
         char *nl;
         while ((nl = memchr(line, '\n', acc - (line - buf))) != NULL) {
@@ -357,10 +327,7 @@ static void client_task(void *arg)
         size_t rest = acc - (line - buf);
         if (rest > 0 && line != buf) memmove(buf, line, rest);
         acc = rest;
-        if (acc >= NODE_LINK_MAX_MSG - 1) {
-            ESP_LOGE(TAG, "client: RX buffer overflow, reset");
-            acc = 0;
-        }
+        if (acc >= NODE_LINK_MAX_MSG - 1) acc = 0;
     }
     free(buf);
     vTaskDelete(NULL);
@@ -389,30 +356,24 @@ esp_err_t node_link_client_send(const char *json, size_t len)
     char *out = malloc(len + 8);
     if (!out) { xSemaphoreGive(s_client_send_mutex); return ESP_ERR_NO_MEM; }
     int n = snprintf(out, len + 8, "status:%.*s\n", (int)len, json);
-    int sent = 0;
-    int waited_ms = 0;
+    int sent = 0, waited_ms = 0;
     esp_err_t result = ESP_OK;
     while (sent < n) {
         int r = send(s_client_sock, out + sent, n - sent, 0);
         if (r <= 0) {
             if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 if (waited_ms >= SEND_RETRY_MAX_MS) {
-                    ESP_LOGW(TAG, "send_status: EAGAIN after %d ms", waited_ms);
                     s_client_connected = false;
                     close(s_client_sock); s_client_sock = -1;
-                    result = ESP_FAIL;
-                    break;
+                    result = ESP_FAIL; break;
                 }
                 vTaskDelay(pdMS_TO_TICKS(SEND_RETRY_STEP_MS));
                 waited_ms += SEND_RETRY_STEP_MS;
                 continue;
             }
-            ESP_LOGW(TAG, "send_status failed: sent=%d/%d errno=%d",
-                     sent, n, errno);
             s_client_connected = false;
             close(s_client_sock); s_client_sock = -1;
-            result = ESP_FAIL;
-            break;
+            result = ESP_FAIL; break;
         }
         sent += r;
         waited_ms = 0;
@@ -432,30 +393,24 @@ esp_err_t node_link_client_send_evt(const char *evt, size_t len)
     char *out = malloc(len + 8);
     if (!out) { xSemaphoreGive(s_client_send_mutex); return ESP_ERR_NO_MEM; }
     int n = snprintf(out, len + 8, "evt:%.*s\n", (int)len, evt);
-    int sent = 0;
-    int waited_ms = 0;
+    int sent = 0, waited_ms = 0;
     esp_err_t result = ESP_OK;
     while (sent < n) {
         int r = send(s_client_sock, out + sent, n - sent, 0);
         if (r <= 0) {
             if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                 if (waited_ms >= SEND_RETRY_MAX_MS) {
-                    ESP_LOGW(TAG, "send_evt: EAGAIN after %d ms", waited_ms);
                     s_client_connected = false;
                     close(s_client_sock); s_client_sock = -1;
-                    result = ESP_FAIL;
-                    break;
+                    result = ESP_FAIL; break;
                 }
                 vTaskDelay(pdMS_TO_TICKS(SEND_RETRY_STEP_MS));
                 waited_ms += SEND_RETRY_STEP_MS;
                 continue;
             }
-            ESP_LOGW(TAG, "send_evt failed: sent=%d/%d errno=%d",
-                     sent, n, errno);
             s_client_connected = false;
             close(s_client_sock); s_client_sock = -1;
-            result = ESP_FAIL;
-            break;
+            result = ESP_FAIL; break;
         }
         sent += r;
         waited_ms = 0;
@@ -475,8 +430,6 @@ void node_link_stop(void)
     if (s_root_client_sock >= 0) { close(s_root_client_sock); s_root_client_sock = -1; }
     s_client_connected = false;
 }
-
-// === ВАРИАНТ B: новые функции ===
 
 bool node_link_wait_for_client(uint32_t timeout_ms)
 {

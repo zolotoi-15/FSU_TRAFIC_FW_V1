@@ -5,13 +5,6 @@
     "name": "Тестовая мастерская — 2 направления + дублёр + пешеход (MESH)"
   },
 
-  "espnow": {
-    "enabled": true,
-    "channel": 3,
-    "slave_mac": "",
-    "status_period_ms": 1000
-  },
-
   "wifi": {
     "ssid": "Keenetic-4251",
     "password": "VTuVMHPi"
@@ -76,10 +69,6 @@
     { "id": 4, "name": "Фаза.4 (пешеходный)",         "groups": [4] }
   ],
 
-  "detectors": [
-    { "id": 1, "name": "Детектор.1" }
-  ],
-
   "plans": [
     { "id": 2, "name": "Программа.2", "algorithm": { "type": "Special", "mode": "AB" } },
     {
@@ -112,21 +101,8 @@
     ]
   },
 
-  "controlSources": [
-    { "id": 2, "name": "JsonRpc-tcp", "priority": 14, "type": "JsonRPC",   "url": "tcp-listen://127.0.0.1:15557/" },
-    { "id": 3, "name": "tcp",         "priority": 15, "type": "JsConsole", "url": "tcp-listen://127.0.0.1:15555/" },
-    { "id": 8, "name": "its",         "priority": 11 },
-    { "id": 9, "name": "emergency",   "priority": 9999 }
-  ],
-
   "modules": {
-    "SystemBus": {
-      "port": {
-        "baudRate": 921600,
-        "portName": "/dev/ttyO1",
-        "rs485enabled": true,
-        "rs485rtsAfterSend": true
-      },
+    "SystemBus": {      
       "devices": {
         "KSK1": {
           "switches": {
@@ -148,32 +124,7 @@
           }
         }
       }
-    },
-    "Keyboard": {
-      "deviceName": "/dev/extbuttons",
-      "channels": [
-        { "keyCode": 513 },
-        { "keyCode": 514 },
-        { "keyCode": 515 },
-        { "keyCode": 516 }
-      ]
-    },
-    "SpectrITS": {
-      "controlSource": "its",
-      "controlTimeout": 120,
-      "url": "tcp://81.30.126.14:49500/"
-    },
-    "TrafiCam": [
-      {
-        "ti_host": "172.16.16.234",
-        "ti_port": 6070,
-        "channels": [ { "channel": 1, "detector": 1 } ]
-      }
-    ],
-    "TrafficStream": [
-      { "url": "" },
-      { "url": null }
-    ]
+    }   
   },
 
   "traffic": {

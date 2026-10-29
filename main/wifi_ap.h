@@ -42,9 +42,12 @@ esp_err_t wifi_sta_start_after_ppp_fail(void);
 esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
                                int8_t *out_rssi, uint8_t *out_channel,
                                const char *ssid_prefix);
-esp_err_t wifi_ap_start_only(const char *ssid, const char *password);
-esp_err_t wifi_sta_start_after_ppp_fail(void);
 
+/* === FIX: временное отключение AP/STA для освобождения heap ===
+   Используется при парсинге большого JSON (/SetJson), когда
+   heap фрагментирован и cJSON не может выделить дерево. */
+esp_err_t wifi_ap_suspend_for_parse(void);
+esp_err_t wifi_ap_resume_after_parse(void);
 
 #ifdef __cplusplus
 }

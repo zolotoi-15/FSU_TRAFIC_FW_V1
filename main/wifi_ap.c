@@ -3,13 +3,14 @@
 #include "config_manager.h"
 #include "modem_ppp.h"
 #include "esp_wifi.h"
-#include "esp_wifi_types.h"   // для wifi_sta_list_t (IDF v6.1+)
+#include "esp_wifi_types.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,6 +24,10 @@ static const char *TAG = "WIFI";
 #define WIFI_STA_TX_POWER_VAL  34
 #define WIFI_AP_TX_POWER_VAL   34
 #define AP_MAX_STA_CONN        2
+
+#ifndef AP_PASSWORD
+#define AP_PASSWORD "fsu12345678"
+#endif
 
 /* ============================================================
    STA state
@@ -70,7 +75,9 @@ static char   s_ap_ssid_cur[33] = {0};
 static char   s_ap_ip_str[16]   = "192.168.4.1";
 static esp_netif_t *s_ap_netif  = NULL;
 
-
+/* === FIX: suspend/resume for parse === */
+static bool s_ap_suspended = false;
+static char s_suspended_ssid[33] = {0};
 
 static const char* reason_str(uint8_t r) {
     switch (r) {
@@ -268,7 +275,6 @@ void wifi_init(void)
     }
 
     esp_wifi_set_storage(WIFI_STORAGE_RAM);
-   // esp_wifi_restore();
 
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID,    evt_handler, NULL);
     esp_event_handler_register(IP_EVENT,   IP_EVENT_STA_GOT_IP, evt_handler, NULL);
@@ -346,8 +352,6 @@ void wifi_stop(void)
 
 /* ============================================================
    wifi_ap_start_only — только AP (WIFI_MODE_AP), канал 6.
-   Используется на root при старте, пока PPPoS не подтверждён.
-   Beacon «разбужен» для ESP32-S3 (IDF v6.1+).
    ============================================================ */
 esp_err_t wifi_ap_start_only(const char *ssid, const char *password)
 {
@@ -369,13 +373,12 @@ esp_err_t wifi_ap_start_only(const char *ssid, const char *password)
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_AP);
     if (err != ESP_OK) return err;
 
-    // Country Code — обязателен для ESP32-S3
     wifi_country_t country = {
         .cc = "RU", .schan = 1, .nchan = 13,
         .policy = WIFI_COUNTRY_POLICY_MANUAL
     };
     esp_wifi_set_country(&country);
-    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);   // IDF v6.1: WIFI_BW20
+    esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
 
     wifi_config_t ap_cfg = {0};
     strncpy((char*)ap_cfg.ap.ssid, s_ap_ssid_cur, sizeof(ap_cfg.ap.ssid) - 1);
@@ -400,7 +403,6 @@ esp_err_t wifi_ap_start_only(const char *ssid, const char *password)
     err = esp_wifi_start();
     if (err != ESP_OK && err != ESP_ERR_WIFI_INIT_STATE) return err;
 
-    // «Пробуждение» beacon для ESP32-S3 (IDF v6.1+)
     vTaskDelay(pdMS_TO_TICKS(150));
 
     wifi_sta_list_t *sta_list = calloc(1, sizeof(wifi_sta_list_t) +
@@ -413,7 +415,7 @@ esp_err_t wifi_ap_start_only(const char *ssid, const char *password)
         free(sta_list);
     }
 
-    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);   // refresh beacon buffer
+    esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
 
     s_ap_is_running = true;
     ESP_LOGI(TAG, "AP-only started: SSID='%s' ch=6 (beacon awake, country=RU)",
@@ -478,7 +480,7 @@ void wifi_ap_stop(void)
 }
 
 /* ============================================================
-   wifi_sta_start_after_ppp_fail — STA fallback, если PPPoS не поднялся.
+   wifi_sta_start_after_ppp_fail — STA fallback
    ============================================================ */
 esp_err_t wifi_sta_start_after_ppp_fail(void)
 {
@@ -618,4 +620,69 @@ esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
     free(list);
     esp_wifi_clear_ap_list();
     return ret;
+}
+
+/* ============================================================
+   FIX: временное отключение AP для освобождения heap при парсинге
+   ============================================================ */
+esp_err_t wifi_ap_suspend_for_parse(void)
+{
+    if (s_ap_suspended) return ESP_OK;
+    if (!s_ap_is_running) {
+        ESP_LOGI(TAG, "wifi_ap_suspend: AP not running, nothing to suspend");
+        return ESP_OK;
+    }
+
+    /* Сохраняем SSID для восстановления */
+    snprintf(s_suspended_ssid, sizeof(s_suspended_ssid), "%s", s_ap_ssid_cur);
+
+    ESP_LOGW(TAG, "wifi_ap_suspend: stopping AP '%s' for parse "
+                  "(heap free=%u, largest=%u)",
+             s_suspended_ssid,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+
+    /* Останавливаем Wi-Fi. Это освобождает буферы AP (~10-15 КБ). */
+    esp_err_t err = esp_wifi_stop();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi_ap_suspend: esp_wifi_stop failed: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    s_ap_is_running = false;
+    s_ap_suspended = true;
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    ESP_LOGW(TAG, "wifi_ap_suspend: AP stopped, "
+                  "heap free=%u, largest=%u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    return ESP_OK;
+}
+
+esp_err_t wifi_ap_resume_after_parse(void)
+{
+    if (!s_ap_suspended) return ESP_OK;
+
+    ESP_LOGI(TAG, "wifi_ap_resume: restarting AP '%s' (heap free=%u, largest=%u)",
+             s_suspended_ssid,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+
+    esp_err_t err = wifi_ap_start_only(s_suspended_ssid, AP_PASSWORD);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "wifi_ap_resume: wifi_ap_start_only failed: %s",
+                 esp_err_to_name(err));
+        return err;
+    }
+
+    s_ap_suspended = false;
+
+    ESP_LOGI(TAG, "wifi_ap_resume: AP restarted, "
+                  "heap free=%u, largest=%u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    return ESP_OK;
 }
