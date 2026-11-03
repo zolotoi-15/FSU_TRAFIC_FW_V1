@@ -155,7 +155,7 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         }
         return;
     }
-    
+
     // === FIX: Обработка ping обновляет таймер последней связи, предотвращая ALL_OFF ===
     if (strcmp(buf, "ping") == 0) {
         s_last_sync_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -568,6 +568,7 @@ static void root_heartbeat_task(void *arg)
 
 void node_proto_start_root_tasks(void)
 {
-    xTaskCreate(root_heartbeat_task, "root_hb", 3072, NULL, 3, NULL);
+    /* === FIX: стек 3072 → 8192 (переполнение при transport_send_cmd) === */
+    xTaskCreate(root_heartbeat_task, "root_hb", 8192, NULL, 3, NULL);
 }
 // ================================================

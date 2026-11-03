@@ -1,11 +1,6 @@
 /* ============================================================
    blink_example_main.c — PRODUCTION app_main().
-   ROOT: PPP → MQTT → LoRa (единственный канал к NODE).
-   NODE: LoRa → телеметрия → ROOT → MQTT.
-
-   === NO WIFI ===
-   Wi-Fi (STA и AP) полностью отключён. Обмен ROOT↔NODE
-   только через LoRa. PPPoS (модем) — не Wi-Fi, оставлен.
+   === FIX: cfg_push_task использует malloc(8192), не 16384 ===
    ============================================================ */
 
 #include <stdio.h>
@@ -15,7 +10,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "esp_wifi.h"             /* нужен для wifi_ap_record_t в mqtt_json.c */
+#include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
@@ -32,9 +27,9 @@
 #include "traffic_light.h"
 #include "traffic_nvs.h"
 #include "config_manager.h"
-#include "wifi_ap.h"              /* нужен для wifi_get_ip()/wifi_sta_connected() — заглушки */
+#include "wifi_ap.h"
 #include "wifi_mqtt.h"
-#include "node_link.h"            /* нужен для node_link_server_has_client() — заглушка */
+#include "node_link.h"
 #include "node_proto.h"
 #include "transport.h"
 #include "lora.h"
@@ -242,6 +237,7 @@ static void rtc_init(void)
     }
 }
 
+/* === FIX: cfg_push_task с malloc(8192) === */
 static void cfg_push_task(void *arg)
 {
     ESP_LOGI(TAG, "cfg_push_task: waiting for LoRa...");
@@ -260,8 +256,8 @@ static void cfg_push_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     extern bool config_export_json(char *b, size_t *l);
-    char *buf = malloc(16384);
-    size_t blen = 16384;
+    char *buf = malloc(8192);
+    size_t blen = 8192;
     if (!buf || !config_export_json(buf, &blen)) {
         ESP_LOGE(TAG, "cfg_push: export failed");
         free(buf);
@@ -340,23 +336,17 @@ void app_main(void)
     esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, on_got_ip, NULL);
 
     if (is_root) {
-        /* ─────────────── ROOT ─────────────── */
         ESP_LOGI(TAG, "=== ROOT init (no Wi-Fi AP) ===");
 
         connectivity_start_tasks();
         root_wd_start_tasks();
         mux_app_task_start();
 
-        // === FIX: Запуск задачи heartbeat для поддержания и восстановления связи LoRa ===
         node_proto_start_root_tasks();
-        // ================================================================================
-
-        // xTaskCreate(cfg_push_task, "cfg_push", 4096, NULL, 3, NULL); // Оставлено закомментированным, как в оригинале
 
         ESP_LOGI(TAG, "ROOT ready: LoRa only, MQTT via PPP");
 
     } else {
-        /* ─────────────── NODE ─────────────── */
         ESP_LOGI(TAG, "=== NODE init (no Wi-Fi STA) ===");
 
         node_proto_start_tasks();

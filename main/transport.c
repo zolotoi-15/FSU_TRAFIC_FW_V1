@@ -1,12 +1,7 @@
 /* ============================================================
    transport.c — LoRa-транспорт (единственный канал).
-   T_CMD / T_STATUS — fire-and-forget.
-   T_CFG / T_EVT — ACK 1500 мс (CFG) / 800 мс (EVT).
-   === FIX: CFG_NEW_BURST_MS = 2000 ===
-   === FIX: ACK_TIMEOUT_CFG = 1500 ===
-   === FIX: игнорировать flag=0 при accum_len==0 ===
-   === FIX: игнорировать CFG < 3000 байт ===
-   === FIX: s_last_cfg_frag_ms = 0 при завершении ===
+   === FIX: диагностика CFG-фрагментов (chunk/accum_before) ===
+   === FIX: hexdump CFG_TAIL_RX после сборки ===
    ============================================================ */
 
 #include "transport.h"
@@ -37,7 +32,7 @@ static const char *TAG = "transport";
 #define PKT_MAGIC         0x4C
 #define PKT_MAX           240
 #define ACK_TIMEOUT       800
-#define ACK_TIMEOUT_CFG   1500     /* было 800 */
+#define ACK_TIMEOUT_CFG   1500
 #define MAX_RETRIES       3
 
 #define ACCUM_CFG_MAX     8192
@@ -45,8 +40,8 @@ static const char *TAG = "transport";
 #define ACCUM_STATUS_MAX  4096
 #define ACCUM_EVT_MAX     1024
 
-#define CFG_NEW_BURST_MS  2000     /* было 1500 */
-#define CFG_MIN_VALID_LEN 3000     /* минимальный размер CFG */
+#define CFG_NEW_BURST_MS  2000
+#define CFG_MIN_VALID_LEN 3000
 
 enum { T_CMD = 1, T_CFG = 2, T_STATUS = 3, T_EVT = 4, T_ACK = 5 };
 
@@ -232,7 +227,7 @@ static esp_err_t lora_send_fragmented(uint8_t type, const char *data, size_t len
     return ESP_OK;
 }
 
-/* === FIX: лог RX junk, игнорирование flag=0 при accum_len==0, CFG < 3000 === */
+/* === FIX: диагностика CFG-фрагментов === */
 static void lora_raw_handler(const uint8_t *data, size_t len)
 {
     if (len < 4 || data[0] != PKT_MAGIC) {
@@ -276,7 +271,6 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
     uint8_t flag  = data[4];
     size_t  chunk = plen - 1;
 
-    /* === FIX: пауза > 2000 мс между фрагментами CFG → новый CFG → сброс === */
     if (type == T_CFG && flag == 0x01) {
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
         if (*accum_len > 0 && (now - s_last_cfg_frag_ms) > CFG_NEW_BURST_MS) {
@@ -303,6 +297,13 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
     }
 #endif
 
+    /* === FIX: диагностика каждого CFG-фрагмента === */
+    if (type == T_CFG) {
+        ESP_LOGI(TAG, "CFG frag: seq=%u flag=%u plen=%u chunk=%u accum_before=%u",
+                 seq, flag, plen, (unsigned)chunk, (unsigned)*accum_len);
+    }
+    /* === END FIX === */
+
     if (*accum_len + chunk < max_len) {
         memcpy(&accum[*accum_len], &data[5], chunk);
         *accum_len += chunk;
@@ -313,7 +314,6 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
     }
 
     if (flag == 0x00) {
-        /* === FIX: последний фрагмент без первого — игнорировать === */
         if (*accum_len == 0) {
             ESP_LOGW(TAG, "RX %s last frag but accum empty — ignore",
                      pkt_type_str(type));
@@ -321,7 +321,6 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
         }
         accum[*accum_len] = '\0';
 
-        /* === FIX: CFG слишком короткий — игнорировать === */
         if (type == T_CFG && *accum_len < CFG_MIN_VALID_LEN) {
             ESP_LOGW(TAG, "RX CFG too short (%u < %u) — ignore",
                      (unsigned)*accum_len, CFG_MIN_VALID_LEN);
@@ -334,6 +333,16 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
         ESP_LOGI(TAG, "RX %s assembled: %u bytes",
                  pkt_type_str(type), (unsigned)*accum_len);
 #endif
+
+        /* === FIX: для CFG показать реальный хвост строки === */
+        if (type == T_CFG) {
+            size_t tail_n = *accum_len > 32 ? 32 : *accum_len;
+            size_t off = *accum_len - tail_n;
+            ESP_LOG_BUFFER_HEXDUMP("CFG_TAIL_RX",
+                                   accum + off, tail_n, ESP_LOG_ERROR);
+        }
+        /* === END FIX === */
+
         switch (type) {
             case T_CMD:    if (s_cmd_cb)    s_cmd_cb(accum, *accum_len);    break;
             case T_CFG:    if (s_cfg_cb)    s_cfg_cb(accum, *accum_len);    break;
@@ -341,7 +350,7 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
             case T_EVT:    if (s_evt_cb)    s_evt_cb(accum, *accum_len);    break;
         }
         *accum_len = 0;
-        s_last_cfg_frag_ms = 0;   /* === FIX: сброс после завершения === */
+        s_last_cfg_frag_ms = 0;
     }
 }
 

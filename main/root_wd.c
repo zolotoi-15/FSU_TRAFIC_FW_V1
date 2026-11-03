@@ -1,12 +1,7 @@
 /* ============================================================
    root_wd.c — ROOT: watchdog NODE по LoRa + phase sync.
    === FIX: симметричное восстановление ===
-   ROOT замечает перезагрузку NODE (STATUS STOPPED после RUNNING)
-   и повторно шлёт traffic:start + sync: + CFG.
-   ROOT не двигает фазы сам (follow_root=true), применяет через
-   apply_ms — синхронно с NODE.
-   cfg_push_task — постоянный цикл (не vTaskDelete), повтор CFG
-   при s_cfg_ack == false.
+   === FIX: буфер cfg_push уменьшен 16384 → 8192 ===
    ============================================================ */
 
 #include "root_wd.h"
@@ -45,7 +40,6 @@ static volatile bool s_follow_root_set = false;
 
 /* ============================================================
    send_sync_to_node — шлёт sync: с apply_ms.
-   === FIX: не static (вызывается из node_proto.c) ===
    ============================================================ */
 uint32_t send_sync_to_node(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms)
 {
@@ -74,7 +68,6 @@ uint32_t send_sync_to_node(uint8_t phase, uint32_t phase_ms, uint32_t duration_m
 
 /* ============================================================
    apply_sync_at — ждёт apply_ms и применяет traffic_light_force_phase.
-   === FIX: не static ===
    ============================================================ */
 void apply_sync_at(uint8_t phase, uint32_t phase_ms,
                    uint32_t duration_ms, uint32_t apply_ms)
@@ -172,7 +165,6 @@ static void root_node_watchdog_task(void *arg)
 
 /* ============================================================
    phase_sync_task — sync фазы через LoRa с apply_ms.
-   ROOT не двигает фазы сам (follow_root=true).
    ============================================================ */
 static void phase_sync_task(void *arg)
 {
@@ -238,14 +230,12 @@ static void phase_sync_task(void *arg)
 
 /* ============================================================
    === FIX: cfg_push_task — постоянный цикл (не vTaskDelete) ===
-   Раз в CFG_RETRY_PERIOD_MS (10 с) проверяет: если s_cfg_ack == false
-   (NODE не подтвердил CFG или перезагрузился) — повторяет CFG.
+   === FIX: буфер 16384 → 8192 ===
    ============================================================ */
 static void cfg_push_task(void *arg)
 {
     ESP_LOGI(TAG, "cfg_push_task started (continuous retry)");
 
-    /* Первый запуск — ждём NODE */
     uint32_t waited = 0;
     while (!transport_is_lora() && waited < 10000) {
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -268,13 +258,14 @@ static void cfg_push_task(void *arg)
         if (!transport_is_lora()) continue;
         if (s_last_node_msg_ms == 0) continue;
         if (s_cfg_pushing) continue;
-        if (s_cfg_ack) continue;   /* CFG подтверждён — не шлём */
+        if (s_cfg_ack) continue;
 
         ESP_LOGI(TAG, "cfg_push: retry (s_cfg_ack=false)");
 
         extern bool config_export_json(char *b, size_t *l);
-        char *buf = malloc(16384);
-        size_t blen = 16384;
+        /* === FIX: 16384 → 8192 === */
+        char *buf = malloc(8192);
+        size_t blen = 8192;
         if (!buf || !config_export_json(buf, &blen)) {
             free(buf);
             continue;
@@ -282,7 +273,6 @@ static void cfg_push_task(void *arg)
 
         s_cfg_pushing = true;
 
-        /* подождать 3 с, чтобы NODE вернулся в RX */
         vTaskDelay(pdMS_TO_TICKS(CFG_PUSH_RX_WAIT_MS));
 
         for (int attempt = 0; attempt < 10; attempt++) {

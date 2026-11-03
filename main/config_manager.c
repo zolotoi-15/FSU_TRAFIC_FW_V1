@@ -27,10 +27,6 @@ app_config_t g_config;
 
 /* ============================================================
    Кэш JSON-конфига.
-   cJSON_PrintUnformatted для 7.6 КБ конфига требует ~15 КБ heap.
-   При частых accept() (node переподключается) heap фрагментируется,
-   и Print падает. Кэшируем результат один раз, инвалидируем при
-   изменении конфига (config_load_json / config_save / reset).
    ============================================================ */
 static char  *s_cfg_json_cache = NULL;
 static size_t s_cfg_json_len   = 0;
@@ -561,14 +557,29 @@ bool config_load_json(const char *json, size_t len)
         return false;
     }
 
+    /* === FIX: диагностика ошибки cJSON === */
     cJSON *root = cJSON_ParseWithLength(json, len);
     if (!root) {
-        ESP_LOGE(TAG, "JSON parse error (cJSON returned NULL, "
-                      "free=%u, largest=%u)",
+        const char *err = cJSON_GetErrorPtr();
+        size_t off = (err && err >= json) ? (size_t)(err - json) : 0;
+        ESP_LOGE(TAG, "JSON parse error at offset %u / %u",
+                 (unsigned)off, (unsigned)len);
+        if (err) {
+            ESP_LOGE(TAG, "JSON error near: %.60s", err);
+        }
+        size_t head = len > 64 ? 64 : len;
+        ESP_LOG_BUFFER_HEXDUMP("CFG_HEAD", json, head, ESP_LOG_ERROR);
+        if (len > 64) {
+            size_t tail_off = len - 64;
+            ESP_LOG_BUFFER_HEXDUMP("CFG_TAIL", json + tail_off, 64, ESP_LOG_ERROR);
+        }
+        ESP_LOGE(TAG, "cfg free=%u, largest=%u",
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return false;
     }
+    /* === END FIX === */
+
     ESP_LOGI(TAG, "Parsing JSON config (%u bytes)", (unsigned)len);
 
     device_role_t saved_role = g_config.role;
@@ -669,14 +680,11 @@ static const char *ped_request_mode_to_str(uint8_t m)
 
 /* ============================================================
    config_export_json — сериализация g_config в JSON.
-   Возвращает true и заполняет buf/len.
-   Использует кэш s_cfg_json_cache (инвалидируется в config_save).
    ============================================================ */
 bool config_export_json(char *buf, size_t *len)
 {
     if (!buf || !len || *len < 256) return false;
 
-    /* Кэш */
     if (s_cfg_json_cache) {
         if (s_cfg_json_len + 1 > *len) {
             ESP_LOGE(TAG, "config_export_json: cache too big (%u > %u)",
@@ -701,7 +709,6 @@ bool config_export_json(char *buf, size_t *len)
         return false;
     }
 
-    /* ─── meta ─── */
     cJSON *meta = cJSON_AddObjectToObject(root, "meta");
     if (meta) {
         cJSON_AddNumberToObject(meta, "version", g_config.version);
@@ -709,7 +716,6 @@ bool config_export_json(char *buf, size_t *len)
         cJSON_AddStringToObject(meta, "name", g_config.name);
     }
 
-    /* ─── espnow ─── */
     cJSON *en = cJSON_AddObjectToObject(root, "espnow");
     if (en) {
         cJSON_AddBoolToObject(en, "enabled", g_config.espnow.enabled);
@@ -724,17 +730,14 @@ bool config_export_json(char *buf, size_t *len)
         cJSON_AddStringToObject(en, "slave_mac", mac);
     }
 
-    /* ─── wifi ─── */
     cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
     if (wifi) {
         cJSON_AddStringToObject(wifi, "ssid", g_config.wifi_ssid);
         cJSON_AddStringToObject(wifi, "password", g_config.wifi_password);
     }
 
-    /* ─── timezone ─── */
     cJSON_AddStringToObject(root, "timezone", g_config.timezone);
 
-    /* ─── mqtt ─── */
     cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
     if (mqtt) {
         cJSON_AddBoolToObject(mqtt, "enabled", g_config.mqtt_enabled);
@@ -746,14 +749,12 @@ bool config_export_json(char *buf, size_t *len)
                                 g_config.mqtt_timepause_min);
     }
 
-    /* ─── traffic ─── */
     cJSON *t = cJSON_AddObjectToObject(root, "traffic");
     if (t) {
         cJSON_AddNumberToObject(t, "mode", g_config.traffic.mode);
         cJSON_AddBoolToObject(t, "enabled", g_config.traffic.enabled);
         cJSON_AddBoolToObject(t, "auto_start", g_config.traffic.auto_start);
 
-        /* pedestrian */
         cJSON *ped = cJSON_AddObjectToObject(t, "pedestrian");
         if (ped) {
             cJSON_AddBoolToObject(ped, "button_enabled",
@@ -767,7 +768,6 @@ bool config_export_json(char *buf, size_t *len)
                                     g_config.traffic.pedestrian.min_recall_s);
         }
 
-        /* pins */
         cJSON *pins = cJSON_AddObjectToObject(t, "pins");
         if (pins) {
             cJSON *single = cJSON_AddObjectToObject(pins, "single");
@@ -821,7 +821,6 @@ bool config_export_json(char *buf, size_t *len)
             }
         }
 
-        /* phases_ms */
         cJSON *ph = cJSON_AddObjectToObject(t, "phases_ms");
         if (ph) {
             cJSON_AddNumberToObject(ph, "red",
@@ -846,7 +845,6 @@ bool config_export_json(char *buf, size_t *len)
                                     g_config.traffic.phases_ms.phase_blink_period);
         }
 
-        /* fault */
         cJSON *f = cJSON_AddObjectToObject(t, "fault");
         if (f) {
             cJSON_AddNumberToObject(f, "imin_mv",
@@ -863,7 +861,6 @@ bool config_export_json(char *buf, size_t *len)
                                     g_config.traffic.fault.vin_off_confirmations);
         }
 
-        /* stages_dd */
         cJSON *stages = cJSON_AddArrayToObject(t, "stages_dd");
         if (stages) {
             for (int i = 0; i < g_config.traffic.stage_count; i++) {
@@ -892,14 +889,12 @@ bool config_export_json(char *buf, size_t *len)
             }
         }
 
-        /* sequence */
         cJSON *seq = cJSON_AddArrayToObject(t, "sequence");
         if (seq) {
             for (int i = 0; i < g_config.traffic.sequence_count; i++)
                 cJSON_AddItemToArray(seq, cJSON_CreateNumber(g_config.traffic.sequence[i]));
         }
 
-        /* transitions */
         cJSON *tr = cJSON_AddArrayToObject(t, "transitions");
         if (tr) {
             for (int i = 0; i < g_config.traffic.transition_count; i++) {
@@ -914,7 +909,6 @@ bool config_export_json(char *buf, size_t *len)
         }
     }
 
-    /* ─── shift_register ─── */
     cJSON *sr = cJSON_AddObjectToObject(root, "shift_register");
     if (sr) {
         cJSON *outs = cJSON_AddArrayToObject(sr, "outputs");
@@ -951,7 +945,6 @@ bool config_export_json(char *buf, size_t *len)
     buf[n] = '\0';
     *len = n;
 
-    /* Сохранить в кэш */
     s_cfg_json_cache = strdup(out);
     s_cfg_json_len = n;
     free(out);
