@@ -125,7 +125,6 @@ static void on_cfg_from_root(const char *json, size_t len)
 
 /* ============================================================
    on_cmd_from_root — обработать команду от ROOT.
-   === FIX: sync: с apply_ms — ждать и применить ===
    ============================================================ */
 static void on_cmd_from_root(const char *cmd, size_t len)
 {
@@ -156,10 +155,14 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         }
         return;
     }
+    
+    // === FIX: Обработка ping обновляет таймер последней связи, предотвращая ALL_OFF ===
     if (strcmp(buf, "ping") == 0) {
         s_last_sync_ms = (uint32_t)(esp_timer_get_time() / 1000);
         return;
     }
+    // ================================================================================
+
     if (strncmp(buf, "ping:", 5) == 0) {
         unsigned int ts = 0;
         if (sscanf(buf + 5, "%u", &ts) == 1) {
@@ -185,18 +188,15 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         return;
     }
 
-    /* === FIX: sync: с apply_ms (5 полей) === */
     if (strncmp(buf, "sync:", 5) == 0) {
         unsigned ph = 0, pm = 0, dur = 0, ts = 0, apply_ms = 0;
         int blink_on = -1;
 
-        /* новый формат: sync:ph:pm:dur:apply_ms (5 полей) */
         int matched = sscanf(buf + 5, "%u:%u:%u:%u:%u",
                              &ph, &pm, &dur, &ts, &apply_ms);
 
-        /* обратная совместимость: sync:ph:pm:dur (3 поля) */
         if (matched == 3) {
-            apply_ms = 0;   /* применить сразу */
+            apply_ms = 0;
         } else if (matched < 4) {
             return;
         }
@@ -208,7 +208,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         uint32_t corr = pm + delay_us / 1000;
         if (dur > 0 && corr >= dur) corr = dur - 1;
 
-        /* === FIX: ждать apply_ms (если 0 < wait <= SYNC_APPLY_MAX_WAIT_MS) === */
         if (apply_ms != 0) {
             uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
             int32_t wait_ms = (int32_t)(apply_ms - now_ms);
@@ -332,6 +331,31 @@ static void on_node_status_from_transport(const char *json, size_t len)
     if (s_last_node_pub_ms != 0 && (now - s_last_node_pub_ms) < 2000) return;
     s_last_node_pub_ms = now;
     wifi_mqtt_publish_node_json(json, len);
+
+    /* === FIX: ROOT замечает перезагрузку NODE (STOPPED после RUNNING) === */
+    if (g_config.role == DEVICE_ROLE_MASTER) {
+        static bool s_node_was_running = false;
+        bool node_running = (strstr(json, "\"state\":\"RUNNING\"") != NULL);
+        if (!node_running && s_node_was_running) {
+            ESP_LOGW(TAG, "NODE stopped (reboot?) → s_cfg_ack=false, "
+                          "re-send traffic:start + sync:");
+            s_cfg_ack = false;
+
+            transport_send_cmd("traffic:start", strlen("traffic:start"));
+            if (traffic_light_get_state() == TRAFFIC_STATE_RUNNING) {
+                uint8_t phase = traffic_light_get_phase();
+                uint32_t pm = traffic_light_get_phase_ms();
+                uint32_t dur = traffic_light_get_phase_duration_ms();
+                extern uint32_t send_sync_to_node(uint8_t, uint32_t, uint32_t);
+                extern void     apply_sync_at(uint8_t, uint32_t, uint32_t, uint32_t);
+                uint32_t apply_ms = send_sync_to_node(phase, pm, dur);
+                if (apply_ms != 0) {
+                    apply_sync_at(phase, pm, dur, apply_ms);
+                }
+            }
+        }
+        s_node_was_running = node_running;
+    }
 }
 
 static void on_evt_from_node(const char *evt, size_t len)
@@ -361,9 +385,6 @@ static void on_evt_from_node(const char *evt, size_t len)
     }
 }
 
-/* ============================================================
-   cfg_ok_tx_task — периодический cfg:ok, пока не получен sync:
-   ============================================================ */
 static void cfg_ok_tx_task(void *arg)
 {
     ESP_LOGI(TAG, "cfg_ok_tx_task started");
@@ -529,3 +550,24 @@ void node_proto_start_tasks(void)
     xTaskCreate(cfg_ok_tx_task, "cfg_ok_tx", 4096, NULL, 3, NULL);
     xTaskCreate(node_link_watchdog_task, "node_wd", 3072, NULL, 3, NULL);
 }
+
+// === FIX: Добавлена задача heartbeat для ROOT ===
+static void root_heartbeat_task(void *arg)
+{
+    ESP_LOGI(TAG, "root_heartbeat_task started (5s period)");
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5000)); // было 10000
+        if (g_config.role == DEVICE_ROLE_MASTER) {
+            esp_err_t err = transport_send_cmd("ping", 4);
+            if (err == ESP_OK) {
+                ESP_LOGD(TAG, "ROOT: heartbeat ping sent to NODE");
+            }
+        }
+    }
+}
+
+void node_proto_start_root_tasks(void)
+{
+    xTaskCreate(root_heartbeat_task, "root_hb", 3072, NULL, 3, NULL);
+}
+// ================================================

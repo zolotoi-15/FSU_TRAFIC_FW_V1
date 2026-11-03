@@ -82,9 +82,6 @@ void blink_reset_rtt(void)
     traffic_light_set_sync_delay_us(0);
 }
 
-/* ============================================================
-   IP_EVENT handler — единый для PPP (Wi-Fi STA нет).
-   ============================================================ */
 static void on_got_ip(void *arg, esp_event_base_t base,
                       int32_t id, void *data)
 {
@@ -102,9 +99,6 @@ static void on_got_ip(void *arg, esp_event_base_t base,
     }
 }
 
-/* ============================================================
-   Pending config из NVS
-   ============================================================ */
 static bool nvs_app_cfg_exists(void)
 {
     nvs_handle_t nvs;
@@ -215,9 +209,6 @@ static void log_heap(const char *stage)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 }
 
-/* ============================================================
-   RTC init с проверкой наличия на шине.
-   ============================================================ */
 static void rtc_init(void)
 {
     i2c_bus_init();
@@ -251,16 +242,10 @@ static void rtc_init(void)
     }
 }
 
-/* ============================================================
-   ROOT: задача отправки конфига на NODE по LoRa.
-   Ждёт, пока LoRa-транспорт будет готов, и шлёт cfg несколько раз
-   (NODE может ещё грузиться). Без Wi-Fi — только LoRa.
-   ============================================================ */
 static void cfg_push_task(void *arg)
 {
     ESP_LOGI(TAG, "cfg_push_task: waiting for LoRa...");
 
-    /* Ждём, пока LoRa станет основным транспортом */
     uint32_t waited_ms = 0;
     while (!transport_is_lora() && waited_ms < 10000) {
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -272,7 +257,7 @@ static void cfg_push_task(void *arg)
         return;
     }
 
-    vTaskDelay(pdMS_TO_TICKS(2000));   /* дать NODE загрузиться */
+    vTaskDelay(pdMS_TO_TICKS(2000));
 
     extern bool config_export_json(char *b, size_t *l);
     char *buf = malloc(16384);
@@ -284,7 +269,6 @@ static void cfg_push_task(void *arg)
         return;
     }
 
-    /* Пробуем 5 раз с интервалом 3 с — пока NODE не ответит ACK */
     for (int attempt = 0; attempt < 5; attempt++) {
         ESP_LOGI(TAG, "cfg_push → LoRa attempt %d/5 (%u bytes)",
                  attempt + 1, (unsigned)blen);
@@ -305,14 +289,10 @@ static void cfg_push_task(void *arg)
     vTaskDelete(NULL);
 }
 
-/* ============================================================
-   app_main — БЕЗ Wi-Fi (STA и AP).
-   ============================================================ */
 void app_main(void)
 {
     ESP_LOGI(TAG, "Board bring-up (ROOT/NODE) — NO WIFI, LoRa only");
 
-    /* 1. NVS */
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -323,7 +303,6 @@ void app_main(void)
 
     log_heap("app_main start");
 
-    /* 2. Config */
     bool pending_applied = apply_pending_cfg_from_nvs();
     if (pending_applied) {
         log_heap("after pending_cfg applied");
@@ -336,33 +315,26 @@ void app_main(void)
     bool is_root = (g_config.role == DEVICE_ROLE_MASTER);
     ESP_LOGI(TAG, "role = %s", is_root ? "ROOT" : "NODE");
 
-    /* 3. Железо */
     board_hw_init();
     sr_init();
     sr_all_off();
     mux_init();
     mux_data_init();
 
-    /* 4. RTC */
     rtc_init();
     time_sync_init();
 
-    /* 5. Traffic light + fault */
     traffic_light_init();
     fault_handler_register();
     wifi_mqtt_apply_config_runtime();
 
-    /* 6. Кнопки */
     buttons_start_tasks();
 
-    /* 7. RS485 / CAN */
     connectivity_register_rs485_can();
 
-    /* 8. Transport (LoRa primary; TCP fallback отключён) */
     transport_init();
     node_proto_register_callbacks();
 
-    /* 9. IP-слой — только для PPP (Wi-Fi STA нет) */
     esp_netif_init();
     esp_event_loop_create_default();
     esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, on_got_ip, NULL);
@@ -371,17 +343,15 @@ void app_main(void)
         /* ─────────────── ROOT ─────────────── */
         ESP_LOGI(TAG, "=== ROOT init (no Wi-Fi AP) ===");
 
-        /* ❌ НЕТ wifi_init() / wifi_ap_start_only() */
-        /* ❌ НЕТ node_link_server_start() — TCP не нужен */
-
-        /* Модем (PPPoS) → MQTT. Только PPP, без Wi-Fi STA fallback. */
         connectivity_start_tasks();
-
         root_wd_start_tasks();
         mux_app_task_start();
 
-        /* Отправка cfg на NODE по LoRa */
-       // xTaskCreate(cfg_push_task, "cfg_push", 4096, NULL, 3, NULL);
+        // === FIX: Запуск задачи heartbeat для поддержания и восстановления связи LoRa ===
+        node_proto_start_root_tasks();
+        // ================================================================================
+
+        // xTaskCreate(cfg_push_task, "cfg_push", 4096, NULL, 3, NULL); // Оставлено закомментированным, как в оригинале
 
         ESP_LOGI(TAG, "ROOT ready: LoRa only, MQTT via PPP");
 
@@ -389,12 +359,7 @@ void app_main(void)
         /* ─────────────── NODE ─────────────── */
         ESP_LOGI(TAG, "=== NODE init (no Wi-Fi STA) ===");
 
-        /* ❌ НЕТ wifi_init() / wifi_start() */
-        /* ❌ НЕТ node_link_client_start() — TCP не нужен */
-
-        /* LoRa уже поднят transport_init(). NODE шлёт телеметрию. */
         node_proto_start_tasks();
-
         mux_app_task_start();
 
         ESP_LOGI(TAG, "NODE ready: LoRa only");
