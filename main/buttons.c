@@ -1,7 +1,6 @@
 /* ============================================================
    buttons.c — кнопки BOOT (роль) и P7 (пешеход).
-   P7: ROOT → transport_send_cmd("pedestrian:request")
-       NODE → transport_send_evt("pedestrian:request")
+   === FIX P3: P7 игнорируется при cfg_push / CFG rx ===
    ============================================================ */
 
 #include "buttons.h"
@@ -10,8 +9,9 @@
 #include "config_manager.h"
 #include "pi4ioe5v6408.h"
 #include "traffic_light.h"
-#include "transport.h"           /* === FIX: LoRa вместо TCP === */
+#include "transport.h"
 #include "wifi_mqtt.h"
+#include "root_wd.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_system.h"
@@ -127,9 +127,8 @@ static bool p7_read_raw(void)
 }
 
 /* ============================================================
-   === FIX: button_p7_task — LoRa вместо TCP ===
-   ROOT → transport_send_cmd("pedestrian:request")
-   NODE → transport_send_evt("pedestrian:request")
+   button_p7_task — LoRa вместо TCP.
+   === FIX P3: игнорируем P7 при cfg_push / CFG rx ===
    ============================================================ */
 static void button_p7_task(void *arg)
 {
@@ -155,17 +154,25 @@ static void button_p7_task(void *arg)
             if (same_count == BTN_DEBOUNCE_COUNT && raw != stable) {
                 stable = raw;
                 if (stable == true) {
+                    /* === FIX P3: не мешаем CFG === */
+                    if (s_cfg_pushing || transport_is_cfg_rx_in_progress()) {
+                        ESP_LOGW(TAG, "P7 ignored (CFG in progress)");
+                        last_raw = raw;
+                        same_count = 0;
+                        vTaskDelay(pdMS_TO_TICKS(BTN_POLL_MS));
+                        continue;
+                    }
+                    /* === END FIX P3 === */
+
                     ESP_LOGI(TAG, "P7 pressed (request_mode=%u)",
                              g_config.traffic.pedestrian.request_mode);
 
                     if (g_config.role == DEVICE_ROLE_MASTER) {
                         traffic_light_request_pedestrian();
-                        /* === FIX: LoRa вместо TCP === */
                         transport_send_cmd("pedestrian:request",
                                            strlen("pedestrian:request"));
                     } else {
                         traffic_light_request_pedestrian();
-                        /* === FIX: LoRa вместо TCP === */
                         transport_send_evt("pedestrian:request",
                                            strlen("pedestrian:request"));
                     }

@@ -1,6 +1,15 @@
 /* ============================================================
    blink_example_main.c — PRODUCTION app_main().
-   === FIX: cfg_push_task использует malloc(8192), не 16384 ===
+   ROOT: PPP → MQTT → LoRa (единственный канал к NODE).
+   NODE: LoRa → телеметрия → ROOT → MQTT.
+
+   === NO WIFI ===
+   Wi-Fi (STA и AP) полностью отключён. Обмен ROOT↔NODE
+   только через LoRa. PPPoS (модем) — не Wi-Fi, оставлен.
+
+   === FIX: удалён дубль cfg_push_task ===
+   Реальная cfg_push_task живёт в root_wd.c и запускается
+   из root_wd_start_tasks(). В этом файле она не нужна.
    ============================================================ */
 
 #include <stdio.h>
@@ -237,53 +246,7 @@ static void rtc_init(void)
     }
 }
 
-/* === FIX: cfg_push_task с malloc(8192) === */
-static void cfg_push_task(void *arg)
-{
-    ESP_LOGI(TAG, "cfg_push_task: waiting for LoRa...");
-
-    uint32_t waited_ms = 0;
-    while (!transport_is_lora() && waited_ms < 10000) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        waited_ms += 500;
-    }
-    if (!transport_is_lora()) {
-        ESP_LOGE(TAG, "cfg_push: LoRa not ready → abort");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(2000));
-
-    extern bool config_export_json(char *b, size_t *l);
-    char *buf = malloc(8192);
-    size_t blen = 8192;
-    if (!buf || !config_export_json(buf, &blen)) {
-        ESP_LOGE(TAG, "cfg_push: export failed");
-        free(buf);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    for (int attempt = 0; attempt < 5; attempt++) {
-        ESP_LOGI(TAG, "cfg_push → LoRa attempt %d/5 (%u bytes)",
-                 attempt + 1, (unsigned)blen);
-        esp_err_t err = transport_send_cfg(buf, blen);
-        if (err == ESP_OK) {
-            ESP_LOGI(TAG, "cfg_push: OK (attempt %d)", attempt + 1);
-            free(buf);
-            vTaskDelete(NULL);
-            return;
-        }
-        ESP_LOGW(TAG, "cfg_push: failed (attempt %d): %s",
-                 attempt + 1, esp_err_to_name(err));
-        vTaskDelay(pdMS_TO_TICKS(3000));
-    }
-
-    ESP_LOGE(TAG, "cfg_push: all attempts failed — NODE not responding");
-    free(buf);
-    vTaskDelete(NULL);
-}
+/* === FIX: cfg_push_task удалён — используется версия из root_wd.c === */
 
 void app_main(void)
 {
@@ -336,6 +299,7 @@ void app_main(void)
     esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, on_got_ip, NULL);
 
     if (is_root) {
+        /* ─────────────── ROOT ─────────────── */
         ESP_LOGI(TAG, "=== ROOT init (no Wi-Fi AP) ===");
 
         connectivity_start_tasks();
@@ -347,6 +311,7 @@ void app_main(void)
         ESP_LOGI(TAG, "ROOT ready: LoRa only, MQTT via PPP");
 
     } else {
+        /* ─────────────── NODE ─────────────── */
         ESP_LOGI(TAG, "=== NODE init (no Wi-Fi STA) ===");
 
         node_proto_start_tasks();

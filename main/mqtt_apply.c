@@ -1,6 +1,10 @@
 /* ============================================================
-   mqtt_apply.c
-   === FIX: без CFG / без связи → ALL_OFF (не STOPPED) ===
+   mqtt_apply.c — применение конфига к runtime.
+
+   === ПРАВИЛО ===
+   ROOT: ALL_OFF при старте. START — только из root_node_watchdog_task
+         ПОСЛЕ cfg:ok от NODE.
+   NODE: ALL_OFF при старте. START — только по traffic:start от ROOT.
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -67,39 +71,18 @@ void mqtt_apply_config_runtime(void)
         return;
     }
 
+    /* === ПРАВИЛО: ROOT и NODE при старте — ALL_OFF.
+       START делает root_node_watchdog_task (ROOT) после cfg:ok,
+       и NODE — по traffic:start от ROOT. === */
     if (g_config.role == DEVICE_ROLE_MASTER) {
-        int n = wifi_ap_client_count();
-        if (n <= 0) {
-            /* === FIX: без node → ALL_OFF, ждём node + cfg:ok === */
-            ESP_LOGI(TAG, "ROOT: no node → ALL_OFF "
-                          "(wait for node + cfg:ok)");
-            traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
-            return;
-            /* === END FIX === */
-        }
-        ESP_LOGI(TAG, "ROOT: %d AP client(s) → START", n);
-        traffic_light_start();
-
-        if (node_link_server_has_client()) {
-            uint32_t dur = traffic_light_get_phase_duration_ms();
-            if (traffic_light_get_phase_count() > 0) {
-                mqtt_notify_phase(0, 0, dur);
-            }
-        }
+        ESP_LOGI(TAG, "ROOT: ALL_OFF at start (wait for cfg:ok from NODE)");
+        traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
+        return;
     } else {
-        /* === FIX: NODE без CFG/связи → ALL_OFF === */
-        if (!node_link_client_connected()) {
-            ESP_LOGI(TAG, "NODE: no root link → ALL_OFF "
-                          "(wait for cfg + traffic:start)");
-            traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
-            return;
-        }
-        ESP_LOGI(TAG, "NODE: root TCP connected → START");
-        traffic_light_start();
-        /* === END FIX === */
+        ESP_LOGI(TAG, "NODE: ALL_OFF at start (wait for CFG + traffic:start from ROOT)");
+        traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
+        return;
     }
-    ESP_LOGI(TAG, "Traffic started (mode=%u, seq=%u)",
-             g_config.traffic.mode, g_config.traffic.sequence_count);
 }
 
 void mqtt_notify_phase(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms)

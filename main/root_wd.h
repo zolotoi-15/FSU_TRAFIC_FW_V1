@@ -17,6 +17,11 @@ void     apply_sync_at(uint8_t phase, uint32_t phase_ms,
 extern volatile bool s_cfg_ack;
 extern volatile bool s_cfg_pushing;
 
+/* === FIX P4: глобальный флаг «CFG применён + traffic:start отправлен» ===
+   phase_sync_task НЕ шлёт sync:, пока этот флаг false.
+   root_node_watchdog_task ставит его в true ПОСЛЕ traffic:start. */
+extern volatile bool s_cfg_applied_and_started;
+
 #ifdef __cplusplus
 }
 #endif

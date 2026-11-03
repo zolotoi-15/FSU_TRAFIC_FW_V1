@@ -1,14 +1,22 @@
 /* ============================================================
    traffic_light.c — публичный API и главный цикл traffic_task.
 
-   === FIX: follow_root ===
-   Если s_follow_root == true (NODE), traffic_task_loop НЕ двигает
-   фазы сам — только blink. Фазы применяются через
-   traffic_light_force_phase() по sync: от ROOT.
+   === ЛОГИКА ===
+   ROOT (s_follow_root == false):
+     - traffic_task_loop двигает фазы сам по таймеру;
+     - по смене фазы вызывает s_phase_change_cb (→ wifi_mqtt_notify_phase);
+     - phase_sync_task шлёт sync: на NODE.
 
-   === FIX: PED_MIN_RECALL без спама ===
-   Логируем PED_MIN_RECALL только при смене фазы
-   (last_min_green_phase != s_phase), а не каждые 20 мс.
+   NODE (s_follow_root == true):
+     - traffic_task_loop НЕ двигает фазы сам — только blink;
+     - фазы применяются через traffic_light_force_phase() по sync: от ROOT;
+     - traffic_light_start() вызывается ТОЛЬКО по traffic:start от ROOT.
+
+   === FIX ===
+   - sync: не запускает traffic (это делает node_proto.c).
+   - traffic_light_start() идемпотентен: повторный вызов при RUNNING
+     не сбрасывает фазу.
+   - phase stuck-check: только на ROOT (s_follow_root == false).
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -164,11 +172,14 @@ static inline uint32_t phase_blink_period_ms(void)
 }
 
 /* ============================================================
-   === FIX: traffic_task_loop с follow_root и без спама PED_MIN_RECALL ===
+   traffic_task_loop:
+   ROOT  — двигает фазы сам, вызывает s_phase_change_cb.
+   NODE  — только blink, фазы применяются через force_phase().
    ============================================================ */
 void traffic_task_loop(void *arg)
 {
-    ESP_LOGI(TAG, "Traffic task started (step=20ms)");
+    ESP_LOGI(TAG, "Traffic task started (step=20ms, follow_root=%d)",
+             s_follow_root);
 
     uint32_t blink_last_fault = 0;
     bool     fault_blink_on   = false;
@@ -183,7 +194,7 @@ void traffic_task_loop(void *arg)
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
         /* ============================================================
-           === FIX: follow_root — только blink, НЕ двигаем фазы ===
+           NODE (s_follow_root == true): только blink, НЕ двигаем фазы
            ============================================================ */
         if (s_follow_root) {
             uint16_t bm = s_blink_mask;
@@ -212,7 +223,7 @@ void traffic_task_loop(void *arg)
         }
 
         /* ============================================================
-           Обычная логика ROOT (follow_root == false)
+           ROOT (s_follow_root == false): обычная логика
            ============================================================ */
         if (s_ped_request &&
             g_config.traffic.pedestrian.request_mode == PED_REQUEST_MODE_INSERT) {
@@ -226,14 +237,12 @@ void traffic_task_loop(void *arg)
 
         if (s_fault != TRAFFIC_FAULT_NONE) {
             if (s_fault == TRAFFIC_FAULT_YELLOW_BLINK) {
-                if (!s_follow_root) {
-                    uint32_t per = g_config.traffic.phases_ms.fault_blink_period;
-                    if (per < BLINK_MIN_PERIOD_MS) per = 500;
-                    if (now - blink_last_fault >= per) {
-                        blink_last_fault = now;
-                        fault_blink_on = !fault_blink_on;
-                        fault_blink_yellow(fault_blink_on);
-                    }
+                uint32_t per = g_config.traffic.phases_ms.fault_blink_period;
+                if (per < BLINK_MIN_PERIOD_MS) per = 500;
+                if (now - blink_last_fault >= per) {
+                    blink_last_fault = now;
+                    fault_blink_on = !fault_blink_on;
+                    fault_blink_yellow(fault_blink_on);
                 }
                 if (!s_fault_blink_state &&
                     (now - s_last_recovery_ms >= g_config.traffic.fault.recovery_ms)) {
@@ -256,9 +265,7 @@ void traffic_task_loop(void *arg)
             }
         }
 
-        if (s_follow_root) continue;
-
-        /* stuck-check под мьютексом */
+        /* stuck-check (только ROOT) */
         {
             bool in_running = false;
             if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
@@ -307,7 +314,6 @@ void traffic_task_loop(void *arg)
             last_min_green_phase = 0xFF;
         }
 
-        /* === FIX: PED_MIN_RECALL — логировать только при смене фазы === */
         if (s_ped_min_recall && stage_is_transport_green(s_phase)) {
             uint32_t max_green = g_config.traffic.pedestrian.min_recall_s * 1000;
             if (max_green > 0 && dur > max_green) {
@@ -384,6 +390,11 @@ void traffic_task_loop(void *arg)
                  s_phase, g_config.traffic.sequence[s_phase],
                  (unsigned long)stage_duration_ms(s_phase),
                  stage_is_pedestrian(s_phase) ? " (PED)" : "");
+
+        /* ROOT: уведомить phase_sync_task о смене фазы */
+        if (s_phase_change_cb) {
+            s_phase_change_cb(s_phase, dur);
+        }
     }
 }
 
@@ -472,6 +483,10 @@ esp_err_t traffic_light_set_mode(traffic_mode_t mode)
     return ESP_OK;
 }
 
+/* ============================================================
+   traffic_light_start — идемпотентный: если уже RUNNING,
+   не сбрасывает фазу.
+   ============================================================ */
 esp_err_t traffic_light_start(void)
 {
     if (g_config.traffic.sequence_count == 0) {
@@ -484,6 +499,14 @@ esp_err_t traffic_light_start(void)
     }
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
+
+    /* === FIX: идемпотентный START === */
+    if (s_state == TRAFFIC_STATE_RUNNING) {
+        ESP_LOGI(TAG, "START ignored — already RUNNING (phase=%u)", s_phase);
+        xSemaphoreGive(s_mutex);
+        return ESP_OK;
+    }
+    /* === END FIX === */
 
     s_state = TRAFFIC_STATE_RUNNING;
     s_phase = 0;
@@ -608,6 +631,11 @@ esp_err_t traffic_light_next_phase(void)
     return ESP_OK;
 }
 
+/* ============================================================
+   traffic_light_force_phase — применяет фазу (вызывается по sync:).
+   NODE: применяет фазу, полученную от ROOT.
+   ROOT: применяет фазу у себя после отправки sync:.
+   ============================================================ */
 esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
                                     uint32_t duration_ms)
 {

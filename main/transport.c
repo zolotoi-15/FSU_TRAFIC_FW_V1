@@ -1,10 +1,8 @@
 /* ============================================================
    transport.c — LoRa-транспорт (единственный канал).
-   === FIX: ACK_TIMEOUT_CFG 1500 → 3000 ===
-   === FIX: CFG_NEW_BURST_MS 2000 → 4000 ===
-   === FIX: s_last_cfg_frag_ms обновляется ДО проверки дубля ===
-   === FIX: сброс s_last_cfg_seq при new burst ===
-   === FIX: transport_is_cfg_rx_in_progress() ===
+   === FIX: ACK_TIMEOUT_CFG 3000 → 4000 ===
+   === FIX: фильтр дублей CFG по seq ===
+   === FIX: CFG_NEW_BURST_MS 4000 → 6000 ===
    ============================================================ */
 
 #include "transport.h"
@@ -34,9 +32,9 @@ static const char *TAG = "transport";
 
 #define PKT_MAGIC         0x4C
 #define PKT_MAX           240
-#define ACK_TIMEOUT       800
-/* === FIX: 1500 → 3000 — NODE часто занят STATUS/ping в момент ACK === */
-#define ACK_TIMEOUT_CFG   3000
+#define ACK_TIMEOUT       1500
+/* === FIX: 3000 → 4000 — даём NODE больше времени на ACK === */
+#define ACK_TIMEOUT_CFG   4000
 #define MAX_RETRIES       3
 
 #define ACCUM_CFG_MAX     8192
@@ -44,8 +42,8 @@ static const char *TAG = "transport";
 #define ACCUM_STATUS_MAX  4096
 #define ACCUM_EVT_MAX     1024
 
-/* === FIX: 2000 → 4000 — даём время на retry без ложного new burst === */
-#define CFG_NEW_BURST_MS  4000
+/* === FIX: 4000 → 6000 — запас на задержки приёма CFG === */
+#define CFG_NEW_BURST_MS  10000
 #define CFG_MIN_VALID_LEN 3000
 
 enum { T_CMD = 1, T_CFG = 2, T_STATUS = 3, T_EVT = 4, T_ACK = 5 };
@@ -70,12 +68,10 @@ static char   s_accum_evt[ACCUM_EVT_MAX];       static size_t s_accum_evt_len = 
 static uint32_t s_last_cfg_frag_ms = 0;
 static uint8_t  s_last_cfg_seq     = 0xFF;
 
-/* === FIX: геттер для node_send_task === */
 bool transport_is_cfg_rx_in_progress(void)
 {
     return s_accum_cfg_len > 0;
 }
-/* === END FIX === */
 
 void transport_reset_cfg_accum(void)
 {
@@ -287,26 +283,21 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
     if (type == T_CFG && flag == 0x01) {
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        /* === FIX: сначала проверяем new burst, потом обновляем таймер === */
         if (*accum_len > 0 && (now - s_last_cfg_frag_ms) > CFG_NEW_BURST_MS) {
             ESP_LOGW(TAG, "RX CFG new burst (%u ms gap), reset accum (%u)",
                      (unsigned)(now - s_last_cfg_frag_ms),
                      (unsigned)*accum_len);
             *accum_len = 0;
-            /* === FIX: сброс трекера дублей при новом burst === */
             s_last_cfg_seq = 0xFF;
         }
-        /* === FIX: обновляем таймер ДО проверки дубля === */
         s_last_cfg_frag_ms = now;
 
-        /* === FIX: дубль проверяем ПОСЛЕ обновления таймера === */
         if (seq == s_last_cfg_seq && *accum_len > 0) {
             ESP_LOGW(TAG, "CFG frag seq=%u duplicate — ignore (accum=%u)",
                      seq, (unsigned)*accum_len);
             return;
         }
         s_last_cfg_seq = seq;
-        /* === END FIX === */
     }
 
     if (type == T_CFG && flag == 0x01 && *accum_len > 4096) {

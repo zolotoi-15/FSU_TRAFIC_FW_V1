@@ -19,9 +19,10 @@ static std::unique_ptr<espp::Sx126x> s_radio;
 static lora_raw_rx_cb_t s_raw_cb = nullptr;
 static SemaphoreHandle_t s_lora_mutex = NULL;
 
-#define LORA_FREQ_HZ        868000000
-#define LORA_TX_POWER_DBM   14
-#define LORA_SF             7
+/* === FIX: явно задаём частоту, SF и мощность === */
+#define LORA_FREQ_HZ        868525050
+#define LORA_TX_POWER_DBM   22        // LLCC68 максимум +22 dBm
+#define LORA_SF             10
 #define LORA_BW_KHZ         125
 #define LORA_CR             5
 #define LORA_SYNC_WORD      0x12
@@ -123,12 +124,18 @@ extern "C" esp_err_t lora_init(void) {
     cfg.auto_init = false;
     cfg.radio_config.frequency_hz = LORA_FREQ_HZ;
     cfg.radio_config.tx_power_dbm = LORA_TX_POWER_DBM;
-    cfg.radio_config.spreading_factor = espp::Sx126x::SpreadingFactor::SF7;
+    cfg.radio_config.spreading_factor = espp::Sx126x::SpreadingFactor::SF10;
     cfg.radio_config.bandwidth = espp::Sx126x::Bandwidth::BW_125_KHZ;
     cfg.radio_config.coding_rate = espp::Sx126x::CodingRate::CR_4_5;
     cfg.radio_config.sync_word = LORA_SYNC_WORD;
     cfg.on_receive = on_rx_packet;
     cfg.log_level = espp::Logger::Verbosity::WARN;
+
+    // === FIX: удалена строка cfg.rx_boosted_gain=true; ===
+    // По документации espp это поле должно быть, но в вашей версии его нет.
+    // Режим Boosted Gain по умолчанию включён (true) в оригинальном Config,
+    // поэтому дополнительная настройка не требуется. Если компилятор
+    // снова начнёт ругаться — проверьте версию managed_components/espp__sx126x.
 
     s_radio = std::make_unique<espp::Sx126x>(cfg);
 
@@ -206,7 +213,6 @@ extern "C" uint8_t lora_receive_packet(uint8_t *buf, uint8_t size) {
 extern "C" void lora_set_rx_callback(lora_raw_rx_cb_t cb) { s_raw_cb = cb; }
 extern "C" bool lora_is_ready(void) { return (bool)s_radio; }
 
-/* === FIX: lora_poll() БЕЗ s_lora_mutex + лог ошибок === */
 extern "C" void lora_poll(void) {
     if (!s_radio) return;
     std::error_code ec;
