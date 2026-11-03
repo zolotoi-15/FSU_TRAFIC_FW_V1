@@ -43,9 +43,6 @@ extern volatile bool s_cfg_ack;
 
 bool node_cfg_received(void) { return s_cfg_received; }
 
-/* ============================================================
-   on_cfg_from_root — применить CFG.
-   ============================================================ */
 static void on_cfg_from_root(const char *json, size_t len)
 {
     uint32_t crc = esp_rom_crc32_le(0, (const uint8_t *)json, len);
@@ -111,6 +108,12 @@ static void on_cfg_from_root(const char *json, size_t len)
 
     traffic_light_set_follow_root(true);
 
+    if (traffic_light_get_fault() == TRAFFIC_FAULT_ALL_OFF) {
+        SET_REMOTE_FLAG(true);
+        traffic_light_set_fault(TRAFFIC_FAULT_NONE);
+        SET_REMOTE_FLAG(false);
+    }
+
     if (g_config.traffic.enabled && g_config.traffic.auto_start) {
         traffic_light_start();
     }
@@ -123,9 +126,6 @@ static void on_cfg_from_root(const char *json, size_t len)
     ESP_LOGI(TAG, "cfg applied (cfg:ok will be sent by cfg_ok_tx_task)");
 }
 
-/* ============================================================
-   on_cmd_from_root — обработать команду от ROOT.
-   ============================================================ */
 static void on_cmd_from_root(const char *cmd, size_t len)
 {
     char buf[256];
@@ -156,12 +156,10 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         return;
     }
 
-    // === FIX: Обработка ping обновляет таймер последней связи, предотвращая ALL_OFF ===
     if (strcmp(buf, "ping") == 0) {
         s_last_sync_ms = (uint32_t)(esp_timer_get_time() / 1000);
         return;
     }
-    // ================================================================================
 
     if (strncmp(buf, "ping:", 5) == 0) {
         unsigned int ts = 0;
@@ -204,6 +202,11 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         s_last_sync_ms = (uint32_t)(esp_timer_get_time() / 1000);
         if (s_comm_lost) s_comm_lost = false;
 
+        if (!s_cfg_received) {
+            ESP_LOGW(TAG, "sync ignored — no CFG yet");
+            return;
+        }
+
         uint32_t delay_us = s_node_delay_us;
         uint32_t corr = pm + delay_us / 1000;
         if (dur > 0 && corr >= dur) corr = dur - 1;
@@ -238,6 +241,13 @@ static void on_cmd_from_root(const char *cmd, size_t len)
 
     int relay = -1, state = -1, mode = 0;
     if (strcmp(buf, "traffic:start") == 0) {
+        if (!s_cfg_received) {
+            ESP_LOGW(TAG, "traffic:start ignored — no CFG yet → ALL_OFF");
+            SET_REMOTE_FLAG(true);
+            traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
+            SET_REMOTE_FLAG(false);
+            return;
+        }
         ESP_LOGW(TAG, "traffic:start from root → clear ALL_OFF + START");
         if (traffic_light_get_fault() == TRAFFIC_FAULT_ALL_OFF) {
             SET_REMOTE_FLAG(true);
@@ -332,7 +342,6 @@ static void on_node_status_from_transport(const char *json, size_t len)
     s_last_node_pub_ms = now;
     wifi_mqtt_publish_node_json(json, len);
 
-    /* === FIX: ROOT замечает перезагрузку NODE (STOPPED после RUNNING) === */
     if (g_config.role == DEVICE_ROLE_MASTER) {
         static bool s_node_was_running = false;
         bool node_running = (strstr(json, "\"state\":\"RUNNING\"") != NULL);
@@ -421,6 +430,7 @@ static void cfg_ok_tx_task(void *arg)
     }
 }
 
+/* === FIX: node_send_task пропускает STATUS во время приёма CFG === */
 static void node_send_task(void *arg)
 {
     char *json = malloc(512);
@@ -428,6 +438,13 @@ static void node_send_task(void *arg)
     ESP_LOGI(TAG, "node_send_task started (transport=%s)",
              transport_is_lora() ? "LoRa" : "TCP");
     while (1) {
+        /* === FIX: не мешаем приёму CFG === */
+        if (transport_is_cfg_rx_in_progress()) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        /* === END FIX === */
+
         uint16_t sr = sr_get_state();
         int off = snprintf(json, 512,
             "{\"role\":\"node\",\"SR\":{\"state\":%u},"
@@ -453,11 +470,27 @@ static void node_send_task(void *arg)
     }
 }
 
+/* === FIX: node_link_watchdog_task учитывает приём CFG === */
 static void node_link_watchdog_task(void *arg)
 {
     bool     was_connected = false;
     uint32_t disconnected_since_ms = 0;
     bool     in_comm_lost_all_off = false;
+    uint32_t boot_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    uint32_t first_sync_ms = 0;
+    bool     no_cfg_all_off = false;
+
+    while (!transport_is_lora()) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if ((uint32_t)(esp_timer_get_time() / 1000) - boot_ms > 10000) {
+            ESP_LOGE(TAG, "node_wd: LoRa not ready after 10s → ALL_OFF");
+            SET_REMOTE_FLAG(true);
+            traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
+            SET_REMOTE_FLAG(false);
+            return;
+        }
+    }
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -466,11 +499,24 @@ static void node_link_watchdog_task(void *arg)
         bool connected = transport_is_lora();
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
 
+        /* === FIX: фиксируем первый sync (но не ping!) === */
+        if (s_last_sync_ms != 0 && first_sync_ms == 0) {
+            first_sync_ms = now;
+        }
+
+        /* === FIX: CFG получен — сбрасываем таймеры CFG === */
+        if (s_cfg_received) {
+            no_cfg_all_off = false;
+            first_sync_ms = 0;
+        }
+        /* === END FIX === */
+
         if (connected && !was_connected) {
             was_connected = true;
             disconnected_since_ms = 0;
             s_last_sync_ms = 0;
             s_comm_lost = false;
+            first_sync_ms = 0;
 
             if (in_comm_lost_all_off) {
                 ESP_LOGW(TAG, "LoRa restored → clear ALL_OFF, START");
@@ -523,6 +569,20 @@ static void node_link_watchdog_task(void *arg)
                     traffic_light_start();
                 }
             }
+
+            /* === FIX: нет CFG, но идёт приём — не уходим в ALL_OFF === */
+            if (!s_cfg_received && first_sync_ms != 0 && !no_cfg_all_off &&
+                !transport_is_cfg_rx_in_progress() &&
+                (now - first_sync_ms) >= NODE_COMM_LOST_MS) {
+                ESP_LOGE(TAG, "no CFG from root > %d ms → ALL_OFF",
+                         NODE_COMM_LOST_MS);
+                traffic_light_stop();
+                SET_REMOTE_FLAG(true);
+                traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
+                SET_REMOTE_FLAG(false);
+                no_cfg_all_off = true;
+            }
+            /* === END FIX === */
         }
     }
 }
@@ -548,16 +608,22 @@ void node_proto_start_tasks(void)
 {
     xTaskCreate(node_send_task, "node_send", 4096, NULL, 4, NULL);
     xTaskCreate(cfg_ok_tx_task, "cfg_ok_tx", 4096, NULL, 3, NULL);
-    xTaskCreate(node_link_watchdog_task, "node_wd", 3072, NULL, 3, NULL);
+    xTaskCreate(node_link_watchdog_task, "node_wd", 4096, NULL, 3, NULL);
 }
 
-// === FIX: Добавлена задача heartbeat для ROOT ===
+/* === FIX: heartbeat пропускается во время cfg_push === */
 static void root_heartbeat_task(void *arg)
 {
     ESP_LOGI(TAG, "root_heartbeat_task started (5s period)");
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(5000)); // было 10000
+        vTaskDelay(pdMS_TO_TICKS(5000));
         if (g_config.role == DEVICE_ROLE_MASTER) {
+            /* === FIX: не мешаем передаче CFG === */
+            if (s_cfg_pushing) {
+                ESP_LOGD(TAG, "ROOT: heartbeat skipped (cfg_push active)");
+                continue;
+            }
+            /* === END FIX === */
             esp_err_t err = transport_send_cmd("ping", 4);
             if (err == ESP_OK) {
                 ESP_LOGD(TAG, "ROOT: heartbeat ping sent to NODE");
@@ -568,7 +634,5 @@ static void root_heartbeat_task(void *arg)
 
 void node_proto_start_root_tasks(void)
 {
-    /* === FIX: стек 3072 → 8192 (переполнение при transport_send_cmd) === */
     xTaskCreate(root_heartbeat_task, "root_hb", 8192, NULL, 3, NULL);
 }
-// ================================================

@@ -1,7 +1,7 @@
 /* ============================================================
    root_wd.c — ROOT: watchdog NODE по LoRa + phase sync.
-   === FIX: симметричное восстановление ===
-   === FIX: буфер cfg_push уменьшен 16384 → 8192 ===
+   === FIX: не шлём ping/sync, пока s_cfg_pushing ===
+   === FIX: cfg_push — пауза между попытками 10 с ===
    ============================================================ */
 
 #include "root_wd.h"
@@ -27,6 +27,7 @@ static const char *TAG = "root_wd";
 #define CFG_PUSH_RX_WAIT_MS     3000
 #define SYNC_APPLY_AHEAD_MS     500
 #define CFG_RETRY_PERIOD_MS     10000
+#define NO_CFG_ALL_OFF_MS       (60 * 1000)
 
 extern volatile uint32_t s_last_fault_clear_ms;
 extern volatile uint32_t s_last_node_msg_ms;
@@ -38,13 +39,13 @@ static volatile bool s_follow_root_set = false;
 
 #define SET_REMOTE_FLAG(v) do { s_fault_from_remote_ex = (v); } while (0)
 
-/* ============================================================
-   send_sync_to_node — шлёт sync: с apply_ms.
-   ============================================================ */
 uint32_t send_sync_to_node(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) return 0;
     if (!transport_is_lora()) return 0;
+    /* === FIX: не шлём sync во время cfg_push === */
+    if (s_cfg_pushing) return 0;
+    /* === END FIX === */
 
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     uint32_t apply_ms = now_ms + SYNC_APPLY_AHEAD_MS;
@@ -66,9 +67,6 @@ uint32_t send_sync_to_node(uint8_t phase, uint32_t phase_ms, uint32_t duration_m
     return apply_ms;
 }
 
-/* ============================================================
-   apply_sync_at — ждёт apply_ms и применяет traffic_light_force_phase.
-   ============================================================ */
 void apply_sync_at(uint8_t phase, uint32_t phase_ms,
                    uint32_t duration_ms, uint32_t apply_ms)
 {
@@ -82,9 +80,6 @@ void apply_sync_at(uint8_t phase, uint32_t phase_ms,
     traffic_light_force_phase(phase, phase_ms, duration_ms);
 }
 
-/* ============================================================
-   root_node_watchdog_task — ALL_OFF, если NODE не было > 30 с.
-   ============================================================ */
 static void root_node_watchdog_task(void *arg)
 {
     ESP_LOGI(TAG, "root_node_watchdog_task started (lost > %d ms → ALL_OFF)",
@@ -94,6 +89,9 @@ static void root_node_watchdog_task(void *arg)
     uint32_t lost_since_ms = 0;
     bool     in_comm_lost_all_off = false;
     uint32_t boot_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+    uint32_t node_seen_ms = 0;
+    bool     no_cfg_all_off = false;
 
     while (1) {
         if (g_config.role != DEVICE_ROLE_MASTER) {
@@ -107,6 +105,13 @@ static void root_node_watchdog_task(void *arg)
             has_node = (now - s_last_node_msg_ms) < NODE_COMM_LOST_MS;
         }
 
+        if (has_node && node_seen_ms == 0) {
+            node_seen_ms = now;
+        }
+        if (s_cfg_ack) {
+            no_cfg_all_off = false;
+        }
+
         if (has_node && !was_connected) {
             ESP_LOGI(TAG, "ROOT: NODE on LoRa → START");
             if (traffic_light_get_fault() == TRAFFIC_FAULT_ALL_OFF) {
@@ -118,20 +123,25 @@ static void root_node_watchdog_task(void *arg)
             wifi_mqtt_set_root_comm_lost(false);
             in_comm_lost_all_off = false;
             lost_since_ms = 0;
+            no_cfg_all_off = false;
 
-            transport_send_cmd("traffic:start", strlen("traffic:start"));
-
-            if (traffic_light_get_state() == TRAFFIC_STATE_RUNNING) {
-                uint8_t phase = traffic_light_get_phase();
-                uint32_t pm = traffic_light_get_phase_ms();
-                uint32_t dur = traffic_light_get_phase_duration_ms();
-                uint32_t apply_ms = send_sync_to_node(phase, pm, dur);
-                if (apply_ms != 0) {
-                    apply_sync_at(phase, pm, dur, apply_ms);
+            if (s_cfg_ack) {
+                transport_send_cmd("traffic:start", strlen("traffic:start"));
+                if (traffic_light_get_state() == TRAFFIC_STATE_RUNNING) {
+                    uint8_t phase = traffic_light_get_phase();
+                    uint32_t pm = traffic_light_get_phase_ms();
+                    uint32_t dur = traffic_light_get_phase_duration_ms();
+                    uint32_t apply_ms = send_sync_to_node(phase, pm, dur);
+                    if (apply_ms != 0) {
+                        apply_sync_at(phase, pm, dur, apply_ms);
+                    }
                 }
+                time_sync_root_push(0);
+            } else {
+                ESP_LOGW(TAG, "ROOT: NODE present but cfg not ack'd → "
+                              "stay STOPPED, wait cfg_push");
+                traffic_light_stop();
             }
-
-            time_sync_root_push(0);
             was_connected = true;
 
         } else if (!has_node && was_connected) {
@@ -141,6 +151,20 @@ static void root_node_watchdog_task(void *arg)
             was_connected = false;
             lost_since_ms = now;
         }
+
+        /* === FIX: NODE на связи, но cfg:ok не пришёл > 60 с → ALL_OFF === */
+        if (has_node && !s_cfg_ack && node_seen_ms != 0 && !no_cfg_all_off &&
+            (now - node_seen_ms) >= NO_CFG_ALL_OFF_MS) {
+            ESP_LOGE(TAG, "ROOT: NODE present but cfg not ack'd > %d ms → ALL_OFF",
+                     NO_CFG_ALL_OFF_MS);
+            traffic_light_stop();
+            SET_REMOTE_FLAG(true);
+            traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
+            SET_REMOTE_FLAG(false);
+            wifi_mqtt_set_root_comm_lost(true);
+            no_cfg_all_off = true;
+        }
+        /* === END FIX === */
 
         if (!has_node && !in_comm_lost_all_off && !was_connected) {
             uint32_t since = (lost_since_ms != 0)
@@ -163,9 +187,6 @@ static void root_node_watchdog_task(void *arg)
     }
 }
 
-/* ============================================================
-   phase_sync_task — sync фазы через LoRa с apply_ms.
-   ============================================================ */
 static void phase_sync_task(void *arg)
 {
     ESP_LOGI(TAG, "phase_sync_task started (LoRa sync with apply_ms)");
@@ -181,6 +202,11 @@ static void phase_sync_task(void *arg)
     while (1) {
         if (g_config.role == DEVICE_ROLE_MASTER) {
             if (s_cfg_pushing) {
+                vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+
+            if (!s_cfg_ack) {
                 vTaskDelay(pdMS_TO_TICKS(100));
                 continue;
             }
@@ -228,10 +254,7 @@ static void phase_sync_task(void *arg)
     }
 }
 
-/* ============================================================
-   === FIX: cfg_push_task — постоянный цикл (не vTaskDelete) ===
-   === FIX: буфер 16384 → 8192 ===
-   ============================================================ */
+/* === FIX: cfg_push_task — пауза между попытками 10 с, буфер 8192 === */
 static void cfg_push_task(void *arg)
 {
     ESP_LOGI(TAG, "cfg_push_task started (continuous retry)");
@@ -263,7 +286,6 @@ static void cfg_push_task(void *arg)
         ESP_LOGI(TAG, "cfg_push: retry (s_cfg_ack=false)");
 
         extern bool config_export_json(char *b, size_t *l);
-        /* === FIX: 16384 → 8192 === */
         char *buf = malloc(8192);
         size_t blen = 8192;
         if (!buf || !config_export_json(buf, &blen)) {
@@ -297,7 +319,9 @@ static void cfg_push_task(void *arg)
                 ESP_LOGW(TAG, "cfg_push: failed (attempt %d): %s",
                          attempt + 1, esp_err_to_name(err));
             }
-            vTaskDelay(pdMS_TO_TICKS(5000));
+            /* === FIX: 5000 → 10000 — даём NODE время освободить LoRa === */
+            vTaskDelay(pdMS_TO_TICKS(10000));
+            /* === END FIX === */
         }
 
         s_cfg_pushing = false;

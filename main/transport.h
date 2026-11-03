@@ -26,8 +26,10 @@ void transport_set_evt_cb(transport_rx_cb_t cb);
 void transport_force_lora(void);
 void transport_force_tcp(void);
 
-/* === NEW: сброс accum_cfg на приёмнике (вызывается по cfg:reset) === */
 void transport_reset_cfg_accum(void);
+
+/* === FIX: NODE приостанавливает STATUS во время приёма CFG === */
+bool transport_is_cfg_rx_in_progress(void);
 
 #ifdef __cplusplus
 }
