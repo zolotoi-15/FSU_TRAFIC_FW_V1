@@ -1,8 +1,15 @@
+/* ============================================================
+   fault_handler.c — зеркалирование fault между ROOT и NODE.
+   === FIX: LoRa (transport_*) вместо TCP (node_link_*) ===
+   ROOT → transport_send_cmd()
+   NODE → transport_send_evt()
+   ============================================================ */
+
 #include "fault_handler.h"
 #include "app_shared.h"
 #include "traffic_light.h"
+#include "transport.h"           /* === FIX: LoRa вместо TCP === */
 #include "wifi_mqtt.h"
-#include "node_link.h"
 #include "config_manager.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -60,26 +67,22 @@ static void on_fault_changed(traffic_fault_t fault)
     ESP_LOGW(TAG, "fault changed → '%s'", buf);
 
     if (g_config.role == DEVICE_ROLE_MASTER) {
-        if (node_link_server_has_client()) {
-            esp_err_t err = node_link_server_send_cmd_nonblock(buf, n);
-            if (err == ESP_OK) {
-                ESP_LOGW(TAG, "root fault → node: '%s'", buf);
-            } else if (err != ESP_ERR_TIMEOUT) {
-                ESP_LOGW(TAG, "root fault → node FAILED: %s", esp_err_to_name(err));
-            }
+        /* === FIX: LoRa вместо TCP === */
+        esp_err_t err = transport_send_cmd(buf, n);
+        if (err == ESP_OK) {
+            ESP_LOGW(TAG, "root fault → node: '%s'", buf);
+        } else {
+            ESP_LOGW(TAG, "root fault → node FAILED: %s", esp_err_to_name(err));
         }
         wifi_mqtt_publish_node_fault(buf, n);
     } else {
-        if (node_link_client_connected()) {
-            esp_err_t err = node_link_client_send_evt(buf, n);
-            if (err == ESP_OK) {
-                ESP_LOGW(TAG, "node fault → root: '%s'", buf);
-            } else {
-                ESP_LOGE(TAG, "node fault → root: send failed '%s' (%s)",
-                         buf, esp_err_to_name(err));
-            }
+        /* === FIX: LoRa вместо TCP === */
+        esp_err_t err = transport_send_evt(buf, n);
+        if (err == ESP_OK) {
+            ESP_LOGW(TAG, "node fault → root: '%s'", buf);
         } else {
-            ESP_LOGE(TAG, "node fault → root: NOT CONNECTED, drop '%s'", buf);
+            ESP_LOGE(TAG, "node fault → root: send failed '%s' (%s)",
+                     buf, esp_err_to_name(err));
         }
     }
 }

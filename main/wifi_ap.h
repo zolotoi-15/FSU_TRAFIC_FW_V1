@@ -1,4 +1,9 @@
-// wifi_ap.h
+/* ============================================================
+   wifi_ap.h — ЗАГЛУШКИ (Wi-Fi отключён).
+   Все функции возвращают «нет Wi-Fi». Нужны, чтобы
+   mqtt_json.c / wifi_mqtt.c / buttons.c компилировались.
+   ============================================================ */
+
 #ifndef WIFI_AP_H
 #define WIFI_AP_H
 
@@ -11,43 +16,42 @@
 extern "C" {
 #endif
 
-void      wifi_init(void);
+/* Wi-Fi инициализация — no-op */
+static inline void wifi_init(void) { }
 
-/* STA (резерв / node) */
-esp_err_t wifi_start(void);
-void      wifi_stop(void);
+/* STA — всегда «нет» */
+static inline esp_err_t wifi_start(void) { return ESP_OK; }
+static inline void      wifi_stop(void)  { }
+static inline bool      wifi_sta_connected(void)  { return false; }
+static inline bool      wifi_sta_has_ip(void)     { return false; }
+static inline const char* wifi_get_ip(void)       { return "0.0.0.0"; }
+static inline bool      wifi_sta_connecting(void) { return false; }
 
-/* AP (root для node) */
-esp_err_t wifi_ap_start(const char *ssid, const char *password);       /* APSTA (legacy) */
-esp_err_t wifi_ap_start_only(const char *ssid, const char *password);  /* только AP, ch=6 */
-void      wifi_ap_stop(void);
-bool      wifi_ap_is_running(void);
-const char* wifi_get_ap_ip(void);
-int         wifi_ap_client_count(void);
+/* AP — всегда «нет» */
+static inline esp_err_t wifi_ap_start(const char *ssid, const char *password)
+    { (void)ssid; (void)password; return ESP_ERR_NOT_SUPPORTED; }
+static inline esp_err_t wifi_ap_start_only(const char *ssid, const char *password)
+    { (void)ssid; (void)password; return ESP_ERR_NOT_SUPPORTED; }
+static inline void      wifi_ap_stop(void)        { }
+static inline bool      wifi_ap_is_running(void)  { return false; }
+static inline bool      wifi_ap_running(void)     { return false; }
+static inline const char* wifi_get_ap_ssid(void)  { return ""; }
+static inline const char* wifi_get_ap_ip(void)    { return "0.0.0.0"; }
+static inline int       wifi_ap_client_count(void){ return 0; }
 
-/* STA status */
-bool        wifi_sta_connected(void);
-bool        wifi_sta_has_ip(void);
-const char* wifi_get_ip(void);
-bool        wifi_sta_connecting(void);
+/* STA fallback — no-op */
+static inline esp_err_t wifi_sta_start_after_ppp_fail(void) { return ESP_OK; }
 
-/* AP status */
-bool        wifi_ap_running(void);
-const char* wifi_get_ap_ssid(void);
+/* Scan — не поддерживается */
+static inline esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
+                                             int8_t *out_rssi, uint8_t *out_channel,
+                                             const char *ssid_prefix)
+    { (void)out_ssid; (void)out_len; (void)out_rssi;
+      (void)out_channel; (void)ssid_prefix; return ESP_ERR_NOT_SUPPORTED; }
 
-/* STA fallback — включить STA, если PPPoS не поднялся */
-esp_err_t wifi_sta_start_after_ppp_fail(void);
-
-/* Scan */
-esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
-                               int8_t *out_rssi, uint8_t *out_channel,
-                               const char *ssid_prefix);
-
-/* === FIX: временное отключение AP/STA для освобождения heap ===
-   Используется при парсинге большого JSON (/SetJson), когда
-   heap фрагментирован и cJSON не может выделить дерево. */
-esp_err_t wifi_ap_suspend_for_parse(void);
-esp_err_t wifi_ap_resume_after_parse(void);
+/* Suspend/resume — no-op */
+static inline esp_err_t wifi_ap_suspend_for_parse(void)  { return ESP_OK; }
+static inline esp_err_t wifi_ap_resume_after_parse(void) { return ESP_OK; }
 
 #ifdef __cplusplus
 }

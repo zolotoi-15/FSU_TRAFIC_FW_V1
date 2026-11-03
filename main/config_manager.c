@@ -196,7 +196,6 @@ void config_save(void)
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
     if (err == ESP_OK) {
-        // === FIX: конфиг изменился → инвалидировать кэш ===
         config_cache_invalidate();
         ESP_LOGI(TAG, "Config saved to NVS (version=%.2f, %u bytes, ped_mode=%u)",
                  g_config.version, (unsigned)sizeof(g_config),
@@ -548,9 +547,6 @@ bool config_load_json(const char *json, size_t len)
         return false;
     }
 
-    /* FIX: логируем heap перед парсингом — 11 КБ JSON требует ~40-50 КБ
-       непрерывного heap для cJSON-дерева. Если largest < порога — сразу
-       отказываемся, чтобы не ловить непонятный "JSON parse error". */
     size_t free_heap  = esp_get_free_heap_size();
     size_t min_heap   = esp_get_minimum_free_heap_size();
     size_t largest    = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
@@ -634,7 +630,6 @@ bool config_load_json(const char *json, size_t len)
 
     cJSON_Delete(root);
 
-    /* FIX: config_load_json ВСЕГДА сохраняет в NVS. */
     config_save();
 
     ESP_LOGI(TAG, "JSON loaded (version=%.2f, role=%s, traffic stages=%u seq=%u, "
@@ -672,11 +667,16 @@ static const char *ped_request_mode_to_str(uint8_t m)
     }
 }
 
+/* ============================================================
+   config_export_json — сериализация g_config в JSON.
+   Возвращает true и заполняет buf/len.
+   Использует кэш s_cfg_json_cache (инвалидируется в config_save).
+   ============================================================ */
 bool config_export_json(char *buf, size_t *len)
 {
     if (!buf || !len || *len < 256) return false;
 
-    // === FIX: если кэш есть — вернуть его (без cJSON_PrintUnformatted) ===
+    /* Кэш */
     if (s_cfg_json_cache) {
         if (s_cfg_json_len + 1 > *len) {
             ESP_LOGE(TAG, "config_export_json: cache too big (%u > %u)",
@@ -701,14 +701,240 @@ bool config_export_json(char *buf, size_t *len)
         return false;
     }
 
-    /* ... построение JSON (meta, espnow, wifi, timezone, mqtt, traffic,
-       shift_register) — без изменений ... */
+    /* ─── meta ─── */
+    cJSON *meta = cJSON_AddObjectToObject(root, "meta");
+    if (meta) {
+        cJSON_AddNumberToObject(meta, "version", g_config.version);
+        cJSON_AddNumberToObject(meta, "id", g_config.id);
+        cJSON_AddStringToObject(meta, "name", g_config.name);
+    }
+
+    /* ─── espnow ─── */
+    cJSON *en = cJSON_AddObjectToObject(root, "espnow");
+    if (en) {
+        cJSON_AddBoolToObject(en, "enabled", g_config.espnow.enabled);
+        cJSON_AddNumberToObject(en, "channel", g_config.espnow.channel);
+        cJSON_AddNumberToObject(en, "status_period_ms",
+                                g_config.espnow.status_period_ms);
+        char mac[18];
+        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 g_config.espnow.slave_mac[0], g_config.espnow.slave_mac[1],
+                 g_config.espnow.slave_mac[2], g_config.espnow.slave_mac[3],
+                 g_config.espnow.slave_mac[4], g_config.espnow.slave_mac[5]);
+        cJSON_AddStringToObject(en, "slave_mac", mac);
+    }
+
+    /* ─── wifi ─── */
+    cJSON *wifi = cJSON_AddObjectToObject(root, "wifi");
+    if (wifi) {
+        cJSON_AddStringToObject(wifi, "ssid", g_config.wifi_ssid);
+        cJSON_AddStringToObject(wifi, "password", g_config.wifi_password);
+    }
+
+    /* ─── timezone ─── */
+    cJSON_AddStringToObject(root, "timezone", g_config.timezone);
+
+    /* ─── mqtt ─── */
+    cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
+    if (mqtt) {
+        cJSON_AddBoolToObject(mqtt, "enabled", g_config.mqtt_enabled);
+        cJSON_AddStringToObject(mqtt, "uri", g_config.mqtt_uri);
+        cJSON_AddNumberToObject(mqtt, "port", g_config.mqtt_port);
+        cJSON_AddStringToObject(mqtt, "user", g_config.mqtt_user);
+        cJSON_AddStringToObject(mqtt, "password", g_config.mqtt_password);
+        cJSON_AddNumberToObject(mqtt, "timepause_min",
+                                g_config.mqtt_timepause_min);
+    }
+
+    /* ─── traffic ─── */
+    cJSON *t = cJSON_AddObjectToObject(root, "traffic");
+    if (t) {
+        cJSON_AddNumberToObject(t, "mode", g_config.traffic.mode);
+        cJSON_AddBoolToObject(t, "enabled", g_config.traffic.enabled);
+        cJSON_AddBoolToObject(t, "auto_start", g_config.traffic.auto_start);
+
+        /* pedestrian */
+        cJSON *ped = cJSON_AddObjectToObject(t, "pedestrian");
+        if (ped) {
+            cJSON_AddBoolToObject(ped, "button_enabled",
+                                  g_config.traffic.pedestrian.button_enabled);
+            cJSON_AddStringToObject(ped, "request_mode",
+                                    ped_request_mode_to_str(
+                                        g_config.traffic.pedestrian.request_mode));
+            cJSON_AddNumberToObject(ped, "insert_timeout_ms",
+                                    g_config.traffic.pedestrian.insert_timeout_ms);
+            cJSON_AddNumberToObject(ped, "min_recall_s",
+                                    g_config.traffic.pedestrian.min_recall_s);
+        }
+
+        /* pins */
+        cJSON *pins = cJSON_AddObjectToObject(t, "pins");
+        if (pins) {
+            cJSON *single = cJSON_AddObjectToObject(pins, "single");
+            if (single) {
+                cJSON_AddNumberToObject(single, "red",
+                                        g_config.traffic.pins.single.red);
+                cJSON_AddNumberToObject(single, "yellow",
+                                        g_config.traffic.pins.single.yellow);
+                cJSON_AddNumberToObject(single, "green",
+                                        g_config.traffic.pins.single.green);
+            }
+            cJSON *cross = cJSON_AddObjectToObject(pins, "cross");
+            if (cross) {
+                const struct { const char *name; traffic_color_pins_t *p; } arr[] = {
+                    {"a_north", &g_config.traffic.pins.cross.a_north},
+                    {"a_south", &g_config.traffic.pins.cross.a_south},
+                    {"b_west",  &g_config.traffic.pins.cross.b_west},
+                    {"b_east",  &g_config.traffic.pins.cross.b_east},
+                };
+                for (size_t i = 0; i < sizeof(arr)/sizeof(arr[0]); i++) {
+                    cJSON *o = cJSON_AddObjectToObject(cross, arr[i].name);
+                    if (o) {
+                        cJSON_AddNumberToObject(o, "red",    arr[i].p->red);
+                        cJSON_AddNumberToObject(o, "yellow", arr[i].p->yellow);
+                        cJSON_AddNumberToObject(o, "green",  arr[i].p->green);
+                    }
+                }
+            }
+            cJSON *cp = cJSON_AddObjectToObject(pins, "cross_ped");
+            if (cp) {
+                const struct { const char *name; traffic_color_pins_t *p; } arr[] = {
+                    {"axis_a",  &g_config.traffic.pins.cross_ped.axis_a},
+                    {"axis_a2", &g_config.traffic.pins.cross_ped.axis_a2},
+                    {"axis_a3", &g_config.traffic.pins.cross_ped.axis_a3},
+                };
+                for (size_t i = 0; i < sizeof(arr)/sizeof(arr[0]); i++) {
+                    cJSON *o = cJSON_AddObjectToObject(cp, arr[i].name);
+                    if (o) {
+                        cJSON_AddNumberToObject(o, "red",    arr[i].p->red);
+                        cJSON_AddNumberToObject(o, "yellow", arr[i].p->yellow);
+                        cJSON_AddNumberToObject(o, "green",  arr[i].p->green);
+                    }
+                }
+                cJSON *ped2 = cJSON_AddObjectToObject(cp, "ped");
+                if (ped2) {
+                    cJSON_AddNumberToObject(ped2, "red",
+                                            g_config.traffic.pins.cross_ped.ped_red);
+                    cJSON_AddNumberToObject(ped2, "green",
+                                            g_config.traffic.pins.cross_ped.ped_green);
+                }
+            }
+        }
+
+        /* phases_ms */
+        cJSON *ph = cJSON_AddObjectToObject(t, "phases_ms");
+        if (ph) {
+            cJSON_AddNumberToObject(ph, "red",
+                                    g_config.traffic.phases_ms.red);
+            cJSON_AddNumberToObject(ph, "red_yellow",
+                                    g_config.traffic.phases_ms.red_yellow);
+            cJSON_AddNumberToObject(ph, "green",
+                                    g_config.traffic.phases_ms.green);
+            cJSON_AddNumberToObject(ph, "green_blink",
+                                    g_config.traffic.phases_ms.green_blink);
+            cJSON_AddNumberToObject(ph, "yellow",
+                                    g_config.traffic.phases_ms.yellow);
+            cJSON_AddNumberToObject(ph, "yellow_blink",
+                                    g_config.traffic.phases_ms.yellow_blink);
+            cJSON_AddNumberToObject(ph, "ped_green",
+                                    g_config.traffic.phases_ms.ped_green);
+            cJSON_AddNumberToObject(ph, "ped_blink",
+                                    g_config.traffic.phases_ms.ped_blink);
+            cJSON_AddNumberToObject(ph, "fault_blink_period",
+                                    g_config.traffic.phases_ms.fault_blink_period);
+            cJSON_AddNumberToObject(ph, "phase_blink_period",
+                                    g_config.traffic.phases_ms.phase_blink_period);
+        }
+
+        /* fault */
+        cJSON *f = cJSON_AddObjectToObject(t, "fault");
+        if (f) {
+            cJSON_AddNumberToObject(f, "imin_mv",
+                                    g_config.traffic.fault.imin_mv);
+            cJSON_AddNumberToObject(f, "vin_on_min_v",
+                                    g_config.traffic.fault.vin_on_min_v);
+            cJSON_AddNumberToObject(f, "vin_off_min_v",
+                                    g_config.traffic.fault.vin_off_min_v);
+            cJSON_AddNumberToObject(f, "phase_grace_ms",
+                                    g_config.traffic.fault.phase_grace_ms);
+            cJSON_AddNumberToObject(f, "recovery_ms",
+                                    g_config.traffic.fault.recovery_ms);
+            cJSON_AddNumberToObject(f, "vin_off_confirmations",
+                                    g_config.traffic.fault.vin_off_confirmations);
+        }
+
+        /* stages_dd */
+        cJSON *stages = cJSON_AddArrayToObject(t, "stages_dd");
+        if (stages) {
+            for (int i = 0; i < g_config.traffic.stage_count; i++) {
+                const traffic_stage_dd_t *s = &g_config.traffic.stages[i];
+                cJSON *st = cJSON_CreateObject();
+                if (!st) continue;
+                cJSON_AddNumberToObject(st, "id", s->id);
+                cJSON_AddStringToObject(st, "name", s->name);
+                cJSON_AddStringToObject(st, "duration_kind",
+                                        duration_kind_to_str(s->duration_kind));
+                cJSON_AddNumberToObject(st, "duration_ms", s->duration_ms);
+
+                cJSON *g = cJSON_AddArrayToObject(st, "groups");
+                for (int k = 0; k < s->group_count; k++)
+                    cJSON_AddItemToArray(g, cJSON_CreateNumber(s->groups[k]));
+
+                cJSON *o = cJSON_AddArrayToObject(st, "outputs_on");
+                for (int k = 0; k < s->on_count; k++)
+                    cJSON_AddItemToArray(o, cJSON_CreateNumber(s->outputs_on[k]));
+
+                cJSON *b = cJSON_AddArrayToObject(st, "outputs_blink");
+                for (int k = 0; k < s->blink_count; k++)
+                    cJSON_AddItemToArray(b, cJSON_CreateNumber(s->outputs_blink[k]));
+
+                cJSON_AddItemToArray(stages, st);
+            }
+        }
+
+        /* sequence */
+        cJSON *seq = cJSON_AddArrayToObject(t, "sequence");
+        if (seq) {
+            for (int i = 0; i < g_config.traffic.sequence_count; i++)
+                cJSON_AddItemToArray(seq, cJSON_CreateNumber(g_config.traffic.sequence[i]));
+        }
+
+        /* transitions */
+        cJSON *tr = cJSON_AddArrayToObject(t, "transitions");
+        if (tr) {
+            for (int i = 0; i < g_config.traffic.transition_count; i++) {
+                const traffic_transition_t *tt = &g_config.traffic.transitions[i];
+                cJSON *o = cJSON_CreateObject();
+                if (!o) continue;
+                cJSON_AddNumberToObject(o, "clearing", tt->clearing);
+                cJSON_AddNumberToObject(o, "entering", tt->entering);
+                cJSON_AddNumberToObject(o, "time", tt->time_cs / 100.0);
+                cJSON_AddItemToArray(tr, o);
+            }
+        }
+    }
+
+    /* ─── shift_register ─── */
+    cJSON *sr = cJSON_AddObjectToObject(root, "shift_register");
+    if (sr) {
+        cJSON *outs = cJSON_AddArrayToObject(sr, "outputs");
+        if (outs) {
+            for (int i = 0; i < g_config.sr.count; i++) {
+                cJSON *o = cJSON_CreateObject();
+                if (!o) continue;
+                cJSON_AddNumberToObject(o, "ch", g_config.sr.outputs[i].ch);
+                cJSON_AddStringToObject(o, "name", g_config.sr.outputs[i].name);
+                cJSON_AddBoolToObject(o, "active", g_config.sr.outputs[i].active);
+                cJSON_AddItemToArray(outs, o);
+            }
+        }
+    }
 
     char *out = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     if (!out) {
         ESP_LOGE(TAG, "config_export_json: cJSON_PrintUnformatted failed "
-                      "(free heap=%u, largest=%u)",
+                      "(free=%u, largest=%u)",
                  (unsigned)esp_get_free_heap_size(),
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return false;
@@ -725,7 +951,7 @@ bool config_export_json(char *buf, size_t *len)
     buf[n] = '\0';
     *len = n;
 
-    // === FIX: сохранить в кэш ===
+    /* Сохранить в кэш */
     s_cfg_json_cache = strdup(out);
     s_cfg_json_len = n;
     free(out);

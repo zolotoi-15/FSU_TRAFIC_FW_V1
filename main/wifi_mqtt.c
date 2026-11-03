@@ -1,15 +1,25 @@
 /* ============================================================
    wifi_mqtt.c — публичный API + MQTT-клиент.
    Модули:
-     mqtt_json.c   — build_json
+     mqtt_json.c   — build_json (телеметрия ROOT)
      mqtt_cmd.c    — /Set + /SetJson
-     mqtt_fault.c  — зеркалирование fault
+     mqtt_fault.c  — зеркалирование fault + публикация NODE JSON
      mqtt_apply.c  — apply_config_runtime, notify_phase
+
+   Топики:
+     FSU_Trafic_<MAC>           — телеметрия ROOT (JSON)
+     FSU_Trafic_<MAC>/Set       — команды
+     FSU_Trafic_<MAC>/SetJson   — конфиг
+     FSU_Trafic_<MAC>/Node      — телеметрия NODE (JSON)
+     FSU_Trafic_<MAC>/LWT       — online/offline
+     FSU_Trafic_<MAC>/Layer     — роль, IP, rssi
+     FSU_Trafic_<MAC>/key_pressed — события кнопки
    ============================================================ */
 
 #include "mqtt_internal.h"
 #include "config_manager.h"
 #include "wifi_ap.h"
+#include "modem_ppp.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
@@ -39,13 +49,19 @@ char       s_sub_topic[192];
 char       s_json_topic[192];
 char       s_layer_topic[192];
 char       s_kp_topic[192];
-char       s_node_json_topic[192];
+char       s_node_json_topic[192];   /* === FSU_Trafic_<MAC>/Node === */
 
 TickType_t s_last_event_time = 0;
 int        s_publish_fail_count = 0;
 
 static bool       s_restart_in_progress = false;
 static SemaphoreHandle_t s_restart_mutex = NULL;
+
+/* === MQTT watchdog === */
+#define MQTT_DOWN_RESTART_MS   (5 * 60 * 1000)
+static volatile uint32_t s_mqtt_last_connected_ms    = 0;
+static volatile uint32_t s_mqtt_last_disconnected_ms = 0;
+static volatile uint32_t s_mqtt_down_since_ms        = 0;
 
 #define NVS_NS_MQTT "mqtt_cfg"
 
@@ -103,6 +119,11 @@ void wifi_mqtt_save_config(void)
     }
 }
 
+/* ============================================================
+   build_topics — формирование MQTT-топиков.
+   По умолчанию — из MAC: FSU_Trafic_<MAC>[/...].
+   === NODE JSON: s_node_json_topic = FSU_Trafic_<MAC>/Node ===
+   ============================================================ */
 static void build_topics(void)
 {
     uint8_t mac[6];
@@ -111,11 +132,13 @@ static void build_topics(void)
              "%s_%02X%02X%02X%02X%02X%02X",
              g_mqtt_config.base_topic,
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    snprintf(s_lwt_topic,  sizeof(s_lwt_topic),  "%s/LWT",     s_topic);
-    snprintf(s_sub_topic,  sizeof(s_sub_topic),  "%s/Set",     s_topic);
-    snprintf(s_json_topic, sizeof(s_json_topic), "%s/SetJson", s_topic);
-    snprintf(s_layer_topic, sizeof(s_layer_topic), "%s/Layer", s_topic);
+
+    snprintf(s_lwt_topic,  sizeof(s_lwt_topic),  "%s/LWT",         s_topic);
+    snprintf(s_sub_topic,  sizeof(s_sub_topic),  "%s/Set",         s_topic);
+    snprintf(s_json_topic, sizeof(s_json_topic), "%s/SetJson",     s_topic);
+    snprintf(s_layer_topic, sizeof(s_layer_topic), "%s/Layer",     s_topic);
     snprintf(s_kp_topic,    sizeof(s_kp_topic),    "%s/key_pressed", s_topic);
+    /* === NODE JSON → MQTT === */
     snprintf(s_node_json_topic, sizeof(s_node_json_topic), "%s/Node", s_topic);
 
     ESP_LOGI(TAG, "Topic:      %s", s_topic);
@@ -125,7 +148,7 @@ static void build_topics(void)
 }
 
 /* ============================================================
-   Публичные обёртки (API из wifi_mqtt.h).
+   Публичные обёртки.
    ============================================================ */
 int wifi_mqtt_fault_priority_ex(traffic_fault_t f)
 {
@@ -175,8 +198,23 @@ void wifi_mqtt_set_phase_sync_enabled(bool en)
 
 const char *wifi_mqtt_last_node_fault(void)
 {
-    /* возвращаем пустую строку — s_last_node_fault_str в mqtt_fault.c */
     return "";
+}
+
+/* === MQTT watchdog helpers === */
+uint32_t wifi_mqtt_get_down_ms(void)
+{
+    if (s_mqtt_connected) return 0;
+    if (s_mqtt_down_since_ms == 0) return 0;
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    if (now < s_mqtt_down_since_ms) return 0;
+    return now - s_mqtt_down_since_ms;
+}
+
+void wifi_mqtt_force_restart_modem(void)
+{
+    ESP_LOGE(TAG, "wifi_mqtt: force restart modem (PPP stop)");
+    modem_ppp_stop();
 }
 
 /* ============================================================
@@ -193,6 +231,8 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
         ESP_LOGI(TAG, "MQTT connected");
         s_mqtt_connected = true;
         s_publish_fail_count = 0;
+        s_mqtt_last_connected_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        s_mqtt_down_since_ms = 0;
         esp_mqtt_client_publish(g_mqtt_client, s_lwt_topic, "online", 0, 1, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, s_sub_topic,  1);
         esp_mqtt_client_subscribe(g_mqtt_client, s_json_topic, 1);
@@ -202,12 +242,19 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGW(TAG, "MQTT disconnected");
         s_mqtt_connected = false;
+        s_mqtt_last_disconnected_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (s_mqtt_down_since_ms == 0) {
+            s_mqtt_down_since_ms = s_mqtt_last_disconnected_ms;
+        }
         mqtt_json_accum_reset();
         break;
 
     case MQTT_EVENT_ERROR:
         ESP_LOGE(TAG, "MQTT error");
         s_mqtt_connected = false;
+        if (s_mqtt_down_since_ms == 0) {
+            s_mqtt_down_since_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        }
         break;
 
     case MQTT_EVENT_DATA:
@@ -334,14 +381,14 @@ static void mqtt_publish_task(void *arg)
     ESP_LOGI(TAG, "mqtt_publish_task started");
     while (1) {
         if (s_mqtt_connected) {
-            wifi_ap_record_t ap;
-            int rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
+            extern const char *modem_ppp_get_ip(void);
+            extern bool modem_ppp_is_connected(void);
+            const char *ip = modem_ppp_is_connected() ? modem_ppp_get_ip() : "0.0.0.0";
             snprintf(layer_ip, sizeof(layer_ip),
-                     "role:%s IP:%s rssi:%d ap:%s clients:%d",
+                     "role:%s IP:%s ppp:%d",
                      g_config.role == DEVICE_ROLE_SLAVE ? "node" : "root",
-                     wifi_get_ip(), rssi,
-                     wifi_ap_is_running() ? wifi_get_ap_ssid() : "-",
-                     wifi_ap_client_count());
+                     ip,
+                     modem_ppp_is_connected() ? 1 : 0);
             esp_mqtt_client_publish(g_mqtt_client, s_layer_topic, layer_ip, 0, 1, 0);
             mqtt_build_json(json, MQTT_JSON_BUFFER_SIZE);
             if (wifi_mqtt_publish(json) == ESP_OK) {
@@ -363,17 +410,32 @@ static void mqtt_watchdog_task(void *arg)
     vTaskDelay(pdMS_TO_TICKS(30000));
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(30000));
-        TickType_t now = xTaskGetTickCount();
-        int32_t since = (int32_t)(now - s_last_event_time);
+
+        TickType_t now_tick = xTaskGetTickCount();
+        int32_t since = (int32_t)(now_tick - s_last_event_time);
         if (since < 0) since = 0;
+
         if (s_mqtt_connected) {
             if (since > MQTT_STUCK_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "MQTT stuck (no events %ld ms) → restart",
+                         (long)since);
                 wifi_mqtt_restart();
                 s_last_event_time = xTaskGetTickCount();
             }
         } else {
-            wifi_mqtt_restart();
-            s_last_event_time = xTaskGetTickCount();
+            uint32_t down_ms = wifi_mqtt_get_down_ms();
+            if (down_ms > MQTT_DOWN_RESTART_MS) {
+                ESP_LOGE(TAG, "MQTT down %lu ms (> %d) → force restart modem",
+                         (unsigned long)down_ms, MQTT_DOWN_RESTART_MS);
+                wifi_mqtt_force_restart_modem();
+                s_mqtt_down_since_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                s_last_event_time = xTaskGetTickCount();
+            } else if (since > MQTT_STUCK_TIMEOUT_MS) {
+                ESP_LOGW(TAG, "MQTT down %ld ms → wifi_mqtt_restart()",
+                         (long)since);
+                wifi_mqtt_restart();
+                s_last_event_time = xTaskGetTickCount();
+            }
         }
     }
 }

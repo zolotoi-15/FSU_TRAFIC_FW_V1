@@ -2,6 +2,10 @@
    mqtt_cmd.c — обработка MQTT-команд (/Set) и JSON-конфига (/SetJson).
    /SetJson сохраняется в NVS чанками и применяется при следующей
    загрузке — до старта PPPoS/MQTT, когда heap свободен.
+
+   === FIX: фильтр коротких сообщений ===
+   Раньше любой JSON (даже 14-байтовый ACK) сохранялся в NVS
+   и вызывал reboot. Теперь сообщения < 1000 байт отбрасываются.
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -27,6 +31,11 @@
 #include <stdio.h>
 
 static const char *TAG = "mqtt_cmd";
+
+/* === FIX: минимальный размер реального конфига (байт) ===
+   Реальный config.json ~7-11 КБ. Всё, что < 1000 — мусор
+   (ACK брокера, эхо, служебные сообщения). */
+#define MQTT_JSON_MIN_CONFIG_SIZE  1000
 
 /* NVS namespace для pending-конфига (применяется при следующей загрузке) */
 #define NVS_NS_PENDING   "pending_cfg"
@@ -77,9 +86,7 @@ bool mqtt_json_accum_feed(const char *data, int data_len,
 }
 
 /* ============================================================
-   FIX: сохранение /SetJson в NVS чанками.
-   При следующей загрузке blink_example_main.c парсит pending_cfg
-   ДО старта PPPoS/MQTT, когда heap свободен (~188 КБ largest).
+   Сохранение /SetJson в NVS чанками.
    ============================================================ */
 static esp_err_t save_pending_cfg_to_nvs(const char *data, int data_len)
 {
@@ -132,10 +139,7 @@ static esp_err_t save_pending_cfg_to_nvs(const char *data, int data_len)
 }
 
 /* ============================================================
-   FIX: mqtt_json_accum_process — вызывается из wifi_mqtt.c
-   после того, как /SetJson полностью собран в s_json_accum.
-   Вместо парсинга (который падает из-за фрагментации heap)
-   сохраняем в NVS и перезагружаемся.
+   === FIX: mqtt_json_accum_process — фильтр < 1000 байт ===
    ============================================================ */
 void mqtt_json_accum_process(void)
 {
@@ -145,13 +149,14 @@ void mqtt_json_accum_process(void)
         return;
     }
 
-    /* Фильтр коротких сообщений — ACK от брокера и прочий мусор. */
-   /* if (s_json_accum_total < 100) {
-        ESP_LOGW(TAG, "mqtt_json_accum_process: too short (%d bytes), skip",
-                 s_json_accum_total);
+    /* === FIX: отбрасываем короткие сообщения (ACK, эхо и т.п.) === */
+    if (s_json_accum_total < MQTT_JSON_MIN_CONFIG_SIZE) {
+        ESP_LOGW(TAG, "mqtt_json_accum_process: too short (%d bytes < %d), "
+                      "skip (not a config)",
+                 s_json_accum_total, MQTT_JSON_MIN_CONFIG_SIZE);
         mqtt_json_accum_reset();
         return;
-    }*/
+    }
 
     ESP_LOGI(TAG, "mqtt_json_accum_process: %d bytes, saving to NVS "
                   "(heap free=%u, largest=%u)",
@@ -182,8 +187,7 @@ void mqtt_json_accum_process(void)
 }
 
 /* ============================================================
-   handle_json_config — /SetJson (прямой путь, если приходит
-   одним сообщением без фрагментации).
+   === FIX: mqtt_handle_json_config — фильтр < 1000 байт ===
    ============================================================ */
 void mqtt_handle_json_config(const char *data, int data_len)
 {
@@ -194,9 +198,10 @@ void mqtt_handle_json_config(const char *data, int data_len)
         return;
     }
 
-    if (data_len < 100) {
-        ESP_LOGW(TAG, "/SetJson: too short (%d bytes), skip (not a config)",
-                 data_len);
+    /* === FIX: отбрасываем короткие сообщения === */
+    if (data_len < MQTT_JSON_MIN_CONFIG_SIZE) {
+        ESP_LOGW(TAG, "/SetJson: too short (%d bytes < %d), skip (not a config)",
+                 data_len, MQTT_JSON_MIN_CONFIG_SIZE);
         return;
     }
 

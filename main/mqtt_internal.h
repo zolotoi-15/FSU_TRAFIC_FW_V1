@@ -18,13 +18,13 @@ extern "C" {
    Общие extern-переменные (определены в wifi_mqtt.c).
    ============================================================ */
 extern bool       s_mqtt_connected;
-extern char       s_topic[160];
-extern char       s_lwt_topic[192];
-extern char       s_sub_topic[192];
-extern char       s_json_topic[192];
-extern char       s_layer_topic[192];
-extern char       s_kp_topic[192];
-extern char       s_node_json_topic[192];
+extern char       s_topic[160];              /* FSU_Trafic_<MAC>          */
+extern char       s_lwt_topic[192];          /* .../LWT                   */
+extern char       s_sub_topic[192];          /* .../Set                   */
+extern char       s_json_topic[192];         /* .../SetJson               */
+extern char       s_layer_topic[192];        /* .../Layer                 */
+extern char       s_kp_topic[192];           /* .../key_pressed           */
+extern char       s_node_json_topic[192];    /* .../Node  ← NODE JSON     */
 
 extern TickType_t s_last_event_time;
 extern int        s_publish_fail_count;
@@ -34,6 +34,10 @@ extern int        s_publish_fail_count;
    ============================================================ */
 void mqtt_restart_safe(void);   /* внутренний restart */
 void mqtt_publish_now_safe(void);
+
+/* === MQTT watchdog helpers (wifi_mqtt.c) === */
+uint32_t wifi_mqtt_get_down_ms(void);
+void     wifi_mqtt_force_restart_modem(void);
 
 /* ============================================================
    Внутренние функции модулей.

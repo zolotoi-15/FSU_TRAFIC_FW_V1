@@ -1,8 +1,11 @@
 /* ============================================================
-   blink_example_main.c — ТОЛЬКО app_main().
-   ТЕСТОВЫЙ РЕЖИМ: только LoRa.
-   ROOT шлёт "PING" раз в 2 секунды, NODE принимает через callback
-   (с polling через lora_poll()).
+   blink_example_main.c — PRODUCTION app_main().
+   ROOT: PPP → MQTT → LoRa (единственный канал к NODE).
+   NODE: LoRa → телеметрия → ROOT → MQTT.
+
+   === NO WIFI ===
+   Wi-Fi (STA и AP) полностью отключён. Обмен ROOT↔NODE
+   только через LoRa. PPPoS (модем) — не Wi-Fi, оставлен.
    ============================================================ */
 
 #include <stdio.h>
@@ -12,12 +15,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
-#include "esp_wifi.h"
+#include "esp_wifi.h"             /* нужен для wifi_ap_record_t в mqtt_json.c */
 #include "esp_event.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_mac.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "driver/i2c_master.h"
 
 #include "board_hw.h"
 #include "mux.h"
@@ -27,9 +32,9 @@
 #include "traffic_light.h"
 #include "traffic_nvs.h"
 #include "config_manager.h"
-#include "wifi_ap.h"
+#include "wifi_ap.h"              /* нужен для wifi_get_ip()/wifi_sta_connected() — заглушки */
 #include "wifi_mqtt.h"
-#include "node_link.h"
+#include "node_link.h"            /* нужен для node_link_server_has_client() — заглушка */
 #include "node_proto.h"
 #include "transport.h"
 #include "lora.h"
@@ -46,12 +51,7 @@ extern const uint8_t config_json_start[] asm("_binary_config_json_start");
 extern const uint8_t config_json_end[]   asm("_binary_config_json_end");
 
 static const char *TAG = "board";
-static const char *TAG_LORA_TEST = "LORA_TEST";
 
-#define AP_PASSWORD          "fsu12345678"
-#define NODE_LINK_PORT_FIX   3333
-
-/* NVS namespace для pending-конфига (см. mqtt_cmd.c) */
 #define NVS_NS_PENDING   "pending_cfg"
 #define NVS_KEY_LEN      "len"
 #define NVS_KEY_CHUNK    "chunk_%d"
@@ -82,23 +82,29 @@ void blink_reset_rtt(void)
     traffic_light_set_sync_delay_us(0);
 }
 
-static void on_sta_got_ip(void *arg, esp_event_base_t base,
-                          int32_t id, void *data)
+/* ============================================================
+   IP_EVENT handler — единый для PPP (Wi-Fi STA нет).
+   ============================================================ */
+static void on_got_ip(void *arg, esp_event_base_t base,
+                      int32_t id, void *data)
 {
     static bool sntp_started = false;
     if (sntp_started) return;
     if (g_config.role != DEVICE_ROLE_MASTER) return;
 
-    ESP_LOGI(TAG, "STA GOT_IP → starting SNTP");
+    ESP_LOGI(TAG, "GOT_IP (%s) → starting SNTP + MQTT",
+             base == IP_EVENT ? "IP" : "other");
     time_sync_start_sntp();
     sntp_started = true;
 
     if (!wifi_mqtt_is_connected()) {
-        ESP_LOGI(TAG, "STA GOT_IP → wifi_mqtt_init()");
         wifi_mqtt_init();
     }
 }
 
+/* ============================================================
+   Pending config из NVS
+   ============================================================ */
 static bool nvs_app_cfg_exists(void)
 {
     nvs_handle_t nvs;
@@ -136,18 +142,24 @@ static bool apply_pending_cfg_from_nvs(void)
         return false;
     }
 
-    ESP_LOGI(TAG, "pending_cfg: found %u bytes, "
-                  "heap free=%u, largest=%u",
+    if (len < 1000) {
+        ESP_LOGW(TAG, "pending_cfg: too short (%u bytes < 1000), erase",
+                 (unsigned)len);
+        if (nvs_open(NVS_NS_PENDING, NVS_READWRITE, &nvs) == ESP_OK) {
+            nvs_erase_all(nvs);
+            nvs_commit(nvs);
+            nvs_close(nvs);
+        }
+        return false;
+    }
+
+    ESP_LOGI(TAG, "pending_cfg: found %u bytes, heap free=%u, largest=%u",
              (unsigned)len,
              (unsigned)esp_get_free_heap_size(),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 
     char *buf = malloc(len + 1);
-    if (!buf) {
-        ESP_LOGE(TAG, "pending_cfg: malloc %u failed", (unsigned)(len + 1));
-        nvs_close(nvs);
-        return false;
-    }
+    if (!buf) { nvs_close(nvs); return false; }
 
     char key[16];
     size_t got = 0;
@@ -156,20 +168,12 @@ static bool apply_pending_cfg_from_nvs(void)
                     ? PENDING_CHUNK_SZ : (int)(len - off);
         snprintf(key, sizeof(key), NVS_KEY_CHUNK, off / PENDING_CHUNK_SZ);
         size_t sz = chunk;
-        err = nvs_get_blob(nvs, key, buf + off, &sz);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "pending_cfg: get %s failed: %s",
-                     key, esp_err_to_name(err));
-            free(buf);
-            nvs_close(nvs);
-            return false;
+        if (nvs_get_blob(nvs, key, buf + off, &sz) != ESP_OK) {
+            free(buf); nvs_close(nvs); return false;
         }
         got += sz;
     }
     buf[len] = '\0';
-
-    ESP_LOGI(TAG, "pending_cfg: loaded %u/%u bytes, parsing...",
-             (unsigned)got, (unsigned)len);
 
     bool ok = config_load_json(buf, len);
     free(buf);
@@ -181,14 +185,9 @@ static bool apply_pending_cfg_from_nvs(void)
         nvs_close(nvs);
     }
 
-    if (ok) {
-        ESP_LOGI(TAG, "pending_cfg: applied OK "
-                      "(version=%.2f, ped_mode=%u)",
-                 g_config.version,
-                 g_config.traffic.pedestrian.request_mode);
-    } else {
-        ESP_LOGE(TAG, "pending_cfg: parse FAILED");
-    }
+    ESP_LOGI(TAG, "pending_cfg: %s (version=%.2f, ped_mode=%u)",
+             ok ? "applied OK" : "parse FAILED",
+             g_config.version, g_config.traffic.pedestrian.request_mode);
     return ok;
 }
 
@@ -217,47 +216,103 @@ static void log_heap(const char *stage)
 }
 
 /* ============================================================
-   ТЕСТОВЫЙ CALLBACK LoRa RX
+   RTC init с проверкой наличия на шине.
    ============================================================ */
-static void lora_test_rx_cb(const uint8_t *data, size_t len)
+static void rtc_init(void)
 {
-    ESP_LOGI(TAG_LORA_TEST, "RX (%u bytes): %.*s",
-             (unsigned)len, (int)len, (const char *)data);
+    i2c_bus_init();
+
+    esp_err_t probe = i2c_master_probe(g_i2c_bus, DS1307_ADDRESS, 50);
+    if (probe != ESP_OK) {
+        ESP_LOGW(TAG, "DS1307 not found on I2C bus (0x%02X) — RTC disabled "
+                      "(time will come from SNTP)",
+                 DS1307_ADDRESS);
+        rtc_handle = NULL;
+        return;
+    }
+
+    ds1307_config_t rtc_cfg = {
+        .ds1307_device = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address  = DS1307_ADDRESS,
+            .scl_speed_hz    = 100000,
+        },
+        .century = 21,
+    };
+
+    esp_err_t err = ds1307_init(g_i2c_bus, &rtc_cfg, &rtc_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "ds1307_init failed (%s) — RTC disabled",
+                 esp_err_to_name(err));
+        rtc_handle = NULL;
+    } else {
+        ESP_LOGI(TAG, "DS1307 ready (addr=0x%02X, century=%d)",
+                 DS1307_ADDRESS, rtc_cfg.century);
+    }
 }
 
 /* ============================================================
-   ТЕСТОВЫЙ ЦИКЛ LoRa
+   ROOT: задача отправки конфига на NODE по LoRa.
+   Ждёт, пока LoRa-транспорт будет готов, и шлёт cfg несколько раз
+   (NODE может ещё грузиться). Без Wi-Fi — только LoRa.
    ============================================================ */
-static void lora_test_root(void)
+static void cfg_push_task(void *arg)
 {
-    ESP_LOGI(TAG_LORA_TEST, "ROOT: starting LoRa TX test (PING every 2s)");
-    while (1) {
-        uint8_t test[] = "PING";
-        if (lora_send_packet(test, 4) == ESP_OK) {
-            ESP_LOGI(TAG_LORA_TEST, "PING sent OK");
-        } else {
-            ESP_LOGE(TAG_LORA_TEST, "PING send FAILED");
+    ESP_LOGI(TAG, "cfg_push_task: waiting for LoRa...");
+
+    /* Ждём, пока LoRa станет основным транспортом */
+    uint32_t waited_ms = 0;
+    while (!transport_is_lora() && waited_ms < 10000) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        waited_ms += 500;
+    }
+    if (!transport_is_lora()) {
+        ESP_LOGE(TAG, "cfg_push: LoRa not ready → abort");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(2000));   /* дать NODE загрузиться */
+
+    extern bool config_export_json(char *b, size_t *l);
+    char *buf = malloc(16384);
+    size_t blen = 16384;
+    if (!buf || !config_export_json(buf, &blen)) {
+        ESP_LOGE(TAG, "cfg_push: export failed");
+        free(buf);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    /* Пробуем 5 раз с интервалом 3 с — пока NODE не ответит ACK */
+    for (int attempt = 0; attempt < 5; attempt++) {
+        ESP_LOGI(TAG, "cfg_push → LoRa attempt %d/5 (%u bytes)",
+                 attempt + 1, (unsigned)blen);
+        esp_err_t err = transport_send_cfg(buf, blen);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "cfg_push: OK (attempt %d)", attempt + 1);
+            free(buf);
+            vTaskDelete(NULL);
+            return;
         }
-        vTaskDelay(pdMS_TO_TICKS(2000));
+        ESP_LOGW(TAG, "cfg_push: failed (attempt %d): %s",
+                 attempt + 1, esp_err_to_name(err));
+        vTaskDelay(pdMS_TO_TICKS(3000));
     }
+
+    ESP_LOGE(TAG, "cfg_push: all attempts failed — NODE not responding");
+    free(buf);
+    vTaskDelete(NULL);
 }
 
-static void lora_test_node(void)
-{
-    ESP_LOGI(TAG_LORA_TEST, "NODE: starting LoRa RX test (polling)");
-    lora_set_rx_callback(lora_test_rx_cb);
-    lora_receive();  // войти в режим приёма
-
-    while (1) {
-        lora_poll();  // FIX: опрос IRQ
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
+/* ============================================================
+   app_main — БЕЗ Wi-Fi (STA и AP).
+   ============================================================ */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Board bring-up (root/node) — LoRa TEST MODE");
+    ESP_LOGI(TAG, "Board bring-up (ROOT/NODE) — NO WIFI, LoRa only");
 
+    /* 1. NVS */
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -268,11 +323,11 @@ void app_main(void)
 
     log_heap("app_main start");
 
+    /* 2. Config */
     bool pending_applied = apply_pending_cfg_from_nvs();
     if (pending_applied) {
         log_heap("after pending_cfg applied");
     }
-
     if (!pending_applied) {
         load_embedded_config_if_needed();
     }
@@ -281,30 +336,67 @@ void app_main(void)
     bool is_root = (g_config.role == DEVICE_ROLE_MASTER);
     ESP_LOGI(TAG, "role = %s", is_root ? "ROOT" : "NODE");
 
-    /* Минимальная инициализация железа */
+    /* 3. Железо */
     board_hw_init();
     sr_init();
     sr_all_off();
     mux_init();
     mux_data_init();
 
-    log_heap("before lora_init");
+    /* 4. RTC */
+    rtc_init();
+    time_sync_init();
 
-    /* ── ТЕСТ: ТОЛЬКО LoRa ── */
-    esp_err_t lora_ret = lora_init();
-    if (lora_ret != ESP_OK) {
-        ESP_LOGE(TAG_LORA_TEST, "lora_init failed: %s",
-                 esp_err_to_name(lora_ret));
-    } else {
-        ESP_LOGI(TAG_LORA_TEST, "lora_init OK");
-    }
+    /* 5. Traffic light + fault */
+    traffic_light_init();
+    fault_handler_register();
+    wifi_mqtt_apply_config_runtime();
 
-    log_heap("after lora_init");
+    /* 6. Кнопки */
+    buttons_start_tasks();
 
-    /* Запускаем тестовый цикл */
+    /* 7. RS485 / CAN */
+    connectivity_register_rs485_can();
+
+    /* 8. Transport (LoRa primary; TCP fallback отключён) */
+    transport_init();
+    node_proto_register_callbacks();
+
+    /* 9. IP-слой — только для PPP (Wi-Fi STA нет) */
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, on_got_ip, NULL);
+
     if (is_root) {
-        lora_test_root();
+        /* ─────────────── ROOT ─────────────── */
+        ESP_LOGI(TAG, "=== ROOT init (no Wi-Fi AP) ===");
+
+        /* ❌ НЕТ wifi_init() / wifi_ap_start_only() */
+        /* ❌ НЕТ node_link_server_start() — TCP не нужен */
+
+        /* Модем (PPPoS) → MQTT. Только PPP, без Wi-Fi STA fallback. */
+        connectivity_start_tasks();
+
+        root_wd_start_tasks();
+        mux_app_task_start();
+
+        /* Отправка cfg на NODE по LoRa */
+       // xTaskCreate(cfg_push_task, "cfg_push", 4096, NULL, 3, NULL);
+
+        ESP_LOGI(TAG, "ROOT ready: LoRa only, MQTT via PPP");
+
     } else {
-        lora_test_node();
+        /* ─────────────── NODE ─────────────── */
+        ESP_LOGI(TAG, "=== NODE init (no Wi-Fi STA) ===");
+
+        /* ❌ НЕТ wifi_init() / wifi_start() */
+        /* ❌ НЕТ node_link_client_start() — TCP не нужен */
+
+        /* LoRa уже поднят transport_init(). NODE шлёт телеметрию. */
+        node_proto_start_tasks();
+
+        mux_app_task_start();
+
+        ESP_LOGI(TAG, "NODE ready: LoRa only");
     }
 }

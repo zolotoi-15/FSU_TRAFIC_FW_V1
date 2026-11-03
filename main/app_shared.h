@@ -5,6 +5,7 @@
 #include "board_pins.h"
 #include "traffic_light.h"
 #include "pi4ioe5v6408.h"
+#include "wifi_ap.h"          /* === NEW: сюда переехали заглушки Wi-Fi === */
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,15 +31,9 @@ int       board_read_iload_raw(uint8_t channel,
                                imon_state_t *out_state,
                                int *out_mv);
 
-const char *wifi_get_ip(void);
-bool        wifi_sta_connected(void);
-bool        wifi_sta_has_ip(void);
-int         wifi_ap_client_count(void);
-
-/* === FIX: out_channel добавлен === */
-esp_err_t wifi_scan_for_fsu_ap(char *out_ssid, size_t out_len,
-                               int8_t *out_rssi, uint8_t *out_channel,
-                               const char *ssid_prefix);
+/* === УБРАНО: wifi_get_ip / wifi_sta_connected / wifi_sta_has_ip /
+   wifi_ap_client_count / wifi_scan_for_fsu_ap — теперь в wifi_ap.h
+   как static inline заглушки. === */
 
 #ifdef __cplusplus
 }

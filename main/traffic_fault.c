@@ -30,12 +30,14 @@ static inline uint32_t fault_blink_period_ms(void)
     return (p >= BLINK_MIN_PERIOD_MS) ? p : 500;
 }
 
-/* ------------------------------------------------------------ */
-/* apply_fault_mode / fault_blink_yellow                        */
-/* ------------------------------------------------------------ */
+/* ============================================================
+   === apply_fault_mode ===
+   ВСЕГДА вызывает set_all_off() — все выходы выключены.
+   При TRAFFIC_FAULT_ALL_OFF — просто return (выходы уже 0).
+   ============================================================ */
 void apply_fault_mode(traffic_fault_t fault)
 {
-    set_all_off();
+    set_all_off();              // ← ВСЕ ВЫХОДЫ ВЫКЛЮЧЕНЫ
     s_fault_yellow_mask = 0;
 
     if (fault == TRAFFIC_FAULT_ALL_OFF) {
@@ -76,9 +78,6 @@ void fault_blink_yellow(bool on)
     s_fault_blink_state = on;
 }
 
-/* ------------------------------------------------------------ */
-/* try_recovery                                                 */
-/* ------------------------------------------------------------ */
 void try_recovery(uint32_t now_ms, uint32_t *blink_last)
 {
     traffic_fault_info_t snap[TRAFFIC_FAULT_MAX];
@@ -166,9 +165,6 @@ void try_recovery(uint32_t now_ms, uint32_t *blink_last)
     if (fire && s_fault_notify) s_fault_notify(TRAFFIC_FAULT_NONE);
 }
 
-/* ------------------------------------------------------------ */
-/* reason_str / fill_reason_text / classify_channel             */
-/* ------------------------------------------------------------ */
 const char *reason_str(uint8_t reason)
 {
     switch (reason) {
@@ -240,9 +236,6 @@ uint8_t classify_channel(uint8_t ch, bool should_be_on,
     return TRAFFIC_REASON_NONE;
 }
 
-/* ------------------------------------------------------------ */
-/* check_faults                                                 */
-/* ------------------------------------------------------------ */
 void traffic_light_check_faults(const mux_data_t *data)
 {
     if (s_state != TRAFFIC_STATE_RUNNING) return;
@@ -390,9 +383,6 @@ void traffic_light_check_faults(const mux_data_t *data)
     if (fire && s_fault_notify) s_fault_notify(nf);
 }
 
-/* ------------------------------------------------------------ */
-/* set_fault                                                    */
-/* ------------------------------------------------------------ */
 void traffic_light_set_fault(traffic_fault_t fault)
 {
     bool fire = false;
@@ -427,9 +417,6 @@ void traffic_light_set_fault(traffic_fault_t fault)
     if (fire && s_fault_notify) s_fault_notify(fault);
 }
 
-/* ------------------------------------------------------------ */
-/* build_fault_report                                           */
-/* ------------------------------------------------------------ */
 static const char *fault_mode_str(traffic_fault_t f)
 {
     switch (f) {

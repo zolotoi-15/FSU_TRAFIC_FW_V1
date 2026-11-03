@@ -15,17 +15,17 @@ idf_component_register(
         "transport.c"
         "mux.c"
         "shift_register.c"
-        "wifi_ap.c"
         "config_manager.c"
         "wifi_mqtt.c"
         "mux_data.c"
         "traffic_light.c"
         "traffic_nvs.c"
-        "node_link.c"
+        # "node_link.c"      ← УБРАНО (TCP отключён)
         "modem_ppp.c"
         "rs485.c"
         "can_bus.c"
         "time_sync.c"
+        # "wifi_ap.c"        ← УБРАНО (Wi-Fi отключён)
     INCLUDE_DIRS "." "include"
     REQUIRES
         driver esp_driver_gpio esp_driver_uart esp_driver_spi

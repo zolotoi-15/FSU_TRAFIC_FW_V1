@@ -76,6 +76,9 @@ void wifi_mqtt_notify_phase(uint8_t phase, uint32_t phase_ms,
                             uint32_t duration_ms);
 void wifi_mqtt_set_phase_sync_enabled(bool en);
 
+uint32_t wifi_mqtt_get_down_ms(void);
+void     wifi_mqtt_force_restart_modem(void);
+
 extern esp_mqtt_client_handle_t g_mqtt_client;
 
 #ifdef __cplusplus

@@ -684,5 +684,6 @@ esp_err_t wifi_ap_resume_after_parse(void)
                   "heap free=%u, largest=%u",
              (unsigned)esp_get_free_heap_size(),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    
     return ESP_OK;
 }

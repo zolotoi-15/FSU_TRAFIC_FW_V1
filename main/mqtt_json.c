@@ -1,17 +1,17 @@
 /* ============================================================
    mqtt_json.c — build_json: JSON-телеметрия root.
+   Wi-Fi отключён: rssi=0, IP берём из PPP (modem_ppp_get_ip()).
    ============================================================ */
 
 #include "mqtt_internal.h"
 #include "config_manager.h"
-#include "wifi_ap.h"
 #include "shift_register.h"
 #include "traffic_light.h"
 #include "mux.h"
 #include "mux_data.h"
 #include "rs485.h"
 #include "can_bus.h"
-#include "esp_wifi.h"
+#include "modem_ppp.h"            /* === NO WIFI: modem_ppp_get_ip() === */
 #include "esp_timer.h"
 #include <stdio.h>
 #include <string.h>
@@ -42,23 +42,14 @@ int mqtt_build_json(char *json, size_t size)
     }
     off += snprintf(json + off, size - off, "]},");
 
-    wifi_ap_record_t ap;
-    int     rssi = (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) ? ap.rssi : 0;
-    uint8_t ch   = 0;
-    wifi_second_chan_t sec = WIFI_SECOND_CHAN_NONE;
-    esp_wifi_get_channel(&ch, &sec);
+    /* === NO WIFI: rssi=0, IP из PPP === */
+    const char *ip = modem_ppp_is_connected() ? modem_ppp_get_ip() : "0.0.0.0";
 
     off += snprintf(json + off, size - off,
-        "\"NET\":{\"role\":\"%s\",\"sta_connected\":%d,\"has_ip\":%d,"
-        "\"rssi\":%d,\"channel\":%u,\"ip\":\"%s\","
-        "\"ap_running\":%d,\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\",\"ap_clients\":%d},",
+        "\"NET\":{\"role\":\"%s\",\"ppp\":%d,\"ip\":\"%s\"},",
         g_config.role == DEVICE_ROLE_SLAVE ? "node" : "root",
-        wifi_sta_connected() ? 1 : 0,
-        wifi_sta_has_ip()    ? 1 : 0,
-        rssi, ch, wifi_get_ip(),
-        wifi_ap_is_running() ? 1 : 0,
-        wifi_get_ap_ssid(), wifi_get_ap_ip(),
-        wifi_ap_client_count());
+        modem_ppp_is_connected() ? 1 : 0,
+        ip);
 
     off += snprintf(json + off, size - off,
         "\"TRAFFIC\":{\"state\":\"%s\",\"mode\":%d,\"phase\":%d,"

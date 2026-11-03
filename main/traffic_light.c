@@ -1,5 +1,14 @@
 /* ============================================================
    traffic_light.c — публичный API и главный цикл traffic_task.
+
+   === FIX: follow_root ===
+   Если s_follow_root == true (NODE), traffic_task_loop НЕ двигает
+   фазы сам — только blink. Фазы применяются через
+   traffic_light_force_phase() по sync: от ROOT.
+
+   === FIX: PED_MIN_RECALL без спама ===
+   Логируем PED_MIN_RECALL только при смене фазы
+   (last_min_green_phase != s_phase), а не каждые 20 мс.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -155,7 +164,7 @@ static inline uint32_t phase_blink_period_ms(void)
 }
 
 /* ============================================================
-   traffic_task — главный цикл.
+   === FIX: traffic_task_loop с follow_root и без спама PED_MIN_RECALL ===
    ============================================================ */
 void traffic_task_loop(void *arg)
 {
@@ -163,7 +172,6 @@ void traffic_task_loop(void *arg)
 
     uint32_t blink_last_fault = 0;
     bool     fault_blink_on   = false;
-
     uint8_t  last_min_green_phase = 0xFF;
 
     TickType_t last_wake = xTaskGetTickCount();
@@ -174,6 +182,38 @@ void traffic_task_loop(void *arg)
 
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
+        /* ============================================================
+           === FIX: follow_root — только blink, НЕ двигаем фазы ===
+           ============================================================ */
+        if (s_follow_root) {
+            uint16_t bm = s_blink_mask;
+            uint32_t per = phase_blink_period_ms();
+            if (bm && (now - s_blink_last_phase >= per)) {
+                s_blink_last_phase = now;
+                s_blink_on = !s_blink_on;
+                for (int ch = 0; ch < 16; ch++) {
+                    if (bm & (1u << ch)) {
+                        if (s_blink_on) sr_output_on(ch);
+                        else            sr_output_off(ch);
+                    }
+                }
+            }
+
+            if (s_fault == TRAFFIC_FAULT_YELLOW_BLINK) {
+                uint32_t per_f = g_config.traffic.phases_ms.fault_blink_period;
+                if (per_f < BLINK_MIN_PERIOD_MS) per_f = 500;
+                if (now - blink_last_fault >= per_f) {
+                    blink_last_fault = now;
+                    fault_blink_on = !fault_blink_on;
+                    fault_blink_yellow(fault_blink_on);
+                }
+            }
+            continue;
+        }
+
+        /* ============================================================
+           Обычная логика ROOT (follow_root == false)
+           ============================================================ */
         if (s_ped_request &&
             g_config.traffic.pedestrian.request_mode == PED_REQUEST_MODE_INSERT) {
             uint32_t age = now - s_ped_request_ms;
@@ -218,8 +258,7 @@ void traffic_task_loop(void *arg)
 
         if (s_follow_root) continue;
 
-        /* FIX: stuck-check под мьютексом — чтобы парсинг конфига
-           (config_load_json) не дал ложный stuck. */
+        /* stuck-check под мьютексом */
         {
             bool in_running = false;
             if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
@@ -268,8 +307,7 @@ void traffic_task_loop(void *arg)
             last_min_green_phase = 0xFF;
         }
 
-        /* FIX: PED_REQUEST_MODE_MIN_RECALL — плавный режим:
-           ограничиваем green до min_recall_s. */
+        /* === FIX: PED_MIN_RECALL — логировать только при смене фазы === */
         if (s_ped_min_recall && stage_is_transport_green(s_phase)) {
             uint32_t max_green = g_config.traffic.pedestrian.min_recall_s * 1000;
             if (max_green > 0 && dur > max_green) {
@@ -296,9 +334,6 @@ void traffic_task_loop(void *arg)
                     if (cur_st->groups[g] == 3) { in_transport_green = true; break; }
                 }
             }
-            /* FIX: при активном min_recall в green — НЕ удерживаем фазу.
-               Иначе s_phase_start_ms сбрасывается, урезанный dur не
-               наступает, и min_recall никогда не переключает. */
             bool min_recall_hold = s_ped_min_recall && in_transport_green;
             if (in_transport_green && !s_ped_request && !min_recall_hold) {
                 s_phase_start_ms = now;

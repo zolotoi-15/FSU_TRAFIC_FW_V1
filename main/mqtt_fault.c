@@ -1,12 +1,10 @@
 /* ============================================================
-   mqtt_fault.c — зеркалирование fault между root и node.
-   apply_remote_fault, publish_node_fault, publish_node_json,
-   reset_node_fault_tracking.
+   mqtt_fault.c — зеркалирование fault + публикация NODE JSON.
+   NODE JSON → s_node_json_topic (FSU_Trafic_<MAC>/Node).
    ============================================================ */
 
 #include "mqtt_internal.h"
 #include "config_manager.h"
-#include "node_link.h"
 #include "traffic_light.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -63,9 +61,9 @@ void wifi_mqtt_set_fault_from_node(bool from_node)
     s_fault_is_from_node = from_node;
 }
 
-/* ============================================================ */
-/* publish_node_fault                                            */
-/* ============================================================ */
+/* ============================================================
+   publish_node_fault — публикация fault-строки в s_topic.
+   ============================================================ */
 void mqtt_fault_publish_node(const char *fault_str, size_t len)
 {
     if (!s_mqtt_connected || !g_mqtt_client) return;
@@ -80,9 +78,9 @@ void mqtt_fault_publish_node(const char *fault_str, size_t len)
     free(out);
 }
 
-/* ============================================================ */
-/* apply_remote_fault                                            */
-/* ============================================================ */
+/* ============================================================
+   apply_remote_fault — применить fault от NODE на ROOT.
+   ============================================================ */
 void mqtt_fault_apply_remote(const char *fault_str, size_t len)
 {
     if (len < 6 || strncmp(fault_str, "fault:", 6) != 0) return;
@@ -154,25 +152,36 @@ void mqtt_fault_apply_remote(const char *fault_str, size_t len)
     wifi_mqtt_publish_now();
 }
 
-/* ============================================================ */
-/* publish_node_json — JSON от node → MQTT + парсинг FAULT       */
-/* ============================================================ */
+/* ============================================================
+   publish_node_json — NODE JSON → MQTT /Node + парсинг FAULT.
+   === FIX: публикуем в s_node_json_topic (FSU_Trafic_<MAC>/Node) ===
+   ============================================================ */
 void mqtt_fault_publish_node_json(const char *json, size_t len)
 {
     if (!json || len == 0) return;
 
+    /* Базовая проверка: JSON начинается с '{' и содержит "role":"node" */
     if (len < 20 || json[0] != '{' || !strstr(json, "\"role\":\"node\"")) {
         ESP_LOGW(TAG, "node JSON rejected: len=%u first='%c'",
                  (unsigned)len, (len > 0) ? json[0] : '?');
         return;
     }
 
+    /* === Публикация в FSU_Trafic_<MAC>/Node === */
     if (s_mqtt_connected && g_mqtt_client) {
         int id = esp_mqtt_client_publish(g_mqtt_client, s_node_json_topic,
                                          json, (int)len, 1, 0);
-        if (id < 0) ESP_LOGW(TAG, "publish node JSON failed");
+        if (id < 0) {
+            ESP_LOGW(TAG, "publish node JSON to %s failed", s_node_json_topic);
+        } else {
+            ESP_LOGI(TAG, "published node JSON → %s (%u bytes)",
+                     s_node_json_topic, (unsigned)len);
+        }
+    } else {
+        ESP_LOGW(TAG, "publish node JSON: MQTT not connected");
     }
 
+    /* === Сохранить в кэш === */
     if (!s_node_mutex) s_node_mutex = xSemaphoreCreateMutex();
     if (!s_node_mutex || xSemaphoreTake(s_node_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
         return;
@@ -185,6 +194,7 @@ void mqtt_fault_publish_node_json(const char *json, size_t len)
     s_node_json[len] = '\0';
     s_node_json_len = len;
 
+    /* === Парсинг FAULT для зеркалирования === */
     const char *f = strstr(json, "\"FAULT\":");
     if (!f) { xSemaphoreGive(s_node_mutex); return; }
 
@@ -207,6 +217,7 @@ void mqtt_fault_publish_node_json(const char *json, size_t len)
         s_node_fault_json[flen] = '\0';
     }
 
+    /* mode */
     const char *new_mode = "NONE";
     const char *scan_start = obj_start + 1;
     const char *scan_end   = obj_end - 1;
