@@ -1,6 +1,10 @@
 /* ============================================================
    mqtt_fault.c — зеркалирование fault + публикация NODE JSON.
    NODE JSON → s_node_json_topic (FSU_Trafic_<MAC>/Node).
+
+   === FIX ===
+   - s_node_fault защищён portMUX-критической секцией (race).
+   - Проверены все пути выхода из-под s_node_mutex.
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -26,6 +30,26 @@ static char s_last_applied_node_fault_mode[16] = {0};
 static volatile traffic_fault_t s_node_fault = TRAFFIC_FAULT_NONE;
 static bool s_fault_is_from_node = false;
 
+/* === FIX: критическая секция для s_node_fault === */
+static portMUX_TYPE s_node_fault_mtx = portMUX_INITIALIZER_UNLOCKED;
+
+static inline traffic_fault_t mqtt_get_node_fault_internal(void)
+{
+    traffic_fault_t v;
+    portENTER_CRITICAL(&s_node_fault_mtx);
+    v = s_node_fault;
+    portEXIT_CRITICAL(&s_node_fault_mtx);
+    return v;
+}
+
+static inline void mqtt_set_node_fault_internal(traffic_fault_t f)
+{
+    portENTER_CRITICAL(&s_node_fault_mtx);
+    s_node_fault = f;
+    portEXIT_CRITICAL(&s_node_fault_mtx);
+}
+/* === END FIX === */
+
 static char    *s_node_json     = NULL;
 static size_t   s_node_json_len = 0;
 static SemaphoreHandle_t s_node_mutex = NULL;
@@ -46,7 +70,7 @@ int mqtt_fault_priority(traffic_fault_t f)
 
 traffic_fault_t mqtt_fault_get_node(void)
 {
-    return s_node_fault;
+    return mqtt_get_node_fault_internal();
 }
 
 void wifi_mqtt_set_root_comm_lost(bool lost)
@@ -104,7 +128,7 @@ void mqtt_fault_apply_remote(const char *fault_str, size_t len)
         return;
     }
 
-    s_node_fault = nf;
+    mqtt_set_node_fault_internal(nf);
 
     traffic_fault_t root_fault = traffic_light_get_fault();
 
@@ -154,7 +178,9 @@ void mqtt_fault_apply_remote(const char *fault_str, size_t len)
 
 /* ============================================================
    publish_node_json — NODE JSON → MQTT /Node + парсинг FAULT.
-   === FIX: публикуем в s_node_json_topic (FSU_Trafic_<MAC>/Node) ===
+
+   === FIX: все пути выхода из-под s_node_mutex корректны.
+   === FIX: s_node_fault пишется через mqtt_set_node_fault_internal.
    ============================================================ */
 void mqtt_fault_publish_node_json(const char *json, size_t len)
 {
@@ -183,18 +209,23 @@ void mqtt_fault_publish_node_json(const char *json, size_t len)
 
     /* === Сохранить в кэш === */
     if (!s_node_mutex) s_node_mutex = xSemaphoreCreateMutex();
-    if (!s_node_mutex || xSemaphoreTake(s_node_mutex, pdMS_TO_TICKS(100)) != pdTRUE)
+    if (!s_node_mutex ||
+        xSemaphoreTake(s_node_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         return;
+    }
 
+    /* --- Кэш JSON --- */
     if (s_node_json) free(s_node_json);
     s_node_json = malloc(len + 1);
-    if (!s_node_json) { xSemaphoreGive(s_node_mutex); return; }
-
+    if (!s_node_json) {
+        xSemaphoreGive(s_node_mutex);
+        return;
+    }
     memcpy(s_node_json, json, len);
     s_node_json[len] = '\0';
     s_node_json_len = len;
 
-    /* === Парсинг FAULT для зеркалирования === */
+    /* --- Парсинг FAULT --- */
     const char *f = strstr(json, "\"FAULT\":");
     if (!f) { xSemaphoreGive(s_node_mutex); return; }
 
@@ -251,7 +282,7 @@ void mqtt_fault_publish_node_json(const char *json, size_t len)
     if (strcmp(new_mode, "ALL_OFF") == 0)      nf = TRAFFIC_FAULT_ALL_OFF;
     else if (strcmp(new_mode, "YELLOW_BLINK") == 0) nf = TRAFFIC_FAULT_YELLOW_BLINK;
 
-    s_node_fault = nf;
+    mqtt_set_node_fault_internal(nf);
 
     strncpy(s_last_applied_node_fault_mode, new_mode,
             sizeof(s_last_applied_node_fault_mode) - 1);
@@ -314,6 +345,6 @@ void mqtt_fault_reset_tracking(void)
     s_last_node_fault_str[0] = '\0';
     s_node_fault_json[0] = '\0';
     s_fault_is_from_node = false;
-    s_node_fault = TRAFFIC_FAULT_NONE;
+    mqtt_set_node_fault_internal(TRAFFIC_FAULT_NONE);
     ESP_LOGI(TAG, "reset node fault tracking → NONE");
 }

@@ -30,6 +30,7 @@ void transport_reset_cfg_accum(void);
 
 /* === FIX: NODE приостанавливает STATUS во время приёма CFG === */
 bool transport_is_cfg_rx_in_progress(void);
+bool transport_is_tx_idle(void);
 
 #ifdef __cplusplus
 }

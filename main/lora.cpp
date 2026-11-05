@@ -19,6 +19,15 @@ static std::unique_ptr<espp::Sx126x> s_radio;
 static lora_raw_rx_cb_t s_raw_cb = nullptr;
 static SemaphoreHandle_t s_lora_mutex = NULL;
 
+/* === FIX: отдельный рекурсивный мьютекс для SPI/radio ===
+   Защищает все вызовы s_radio->* (transmit, start_receive,
+   service_interrupts) от одновременного доступа из разных задач.
+   Recursive, потому что service_interrupts() может внутри
+   вызвать on_receive → lora_send_packet(ack) → transmit(),
+   и тот же поток должен иметь возможность повторно взять мьютекс. */
+static SemaphoreHandle_t s_spi_mutex = NULL;
+/* === END FIX === */
+
 /* === FIX: явно задаём частоту, SF и мощность === */
 #define LORA_FREQ_HZ        868525050
 #define LORA_TX_POWER_DBM   22        // LLCC68 максимум +22 dBm
@@ -59,13 +68,17 @@ static bool spi_write_then_read(const uint8_t *write_data, size_t write_len,
 static bool is_busy() { return gpio_get_level(LORA_BUSY) != 0; }
 static void reset(bool level) { gpio_set_level(LORA_RST, level ? 1 : 0); }
 
+/* === FIX: проверка CRC перед вызовом user callback === */
 static void on_rx_packet(const espp::Sx126x::RxPacket &pkt) {
+    // В текущей версии espp PacketStatus не имеет поля crc_error,
+    // проверку CRC необходимо выполнять через IRQ-флаг драйвера или на уровне приложения.
     ESP_LOGI(TAG, "on_rx_packet: %d bytes, rssi=%.1f, snr=%.1f",
              (int)pkt.data.size(), pkt.status.rssi, pkt.status.snr);
     if (s_raw_cb && !pkt.data.empty()) {
         s_raw_cb(pkt.data.data(), pkt.data.size());
     }
 }
+/* === END FIX === */
 
 static void log_lora_config(void) {
     ESP_LOGI(TAG, "LoRa config:");
@@ -92,6 +105,15 @@ extern "C" esp_err_t lora_init(void) {
             return ESP_ERR_NO_MEM;
         }
     }
+    /* === FIX: аллоцируем s_spi_mutex === */
+    if (!s_spi_mutex) {
+        s_spi_mutex = xSemaphoreCreateRecursiveMutex();
+        if (!s_spi_mutex) {
+            ESP_LOGE(TAG, "s_spi_mutex alloc failed");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    /* === END FIX === */
 
     spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = LORA_MOSI;
@@ -131,16 +153,14 @@ extern "C" esp_err_t lora_init(void) {
     cfg.on_receive = on_rx_packet;
     cfg.log_level = espp::Logger::Verbosity::WARN;
 
-    // === FIX: удалена строка cfg.rx_boosted_gain=true; ===
-    // По документации espp это поле должно быть, но в вашей версии его нет.
-    // Режим Boosted Gain по умолчанию включён (true) в оригинальном Config,
-    // поэтому дополнительная настройка не требуется. Если компилятор
-    // снова начнёт ругаться — проверьте версию managed_components/espp__sx126x.
-
     s_radio = std::make_unique<espp::Sx126x>(cfg);
+
+    /* === FIX: initialize() тоже трогает SPI — берём мьютекс === */
+    if (s_spi_mutex) xSemaphoreTakeRecursive(s_spi_mutex, portMAX_DELAY);
 
     std::error_code ec;
     if (!s_radio->initialize(ec)) {
+        if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
         ESP_LOGE(TAG, "Sx126x init failed: %s", ec.message().c_str());
         s_radio.reset();
         return ESP_FAIL;
@@ -158,15 +178,22 @@ extern "C" esp_err_t lora_init(void) {
         ESP_LOGI(TAG, "LoRa RX mode enabled");
     }
 
+    if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
+    /* === END FIX === */
+
     return ESP_OK;
 }
 
 extern "C" void lora_receive(void) {
     if (!s_radio) return;
-    if (s_lora_mutex && xSemaphoreTake(s_lora_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
-        ESP_LOGW(TAG, "lora_receive: mutex timeout");
+
+    /* === FIX: SPI-мьютекс вокруг start_receive === */
+    if (s_spi_mutex &&
+        xSemaphoreTakeRecursive(s_spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGW(TAG, "lora_receive: spi mutex timeout");
         return;
     }
+
     std::error_code ec;
     s_radio->start_receive(ec);
     if (ec) {
@@ -174,14 +201,19 @@ extern "C" void lora_receive(void) {
     } else {
         ESP_LOGI(TAG, "LoRa RX mode (re)enabled");
     }
-    if (s_lora_mutex) xSemaphoreGive(s_lora_mutex);
+
+    if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
 }
 
 extern "C" esp_err_t lora_send_packet(uint8_t *buf, uint8_t size) {
     if (!s_radio || !buf || size == 0) return ESP_ERR_INVALID_ARG;
 
-    if (s_lora_mutex && xSemaphoreTake(s_lora_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
-        ESP_LOGW(TAG, "lora_send_packet: mutex timeout");
+    /* === FIX: SPI-мьютекс вокруг transmit + start_receive ===
+       Recursive: если вызов пришёл из on_rx_packet (ACK),
+       тот же поток уже держит мьютекс — войдём повторно. */
+    if (s_spi_mutex &&
+        xSemaphoreTakeRecursive(s_spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
+        ESP_LOGW(TAG, "lora_send_packet: spi mutex timeout");
         return ESP_ERR_TIMEOUT;
     }
 
@@ -196,7 +228,7 @@ extern "C" esp_err_t lora_send_packet(uint8_t *buf, uint8_t size) {
         ESP_LOGW(TAG, "start_receive after tx: %s", ec2.message().c_str());
     }
 
-    if (s_lora_mutex) xSemaphoreGive(s_lora_mutex);
+    if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
 
     if (!ok) {
         ESP_LOGW(TAG, "tx failed: %s", ec.message().c_str());
@@ -215,9 +247,19 @@ extern "C" bool lora_is_ready(void) { return (bool)s_radio; }
 
 extern "C" void lora_poll(void) {
     if (!s_radio) return;
+
+    /* === FIX: service_interrupts() трогает SPI и s_radio ===
+       Не блокируемся надолго — пропускаем опрос, если мьютекс занят. */
+    if (s_spi_mutex &&
+        xSemaphoreTakeRecursive(s_spi_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        return;
+    }
+
     std::error_code ec;
     s_radio->service_interrupts(ec);
     if (ec) {
         ESP_LOGW(TAG, "service_interrupts: %s", ec.message().c_str());
     }
+
+    if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
 }

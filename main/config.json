@@ -102,7 +102,7 @@
   },
 
   "modules": {
-    "SystemBus": {      
+    "SystemBus": {
       "devices": {
         "KSK1": {
           "switches": {
@@ -124,7 +124,7 @@
           }
         }
       }
-    }   
+    }
   },
 
   "traffic": {

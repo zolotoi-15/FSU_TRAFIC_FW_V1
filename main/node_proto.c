@@ -6,7 +6,7 @@
    - traffic:start не перезапускает уже RUNNING.
    - s_node_running обновляется ВСЕГДА (throttle только для MQTT).
    - STATUS каждые 1–2 с.
-   - Опечатка strcmp(can, ...) → strcmp(cmd, ...).
+   - node_send_task: не шлём STATUS, пока предыдущий TX не завершён.
    ============================================================ */
 
 #include "node_proto.h"
@@ -355,9 +355,7 @@ void node_handle_local_cmd(const char *cmd)
         return;
     }
     if (strcmp(cmd, "can:standby") == 0) { can_bus_set_standby(true);  return; }
-    /* === FIX: было strcmp(can, ...) — опечатка === */
     if (strcmp(cmd, "can:normal")  == 0) { can_bus_set_standby(false); return; }
-    /* === END FIX === */
 }
 
 static void on_node_status_from_transport(const char *json, size_t len)
@@ -469,6 +467,7 @@ static void cfg_ok_tx_task(void *arg)
     }
 }
 
+/* === FIX: node_send_task не накладывается на предыдущий TX === */
 static void node_send_task(void *arg)
 {
     char *json = malloc(512);
@@ -478,6 +477,12 @@ static void node_send_task(void *arg)
     while (1) {
         if (transport_is_cfg_rx_in_progress()) {
             vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        /* Не шлём STATUS, если предыдущий пакет ещё в эфире */
+        if (!transport_is_tx_idle()) {
+            vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
 
@@ -505,6 +510,7 @@ static void node_send_task(void *arg)
         }
     }
 }
+/* === END FIX === */
 
 static void node_link_watchdog_task(void *arg)
 {

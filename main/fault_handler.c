@@ -1,14 +1,17 @@
 /* ============================================================
    fault_handler.c — зеркалирование fault между ROOT и NODE.
-   === FIX: LoRa (transport_*) вместо TCP (node_link_*) ===
    ROOT → transport_send_cmd()
    NODE → transport_send_evt()
+
+   === FIX ===
+   - NODE: не отправлять evt, пока LoRa не готова
+     (иначе событие теряется при старте).
    ============================================================ */
 
 #include "fault_handler.h"
 #include "app_shared.h"
 #include "traffic_light.h"
-#include "transport.h"           /* === FIX: LoRa вместо TCP === */
+#include "transport.h"
 #include "wifi_mqtt.h"
 #include "config_manager.h"
 #include "esp_log.h"
@@ -67,7 +70,6 @@ static void on_fault_changed(traffic_fault_t fault)
     ESP_LOGW(TAG, "fault changed → '%s'", buf);
 
     if (g_config.role == DEVICE_ROLE_MASTER) {
-        /* === FIX: LoRa вместо TCP === */
         esp_err_t err = transport_send_cmd(buf, n);
         if (err == ESP_OK) {
             ESP_LOGW(TAG, "root fault → node: '%s'", buf);
@@ -76,7 +78,14 @@ static void on_fault_changed(traffic_fault_t fault)
         }
         wifi_mqtt_publish_node_fault(buf, n);
     } else {
-        /* === FIX: LoRa вместо TCP === */
+        /* === FIX: не отправляем evt, пока LoRa не готова ===
+           Иначе при старте NODE (LoRa init ~800 мс) событие
+           fault:all_off теряется, и ROOT не знает о состоянии NODE. */
+        if (!transport_is_lora()) {
+            ESP_LOGW(TAG, "node fault → root: LoRa not ready, skip '%s'", buf);
+            return;
+        }
+        /* === END FIX === */
         esp_err_t err = transport_send_evt(buf, n);
         if (err == ESP_OK) {
             ESP_LOGW(TAG, "node fault → root: '%s'", buf);

@@ -41,6 +41,12 @@ static void config_cache_invalidate(void)
     }
 }
 
+/* ============================================================
+   Forward declarations (нужны, т.к. используются ниже).
+   ============================================================ */
+static const char *duration_kind_to_str(uint8_t kind);
+static const char *ped_request_mode_to_str(uint8_t m);
+
 /* ============================================================ */
 static void set_defaults(void)
 {
@@ -524,6 +530,20 @@ static void parse_traffic(const cJSON *t)
                 tc->sequence[tc->sequence_count++] = (uint8_t)si->valueint;
         }
     }
+
+    /* === FIX: проверка согласованности sequence ↔ stages_dd === */
+    if (tc->sequence_count > 0 && tc->stage_count > 0) {
+        for (int i = 0; i < tc->sequence_count; i++) {
+            bool found = false;
+            for (int j = 0; j < tc->stage_count; j++) {
+                if (tc->stages[j].id == tc->sequence[i]) { found = true; break; }
+            }
+            if (!found) {
+                ESP_LOGE(TAG, "sequence[%d]=%u not in stages_dd (count=%u)!",
+                         i, tc->sequence[i], tc->stage_count);
+            }
+        }
+    }
 }
 
 static void parse_signal_groups(const cJSON *sg) { /* ваш код */ }
@@ -557,7 +577,6 @@ bool config_load_json(const char *json, size_t len)
         return false;
     }
 
-    /* === FIX: диагностика ошибки cJSON === */
     cJSON *root = cJSON_ParseWithLength(json, len);
     if (!root) {
         const char *err = cJSON_GetErrorPtr();
@@ -578,7 +597,6 @@ bool config_load_json(const char *json, size_t len)
                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
         return false;
     }
-    /* === END FIX === */
 
     ESP_LOGI(TAG, "Parsing JSON config (%u bytes)", (unsigned)len);
 
@@ -861,6 +879,7 @@ bool config_export_json(char *buf, size_t *len)
                                     g_config.traffic.fault.vin_off_confirmations);
         }
 
+        /* === FIX: экспорт stages_dd === */
         cJSON *stages = cJSON_AddArrayToObject(t, "stages_dd");
         if (stages) {
             for (int i = 0; i < g_config.traffic.stage_count; i++) {
@@ -889,12 +908,15 @@ bool config_export_json(char *buf, size_t *len)
             }
         }
 
+        /* === FIX: экспорт sequence === */
         cJSON *seq = cJSON_AddArrayToObject(t, "sequence");
         if (seq) {
             for (int i = 0; i < g_config.traffic.sequence_count; i++)
-                cJSON_AddItemToArray(seq, cJSON_CreateNumber(g_config.traffic.sequence[i]));
+                cJSON_AddItemToArray(seq,
+                    cJSON_CreateNumber(g_config.traffic.sequence[i]));
         }
 
+        /* === FIX: экспорт transitions === */
         cJSON *tr = cJSON_AddArrayToObject(t, "transitions");
         if (tr) {
             for (int i = 0; i < g_config.traffic.transition_count; i++) {

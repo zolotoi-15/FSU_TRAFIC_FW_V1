@@ -20,19 +20,18 @@ idf_component_register(
         "mux_data.c"
         "traffic_light.c"
         "traffic_nvs.c"
-        # "node_link.c"      ← УБРАНО (TCP отключён)
         "modem_ppp.c"
         "rs485.c"
         "can_bus.c"
         "time_sync.c"
-        # "wifi_ap.c"        ← УБРАНО (Wi-Fi отключён)
     INCLUDE_DIRS "." "include"
     REQUIRES
         driver esp_driver_gpio esp_driver_uart esp_driver_spi
         esp_driver_i2c esp_driver_twai esp_eth esp_netif esp_timer
         esp_adc esp_wifi esp_event esp_http_server lwip nvs_flash
-        espressif__cjson espressif__esp_modem
+        espressif__esp_modem
         espp__sx126x
+        # espressif__cjson  ← УДАЛЕНО (в IDF 6.x cJSON — managed component)
 )
 
 target_add_binary_data(${COMPONENT_LIB} "config.json" TEXT)

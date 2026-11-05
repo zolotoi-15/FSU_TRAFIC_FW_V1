@@ -1,8 +1,12 @@
 /* ============================================================
    transport.c — LoRa-транспорт (единственный канал).
-   === FIX: ACK_TIMEOUT_CFG 3000 → 4000 ===
-   === FIX: фильтр дублей CFG по seq ===
-   === FIX: CFG_NEW_BURST_MS 4000 → 6000 ===
+
+   === FIX ===
+   - мьютекс s_accum_mtx защищает статические буферы.
+   - флаг s_tx_busy: не отправляем новый пакет, пока
+     предыдущий transmit не завершён (защита от переполнения
+     очереди SX126x и гонки с ack_tx_task).
+   - transport_is_tx_idle() для node_send_task.
    ============================================================ */
 
 #include "transport.h"
@@ -33,7 +37,6 @@ static const char *TAG = "transport";
 #define PKT_MAGIC         0x4C
 #define PKT_MAX           240
 #define ACK_TIMEOUT       1500
-/* === FIX: 3000 → 4000 — даём NODE больше времени на ACK === */
 #define ACK_TIMEOUT_CFG   4000
 #define MAX_RETRIES       3
 
@@ -42,7 +45,6 @@ static const char *TAG = "transport";
 #define ACCUM_STATUS_MAX  4096
 #define ACCUM_EVT_MAX     1024
 
-/* === FIX: 4000 → 6000 — запас на задержки приёма CFG === */
 #define CFG_NEW_BURST_MS  10000
 #define CFG_MIN_VALID_LEN 3000
 
@@ -54,6 +56,12 @@ static volatile bool     s_use_lora = false;
 static volatile bool     s_inited   = false;
 
 static QueueHandle_t     s_ack_queue = NULL;
+
+/* === FIX: мьютекс, защищающий статические буферы накопления === */
+static SemaphoreHandle_t s_accum_mtx = NULL;
+/* === FIX: флаг «идёт передача» === */
+static volatile bool     s_tx_busy  = false;
+/* === END FIX === */
 
 static transport_rx_cb_t s_cmd_cb    = NULL;
 static transport_rx_cb_t s_cfg_cb    = NULL;
@@ -68,19 +76,48 @@ static char   s_accum_evt[ACCUM_EVT_MAX];       static size_t s_accum_evt_len = 
 static uint32_t s_last_cfg_frag_ms = 0;
 static uint8_t  s_last_cfg_seq     = 0xFF;
 
+/* ============================================================
+   Публичные аксессоры.
+   ============================================================ */
 bool transport_is_cfg_rx_in_progress(void)
 {
-    return s_accum_cfg_len > 0;
+    if (!s_accum_mtx) return s_accum_cfg_len > 0;
+    bool v = false;
+    if (xSemaphoreTake(s_accum_mtx, pdMS_TO_TICKS(20)) == pdTRUE) {
+        v = s_accum_cfg_len > 0;
+        xSemaphoreGive(s_accum_mtx);
+    }
+    return v;
 }
 
 void transport_reset_cfg_accum(void)
 {
-    s_accum_cfg_len = 0;
-    s_last_cfg_frag_ms = 0;
-    s_last_cfg_seq = 0xFF;
-    ESP_LOGI(TAG, "transport_reset_cfg_accum: len=0");
+    if (!s_accum_mtx) {
+        s_accum_cfg_len = 0;
+        s_last_cfg_frag_ms = 0;
+        s_last_cfg_seq = 0xFF;
+        ESP_LOGW(TAG, "transport_reset_cfg_accum: mutex NULL, direct reset");
+        return;
+    }
+    if (xSemaphoreTake(s_accum_mtx, pdMS_TO_TICKS(100)) == pdTRUE) {
+        s_accum_cfg_len = 0;
+        s_last_cfg_frag_ms = 0;
+        s_last_cfg_seq = 0xFF;
+        xSemaphoreGive(s_accum_mtx);
+        ESP_LOGI(TAG, "transport_reset_cfg_accum: len=0");
+    } else {
+        ESP_LOGW(TAG, "transport_reset_cfg_accum: mutex timeout");
+    }
 }
 
+/* === FIX: публичный геттер «TX свободен» === */
+bool transport_is_tx_idle(void)
+{
+    return !s_tx_busy;
+}
+/* === END FIX === */
+
+/* ============================================================ */
 static const char *pkt_type_str(uint8_t t)
 {
     switch (t) {
@@ -126,6 +163,12 @@ static void ack_tx_task(void *arg)
     uint8_t seq;
     while (1) {
         if (xQueueReceive(s_ack_queue, &seq, portMAX_DELAY) == pdTRUE) {
+            /* === FIX: не отправляем ACK, если TX занят === */
+            if (s_tx_busy) {
+                ESP_LOGW(TAG, "ack_tx: TX busy, skip ACK seq=%u", seq);
+                continue;
+            }
+            /* === END FIX === */
             uint8_t ack[4] = { PKT_MAGIC, T_ACK, seq, 0 };
             esp_err_t err = lora_send_packet(ack, 4);
             if (err != ESP_OK) {
@@ -198,6 +241,10 @@ static esp_err_t lora_send_packet_ack(uint8_t type, uint8_t seq,
 
 static esp_err_t lora_send_fragmented(uint8_t type, const char *data, size_t len)
 {
+    /* === FIX: берём флаг TX busy, чтобы node_send_task не наложился === */
+    s_tx_busy = true;
+    /* === END FIX === */
+
     uint8_t seq = (uint8_t)(esp_timer_get_time() & 0xFF);
     size_t sent = 0;
     int frag_idx = 0;
@@ -227,6 +274,7 @@ static esp_err_t lora_send_fragmented(uint8_t type, const char *data, size_t len
             ESP_LOGE(TAG, "TX %s frag %d/%d FAILED: %s",
                      pkt_type_str(type), frag_idx + 1, frag_total,
                      esp_err_to_name(err));
+            s_tx_busy = false;   /* FIX: сброс флага */
             return err;
         }
 
@@ -234,9 +282,14 @@ static esp_err_t lora_send_fragmented(uint8_t type, const char *data, size_t len
         seq++;
         frag_idx++;
     }
+
+    s_tx_busy = false;           /* FIX: сброс флага */
     return ESP_OK;
 }
 
+/* ============================================================
+   lora_raw_handler — приём пакета.
+   ============================================================ */
 static void lora_raw_handler(const uint8_t *data, size_t len)
 {
     if (len < 4 || data[0] != PKT_MAGIC) {
@@ -264,6 +317,14 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
         xQueueSend(s_ack_queue, &seq, 0);
     }
 
+    /* === FIX: захватываем мьютекс накопления === */
+    if (s_accum_mtx &&
+        xSemaphoreTake(s_accum_mtx, pdMS_TO_TICKS(20)) != pdTRUE) {
+        ESP_LOGW(TAG, "RX %s seq=%u drop frag (accum mutex busy)",
+                 pkt_type_str(type), seq);
+        return;
+    }
+
     char  *accum = NULL;
     size_t *accum_len = NULL;
     size_t max_len = 0;
@@ -273,10 +334,15 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
         case T_CFG:    accum = s_accum_cfg;    accum_len = &s_accum_cfg_len;    max_len = sizeof(s_accum_cfg);    break;
         case T_STATUS: accum = s_accum_status; accum_len = &s_accum_status_len; max_len = sizeof(s_accum_status); break;
         case T_EVT:    accum = s_accum_evt;    accum_len = &s_accum_evt_len;    max_len = sizeof(s_accum_evt);    break;
-        default: return;
+        default:
+            if (s_accum_mtx) xSemaphoreGive(s_accum_mtx);
+            return;
     }
 
-    if (len < 5 || plen < 1) return;
+    if (len < 5 || plen < 1) {
+        if (s_accum_mtx) xSemaphoreGive(s_accum_mtx);
+        return;
+    }
     uint8_t flag  = data[4];
     size_t  chunk = plen - 1;
 
@@ -295,6 +361,7 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
         if (seq == s_last_cfg_seq && *accum_len > 0) {
             ESP_LOGW(TAG, "CFG frag seq=%u duplicate — ignore (accum=%u)",
                      seq, (unsigned)*accum_len);
+            if (s_accum_mtx) xSemaphoreGive(s_accum_mtx);
             return;
         }
         s_last_cfg_seq = seq;
@@ -327,6 +394,7 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
     } else {
         ESP_LOGW(TAG, "RX %s overflow, reset", pkt_type_str(type));
         *accum_len = 0;
+        if (s_accum_mtx) xSemaphoreGive(s_accum_mtx);
         return;
     }
 
@@ -334,6 +402,7 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
         if (*accum_len == 0) {
             ESP_LOGW(TAG, "RX %s last frag but accum empty — ignore",
                      pkt_type_str(type));
+            if (s_accum_mtx) xSemaphoreGive(s_accum_mtx);
             return;
         }
         accum[*accum_len] = '\0';
@@ -344,6 +413,7 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
             *accum_len = 0;
             s_last_cfg_frag_ms = 0;
             s_last_cfg_seq = 0xFF;
+            if (s_accum_mtx) xSemaphoreGive(s_accum_mtx);
             return;
         }
 
@@ -359,16 +429,29 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
                                    accum + off, tail_n, ESP_LOG_ERROR);
         }
 
-        switch (type) {
-            case T_CMD:    if (s_cmd_cb)    s_cmd_cb(accum, *accum_len);    break;
-            case T_CFG:    if (s_cfg_cb)    s_cfg_cb(accum, *accum_len);    break;
-            case T_STATUS: if (s_status_cb) s_status_cb(accum, *accum_len); break;
-            case T_EVT:    if (s_evt_cb)    s_evt_cb(accum, *accum_len);    break;
-        }
+        /* Копируем данные локально, чтобы вызвать callback ВНЕ мьютекса */
+        char   local_buf[ACCUM_CFG_MAX];
+        size_t local_len = *accum_len;
+        if (local_len > sizeof(local_buf)) local_len = sizeof(local_buf);
+        memcpy(local_buf, accum, local_len);
+        local_buf[local_len] = '\0';
+
         *accum_len = 0;
         s_last_cfg_frag_ms = 0;
         s_last_cfg_seq = 0xFF;
+
+        if (s_accum_mtx) xSemaphoreGive(s_accum_mtx);
+
+        switch (type) {
+            case T_CMD:    if (s_cmd_cb)    s_cmd_cb(local_buf, local_len);    break;
+            case T_CFG:    if (s_cfg_cb)    s_cfg_cb(local_buf, local_len);    break;
+            case T_STATUS: if (s_status_cb) s_status_cb(local_buf, local_len); break;
+            case T_EVT:    if (s_evt_cb)    s_evt_cb(local_buf, local_len);    break;
+        }
+        return;
     }
+
+    if (s_accum_mtx) xSemaphoreGive(s_accum_mtx);
 }
 
 esp_err_t transport_init(void)
@@ -388,12 +471,18 @@ esp_err_t transport_init(void)
         return ESP_ERR_NO_MEM;
     }
 
+    s_accum_mtx = xSemaphoreCreateMutex();
+    if (!s_accum_mtx) {
+        ESP_LOGE(TAG, "accum_mtx alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+
     if (lora_init() == ESP_OK) {
         lora_set_rx_callback(lora_raw_handler);
         lora_receive();
         s_use_lora = true;
 
-        xTaskCreate(lora_poll_task, "lora_poll", 8192, NULL, 3, NULL);
+        xTaskCreate(lora_poll_task, "lora_poll", 12288, NULL, 3, NULL);  /* FIX: стек 12K */
         xTaskCreate(ack_tx_task,    "ack_tx",    4096, NULL, 3, NULL);
 
         ESP_LOGI(TAG, "Transport = LoRa only (no TCP fallback)");

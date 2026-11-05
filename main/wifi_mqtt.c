@@ -14,6 +14,10 @@
      FSU_Trafic_<MAC>/LWT       — online/offline
      FSU_Trafic_<MAC>/Layer     — роль, IP, rssi
      FSU_Trafic_<MAC>/key_pressed — события кнопки
+
+   === FIX ===
+   - s_mqtt_down_since_ms защищён критической секцией (race).
+   - wifi_mqtt_init: задачи MQTT создаются ТОЛЬКО на MASTER (NODE).
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -62,6 +66,26 @@ static SemaphoreHandle_t s_restart_mutex = NULL;
 static volatile uint32_t s_mqtt_last_connected_ms    = 0;
 static volatile uint32_t s_mqtt_last_disconnected_ms = 0;
 static volatile uint32_t s_mqtt_down_since_ms        = 0;
+
+/* === FIX: критическая секция для s_mqtt_down_since_ms === */
+static portMUX_TYPE s_mqtt_state_mtx = portMUX_INITIALIZER_UNLOCKED;
+
+static inline void mqtt_set_down_since(uint32_t ms)
+{
+    portENTER_CRITICAL(&s_mqtt_state_mtx);
+    s_mqtt_down_since_ms = ms;
+    portEXIT_CRITICAL(&s_mqtt_state_mtx);
+}
+
+static inline uint32_t mqtt_get_down_since(void)
+{
+    uint32_t v;
+    portENTER_CRITICAL(&s_mqtt_state_mtx);
+    v = s_mqtt_down_since_ms;
+    portEXIT_CRITICAL(&s_mqtt_state_mtx);
+    return v;
+}
+/* === END FIX === */
 
 #define NVS_NS_MQTT "mqtt_cfg"
 
@@ -121,8 +145,6 @@ void wifi_mqtt_save_config(void)
 
 /* ============================================================
    build_topics — формирование MQTT-топиков.
-   По умолчанию — из MAC: FSU_Trafic_<MAC>[/...].
-   === NODE JSON: s_node_json_topic = FSU_Trafic_<MAC>/Node ===
    ============================================================ */
 static void build_topics(void)
 {
@@ -138,7 +160,6 @@ static void build_topics(void)
     snprintf(s_json_topic, sizeof(s_json_topic), "%s/SetJson",     s_topic);
     snprintf(s_layer_topic, sizeof(s_layer_topic), "%s/Layer",     s_topic);
     snprintf(s_kp_topic,    sizeof(s_kp_topic),    "%s/key_pressed", s_topic);
-    /* === NODE JSON → MQTT === */
     snprintf(s_node_json_topic, sizeof(s_node_json_topic), "%s/Node", s_topic);
 
     ESP_LOGI(TAG, "Topic:      %s", s_topic);
@@ -205,10 +226,11 @@ const char *wifi_mqtt_last_node_fault(void)
 uint32_t wifi_mqtt_get_down_ms(void)
 {
     if (s_mqtt_connected) return 0;
-    if (s_mqtt_down_since_ms == 0) return 0;
+    uint32_t down_since = mqtt_get_down_since();
+    if (down_since == 0) return 0;
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    if (now < s_mqtt_down_since_ms) return 0;
-    return now - s_mqtt_down_since_ms;
+    if (now < down_since) return 0;
+    return now - down_since;
 }
 
 void wifi_mqtt_force_restart_modem(void)
@@ -232,7 +254,7 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
         s_mqtt_connected = true;
         s_publish_fail_count = 0;
         s_mqtt_last_connected_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        s_mqtt_down_since_ms = 0;
+        mqtt_set_down_since(0);
         esp_mqtt_client_publish(g_mqtt_client, s_lwt_topic, "online", 0, 1, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, s_sub_topic,  1);
         esp_mqtt_client_subscribe(g_mqtt_client, s_json_topic, 1);
@@ -243,8 +265,8 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
         ESP_LOGW(TAG, "MQTT disconnected");
         s_mqtt_connected = false;
         s_mqtt_last_disconnected_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        if (s_mqtt_down_since_ms == 0) {
-            s_mqtt_down_since_ms = s_mqtt_last_disconnected_ms;
+        if (mqtt_get_down_since() == 0) {
+            mqtt_set_down_since(s_mqtt_last_disconnected_ms);
         }
         mqtt_json_accum_reset();
         break;
@@ -252,8 +274,8 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
     case MQTT_EVENT_ERROR:
         ESP_LOGE(TAG, "MQTT error");
         s_mqtt_connected = false;
-        if (s_mqtt_down_since_ms == 0) {
-            s_mqtt_down_since_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if (mqtt_get_down_since() == 0) {
+            mqtt_set_down_since((uint32_t)(esp_timer_get_time() / 1000));
         }
         break;
 
@@ -428,7 +450,7 @@ static void mqtt_watchdog_task(void *arg)
                 ESP_LOGE(TAG, "MQTT down %lu ms (> %d) → force restart modem",
                          (unsigned long)down_ms, MQTT_DOWN_RESTART_MS);
                 wifi_mqtt_force_restart_modem();
-                s_mqtt_down_since_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                mqtt_set_down_since((uint32_t)(esp_timer_get_time() / 1000));
                 s_last_event_time = xTaskGetTickCount();
             } else if (since > MQTT_STUCK_TIMEOUT_MS) {
                 ESP_LOGW(TAG, "MQTT down %ld ms → wifi_mqtt_restart()",
@@ -440,8 +462,13 @@ static void mqtt_watchdog_task(void *arg)
     }
 }
 
+/* === FIX: задачи MQTT создаются ТОЛЬКО на MASTER (NODE) === */
 esp_err_t wifi_mqtt_init(void)
 {
+    if (g_config.role != DEVICE_ROLE_MASTER) {
+        ESP_LOGI(TAG, "wifi_mqtt_init: NODE — MQTT disabled");
+        return ESP_OK;
+    }
     wifi_mqtt_load_config();
     build_topics();
     wifi_mqtt_restart();
@@ -449,6 +476,7 @@ esp_err_t wifi_mqtt_init(void)
     xTaskCreate(mqtt_watchdog_task, "mqtt_wd", 4096, NULL, 3, NULL);
     return ESP_OK;
 }
+/* === END FIX === */
 
 void wifi_mqtt_stop(void)
 {

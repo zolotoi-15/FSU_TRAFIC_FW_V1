@@ -17,6 +17,8 @@
    - traffic_light_start() идемпотентен: повторный вызов при RUNNING
      не сбрасывает фазу.
    - phase stuck-check: только на ROOT (s_follow_root == false).
+   - apply_fault_mode() вызывается ВНЕ s_mutex в stuck-check
+     (устранён потенциальный дедлок ABBA с s_sr_mutex).
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -175,6 +177,8 @@ static inline uint32_t phase_blink_period_ms(void)
    traffic_task_loop:
    ROOT  — двигает фазы сам, вызывает s_phase_change_cb.
    NODE  — только blink, фазы применяются через force_phase().
+
+   === FIX: apply_fault_mode() вызывается ВНЕ s_mutex ===
    ============================================================ */
 void traffic_task_loop(void *arg)
 {
@@ -265,7 +269,12 @@ void traffic_task_loop(void *arg)
             }
         }
 
-        /* stuck-check (только ROOT) */
+        /* ============================================================
+           stuck-check (только ROOT).
+           === FIX: apply_fault_mode() вызывается ВНЕ s_mutex,
+                    чтобы не было дедлока ABBA с s_sr_mutex. ===
+           ============================================================ */
+        bool need_fault = false;
         {
             bool in_running = false;
             if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
@@ -281,20 +290,22 @@ void traffic_task_loop(void *arg)
                         if (s_fault == TRAFFIC_FAULT_NONE) {
                             s_fault = TRAFFIC_FAULT_YELLOW_BLINK;
                             s_last_recovery_ms = now;
-                            apply_fault_mode(s_fault);
-                            s_fault_blink_state = false;
                             s_ok_streak = 0;
                             s_last_recovery_ok_ms = 0;
+                            need_fault = true;
                         }
-                        xSemaphoreGive(s_mutex);
-                        if (s_fault_notify)
-                            s_fault_notify(TRAFFIC_FAULT_YELLOW_BLINK);
-                        continue;
                     }
                 }
                 xSemaphoreGive(s_mutex);
             }
             if (!in_running) continue;
+        }
+        if (need_fault) {
+            /* Вне s_mutex: s_sr_mutex не пересекается с s_mutex */
+            apply_fault_mode(TRAFFIC_FAULT_YELLOW_BLINK);
+            s_fault_blink_state = false;
+            if (s_fault_notify) s_fault_notify(TRAFFIC_FAULT_YELLOW_BLINK);
+            continue;
         }
 
         uint32_t dur = effective_stage_duration_ms(s_phase);
@@ -500,13 +511,11 @@ esp_err_t traffic_light_start(void)
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
 
-    /* === FIX: идемпотентный START === */
     if (s_state == TRAFFIC_STATE_RUNNING) {
         ESP_LOGI(TAG, "START ignored — already RUNNING (phase=%u)", s_phase);
         xSemaphoreGive(s_mutex);
         return ESP_OK;
     }
-    /* === END FIX === */
 
     s_state = TRAFFIC_STATE_RUNNING;
     s_phase = 0;
