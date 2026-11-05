@@ -14,7 +14,7 @@
 
    esp_modem 2.x: DCE+DTE создаются одной функцией esp_modem_new_dev().
    ============================================================ */
-
+#define _GNU_SOURCE
 #include "modem_ppp.h"
 #include "board_pins.h"
 
@@ -446,4 +446,9 @@ const char *modem_ppp_get_ip(void)
 bool modem_ppp_sim_ready(void)
 {
     return s_sim_ready;
+}
+
+esp_netif_t *modem_ppp_get_netif(void)
+{
+    return s_ppp_netif;
 }

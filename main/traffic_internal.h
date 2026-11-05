@@ -17,9 +17,6 @@ extern "C" {
 #define MUX_FAULT_SETTLE_MS  12
 #define MUTEX_TIMEOUT_MS     1000
 
-/* ============================================================
-   Общие extern-переменные (определены в traffic_light.c).
-   ============================================================ */
 extern volatile traffic_state_t s_state;
 extern volatile traffic_mode_t  s_mode;
 extern volatile uint8_t         s_phase;
@@ -56,18 +53,15 @@ extern volatile bool            s_fault_blink_state;
 extern traffic_fault_notify_cb_t s_fault_notify;
 extern traffic_phase_change_cb_t s_phase_change_cb;
 
-/* ============================================================
-   Внутренние функции.
-   ============================================================ */
-
 /* traffic_config.c */
 const traffic_stage_dd_t *find_stage(uint8_t id);
 bool     stage_is_pedestrian(uint8_t seq_idx);
 bool     stage_is_transport_green(uint8_t seq_idx);
 uint8_t  next_phase_smooth_ped(uint8_t cur_seq);
-uint32_t stage_duration_ms(uint8_t seq_idx);
+uint32_t stage_duration_ms(uint8_t seq_idx);       /* ← internal, NODE не использует */
 uint32_t effective_stage_duration_ms(uint8_t seq_idx);
 uint16_t traffic_light_active_sr_mask_internal(void);
+uint16_t traffic_light_stage_sr_mask_internal(void);
 uint16_t traffic_light_expected_sr_mask_internal(void);
 void     apply_stage_dd(uint8_t seq_idx);
 void     set_all_off(void);

@@ -2,4 +2,4 @@
 # Name, Type, SubType, Offset, Size, Flags
 nvs,data,nvs,,128K,
 phy_init,data,phy,,4K,
-factory,app,factory,,3M,
+factory,app,factory,,4M,

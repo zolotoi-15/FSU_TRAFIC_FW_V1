@@ -15,7 +15,6 @@
 
 static const char *TAG = "board_hw";
 
-/* Extern через app_shared.h */
 pi4ioe5v6408_config_t expander_a = {
     .device_addr = 0x43, .clk_speed = 100000, .initialized = false,
 };
@@ -30,8 +29,7 @@ static const diag_en_map_t s_diag_en_map[] = {
 };
 #define DIAG_EN_MAP_SIZE (sizeof(s_diag_en_map)/sizeof(s_diag_en_map[0]))
 
-esp_err_t board_diag_en_set(uint8_t channel, bool enable)
-{
+esp_err_t board_diag_en_set(uint8_t channel, bool enable) {
     for (size_t i = 0; i < DIAG_EN_MAP_SIZE; i++) {
         const diag_en_map_t *m = &s_diag_en_map[i];
         if (m->channel != channel) continue;
@@ -41,8 +39,7 @@ esp_err_t board_diag_en_set(uint8_t channel, bool enable)
     return ESP_ERR_NOT_FOUND;
 }
 
-void board_diag_en_all_off(void)
-{
+void board_diag_en_all_off(void) {
     for (size_t i = 0; i < DIAG_EN_MAP_SIZE; i++) {
         const diag_en_map_t *m = &s_diag_en_map[i];
         pi4ioe5v6408_config_t *exp = (m->expander == 0) ? &expander_a : &expander_b;
@@ -50,8 +47,7 @@ void board_diag_en_all_off(void)
     }
 }
 
-static void configure_diag_en_outputs(void)
-{
+static void configure_diag_en_outputs(void) {
     bool used_a[8] = {0}, used_b[8] = {0};
     for (size_t i = 0; i < DIAG_EN_MAP_SIZE; i++) {
         const diag_en_map_t *m = &s_diag_en_map[i];
@@ -69,8 +65,7 @@ static void configure_diag_en_outputs(void)
     }
 }
 
-static imon_state_t classify_imon(int mv)
-{
+static imon_state_t classify_imon(int mv) {
     if (mv < 0) return IMON_STATE_UNKNOWN;
     if (mv < g_config.traffic.fault.imin_mv) return IMON_STATE_NO_DIAG;
     if (mv >= IMON_TH_FAULT_MV)   return IMON_STATE_FAULT;
@@ -78,54 +73,56 @@ static imon_state_t classify_imon(int mv)
     return IMON_STATE_OK;
 }
 
-int board_read_iload_raw(uint8_t channel, imon_state_t *out_state, int *out_mv)
-{
+/* Не берёт mux-мьютекс — вызывать ИЗ mux_task (или явно держать мьютекс). */
+int board_read_iload_raw(uint8_t channel, imon_state_t *out_state, int *out_mv) {
     if (out_state) *out_state = IMON_STATE_UNKNOWN;
     if (out_mv)    *out_mv    = 0;
+    if (channel >= MUX_CHANNEL_COUNT) return -1;
     if (!sr_get_output(channel)) {
         if (out_state) *out_state = IMON_STATE_OK;
         return 0;
     }
-    esp_rom_delay_us(20);
+
     esp_err_t ret = board_diag_en_set(channel, true);
-    if (ret == ESP_ERR_NOT_FOUND) {
-        if (out_state) *out_state = IMON_STATE_NO_DIAG;
-        return 0;
-    }
+    if (ret == ESP_ERR_NOT_FOUND) { if (out_state) *out_state = IMON_STATE_NO_DIAG; return 0; }
     if (ret != ESP_OK) return -1;
     esp_rom_delay_us(50);
 
-    SemaphoreHandle_t mux_mtx = mux_get_mutex();
-    if (mux_mtx) xSemaphoreTake(mux_mtx, portMAX_DELAY);
+    /* Вызывающий должен держать mux_get_mutex() */
     mux_select_channel(channel);
     vTaskDelay(pdMS_TO_TICKS(5));
     int mv = mux_read_sig2_avg_mv(8);
-    if (mux_mtx) xSemaphoreGive(mux_mtx);
+
+    board_diag_en_set(channel, false);
 
     if (mv < 0) return -1;
     imon_state_t st = classify_imon(mv);
     if (out_state) *out_state = st;
     if (out_mv)    *out_mv    = mv;
-    if (st == IMON_STATE_FAULT)   return -2;
-    if (st == IMON_STATE_SUSPECT) return -3;
+    if (st == IMON_STATE_FAULT)   return 0;
+    if (st == IMON_STATE_SUSPECT) return 0;
     if (st == IMON_STATE_NO_DIAG) return 0;
-    if (st == IMON_STATE_UNKNOWN) return -1;
-    return (int)(((float)mv * TPS27S100B_K_IMON) / TPS27S100B_R_IMON);
+    if (st == IMON_STATE_UNKNOWN) return 0;
+    int offset = mux_get_imon_offset_mv(channel);
+    int corr = mv - offset;
+    if (corr < 0) corr = 0;
+    return (int)(((float)corr * TPS27S100B_K_IMON) / TPS27S100B_R_IMON);
 }
 
-esp_err_t board_hw_init(void)
-{
+esp_err_t board_hw_init(void) {
     if (i2c_bus_init() != ESP_OK) return ESP_FAIL;
     i2c_bus_scan();
     i2c_dump_all();
 
-    pi4ioe5v6408_init_with_bus(&expander_a, g_i2c_bus);
-    pi4ioe5v6408_init_with_bus(&expander_b, g_i2c_bus);
+    esp_err_t ea = pi4ioe5v6408_init_with_bus(&expander_a, g_i2c_bus);
+    esp_err_t eb = pi4ioe5v6408_init_with_bus(&expander_b, g_i2c_bus);
+    if (ea != ESP_OK) ESP_LOGE(TAG, "expander A init: %s", esp_err_to_name(ea));
+    if (eb != ESP_OK) ESP_LOGE(TAG, "expander B init: %s", esp_err_to_name(eb));
+
     pi4ioe5v6408_set_pin_direction(&expander_a, 0, false);
     pi4ioe5v6408_set_pin_output(&expander_a, 0, true);
     configure_diag_en_outputs();
 
-    /* P7 input */
     pi4ioe5v6408_set_pin_direction(&expander_b, 7, true);
     pi4ioe5v6408_set_pin_pull(&expander_b, 7, 1, true);
     pi4ioe5v6408_set_pin_high_z(&expander_b, 7, false);
@@ -134,23 +131,30 @@ esp_err_t board_hw_init(void)
     if (pi4ioe5v6408_get_pin_input(&expander_b, 7, &init_state) == ESP_OK) {
         ESP_LOGI(TAG, "Button P7 initial state: %d", (int)init_state);
     }
-
-    return ESP_OK;
+    return (ea == ESP_OK && eb == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
-void board_diag_en_self_test(void)
-{
+void board_diag_en_self_test(void) {
     const uint8_t test_ch = 5;
     board_diag_en_all_off();
     vTaskDelay(pdMS_TO_TICKS(10));
+
+    SemaphoreHandle_t mux_mtx = mux_get_mutex();
+    if (mux_mtx) xSemaphoreTake(mux_mtx, portMAX_DELAY);
     mux_select_channel(test_ch);
     vTaskDelay(pdMS_TO_TICKS(5));
     int mv_low = mux_read_sig2_avg_mv(8);
+    if (mux_mtx) xSemaphoreGive(mux_mtx);
+
     if (board_diag_en_set(test_ch, true) != ESP_OK) return;
     vTaskDelay(pdMS_TO_TICKS(10));
+
+    if (mux_mtx) xSemaphoreTake(mux_mtx, portMAX_DELAY);
     mux_select_channel(test_ch);
     vTaskDelay(pdMS_TO_TICKS(5));
     int mv_high = mux_read_sig2_avg_mv(8);
+    if (mux_mtx) xSemaphoreGive(mux_mtx);
+
     board_diag_en_set(test_ch, false);
     ESP_LOGI(TAG, "self-test ch%02d: LOW=%d, HIGH=%d", test_ch, mv_low, mv_high);
 }

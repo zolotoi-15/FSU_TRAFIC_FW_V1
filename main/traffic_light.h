@@ -100,8 +100,34 @@ esp_err_t traffic_light_reset(void);
 
 esp_err_t traffic_light_next_phase(void);
 
+/* force_phase — pm_target на момент применения (pm=0 = начало фазы) */
 esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
                                     uint32_t duration_ms);
+
+/* === SYNC-MASK: ROOT и NODE применяют ОДНУ маску.
+   ROOT вычисляет маску из своего stage_dd, NODE получает
+   маску в sync: и применяет напрямую, не заглядывая в stage_dd.
+   Это делает ROOT единственным источником правды о том,
+   какие каналы включены в каждой фазе. === */
+esp_err_t traffic_light_force_phase_masked(uint8_t phase,
+                                           uint32_t phase_ms,
+                                           uint32_t duration_ms);
+void      traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
+                                   uint8_t phase, uint32_t phase_ms,
+                                   uint32_t duration_ms);
+
+/* Маски ТЕКУЩЕЙ фазы (s_phase) — для логов, resync, force_phase_masked. */
+uint16_t  traffic_light_get_phase_on_mask(void);
+uint16_t  traffic_light_get_phase_blink_mask(void);
+
+/* === FIX SYNC-MASK: публичный геттер масок фазы по индексу sequence.
+   Используется root_wd.c для формирования sync: пакета.
+   НЕ требует include traffic_internal.h в вызывающем коде.
+   Возвращает 0 в out_on_mask/out_blink_mask, если фаза вне диапазона. === */
+void traffic_light_get_stage_masks(uint8_t phase,
+                                   uint16_t *out_on_mask,
+                                   uint16_t *out_blink_mask);
+/* === END FIX SYNC-MASK === */
 
 traffic_state_t traffic_light_get_state(void);
 traffic_mode_t  traffic_light_get_mode(void);
@@ -110,6 +136,8 @@ uint32_t        traffic_light_get_phase_ms(void);
 uint8_t         traffic_light_get_phase_count(void);
 uint32_t        traffic_light_get_phase_duration_ms(void);
 const char     *traffic_light_state_str(void);
+
+uint32_t        traffic_light_stage_duration_ms(uint8_t seq_idx);
 
 traffic_fault_t traffic_light_get_fault(void);
 const char     *traffic_light_fault_str(void);
@@ -128,25 +156,14 @@ size_t traffic_light_build_fault_report(char *buf, size_t size);
 typedef void (*traffic_fault_notify_cb_t)(traffic_fault_t fault);
 void traffic_light_set_fault_notify(traffic_fault_notify_cb_t cb);
 
-/* node не двигает фазу сам — только по sync: от root */
 void traffic_light_set_follow_root(bool en);
 
-/* NEW: PED_BUTTON — вызывная кнопка (P7).
-   Поведение зависит от g_config.traffic.pedestrian.request_mode:
-     STAGE      — вставить пешеходную фазу следующей (текущее поведение);
-     INSERT     — вставить в текущий цикл (с таймаутом);
-     MIN_RECALL — гарантировать min зелёный в след. цикле.
-   Если button_enabled=false — запрос игнорируется. */
 void     traffic_light_request_pedestrian(void);
-
-/* NEW: PED_BUTTON — true, если кнопка включена в конфиге. */
 bool     traffic_light_ped_button_enabled(void);
 
-/* callback при смене фазы (только на root, s_follow_root=false). */
 typedef void (*traffic_phase_change_cb_t)(uint8_t phase, uint32_t dur_ms);
 void traffic_light_set_phase_change_cb(traffic_phase_change_cb_t cb);
 
-/* RTT-компенсация network_delay (ping/pong). */
 void     traffic_light_set_sync_delay_us(uint32_t delay_us);
 uint32_t traffic_light_get_sync_delay_us(void);
 void traffic_light_set_mux_reading(bool en);

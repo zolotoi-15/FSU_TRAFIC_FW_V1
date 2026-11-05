@@ -16,28 +16,28 @@
 static const char *TAG = "lora";
 static spi_device_handle_t s_spi_handle = nullptr;
 static std::unique_ptr<espp::Sx126x> s_radio;
-static lora_raw_rx_cb_t s_raw_cb = nullptr;
-static SemaphoreHandle_t s_lora_mutex = NULL;
-
-/* === FIX: отдельный рекурсивный мьютекс для SPI/radio ===
-   Защищает все вызовы s_radio->* (transmit, start_receive,
-   service_interrupts) от одновременного доступа из разных задач.
-   Recursive, потому что service_interrupts() может внутри
-   вызвать on_receive → lora_send_packet(ack) → transmit(),
-   и тот же поток должен иметь возможность повторно взять мьютекс. */
+static lora_raw_rx_cb_t s_raw_cb = nullptr;   // C-совместимый
 static SemaphoreHandle_t s_spi_mutex = NULL;
-/* === END FIX === */
 
-/* === FIX: явно задаём частоту, SF и мощность === */
-#define LORA_FREQ_HZ        868525050
-#define LORA_TX_POWER_DBM   22        // LLCC68 максимум +22 dBm
-#define LORA_SF             10
-#define LORA_BW_KHZ         125
+#define LORA_FREQ_HZ        468525050
+#define LORA_TX_POWER_DBM   17
+#define LORA_SF             9
+#define LORA_BW_KHZ         250
 #define LORA_CR             5
 #define LORA_SYNC_WORD      0x12
-#define LORA_PREAMBLE_LEN   8
+#define LORA_PREAMBLE_LEN   12
 #define LORA_USE_DIO2_SWITCH true
-#define LORA_USE_DCDC       false
+#define LORA_USE_DCDC       true
+#define LORA_CRC_ON         true
+#define LORA_RX_BOOST_GAIN  true
+
+/* === FIX #1: SPI mutex timeout 1000 → 3000 мс ===
+   Причина: lora_poll (service_interrupts) держит mutex до 200 мс,
+   плюс ack_tx + lora_send_packet одновременно стучатся.
+   1000 мс не хватает при плохом SNR (ToA 32B ~112 мс, retry) */
+#define LORA_SPI_TX_TIMEOUT_MS  3000
+#define LORA_SPI_POLL_TIMEOUT_MS 200
+/* === END FIX #1 === */
 
 static bool spi_write(const uint8_t *data, size_t len) {
     spi_transaction_t t = {};
@@ -68,17 +68,14 @@ static bool spi_write_then_read(const uint8_t *write_data, size_t write_len,
 static bool is_busy() { return gpio_get_level(LORA_BUSY) != 0; }
 static void reset(bool level) { gpio_set_level(LORA_RST, level ? 1 : 0); }
 
-/* === FIX: проверка CRC перед вызовом user callback === */
 static void on_rx_packet(const espp::Sx126x::RxPacket &pkt) {
-    // В текущей версии espp PacketStatus не имеет поля crc_error,
-    // проверку CRC необходимо выполнять через IRQ-флаг драйвера или на уровне приложения.
-    ESP_LOGI(TAG, "on_rx_packet: %d bytes, rssi=%.1f, snr=%.1f",
-             (int)pkt.data.size(), pkt.status.rssi, pkt.status.snr);
+    ESP_LOGI(TAG, "on_rx_packet: %d bytes, rssi=%.1f, snr=%.1f, sig_rssi=%.1f",
+             (int)pkt.data.size(), pkt.status.rssi, pkt.status.snr,
+             pkt.status.signal_rssi);
     if (s_raw_cb && !pkt.data.empty()) {
         s_raw_cb(pkt.data.data(), pkt.data.size());
     }
 }
-/* === END FIX === */
 
 static void log_lora_config(void) {
     ESP_LOGI(TAG, "LoRa config:");
@@ -89,6 +86,8 @@ static void log_lora_config(void) {
     ESP_LOGI(TAG, "  CR        = 4/%d", LORA_CR);
     ESP_LOGI(TAG, "  sync_word = 0x%02X", LORA_SYNC_WORD);
     ESP_LOGI(TAG, "  preamble  = %d", LORA_PREAMBLE_LEN);
+    ESP_LOGI(TAG, "  crc       = %s", LORA_CRC_ON ? "ON" : "OFF");
+    ESP_LOGI(TAG, "  rx_boost  = %s", LORA_RX_BOOST_GAIN ? "yes" : "no");
     ESP_LOGI(TAG, "  dio2_sw   = %s", LORA_USE_DIO2_SWITCH ? "yes" : "no");
     ESP_LOGI(TAG, "  dcdc      = %s", LORA_USE_DCDC ? "yes" : "no");
     ESP_LOGI(TAG, "  pins: CS=%d RST=%d BUSY=%d DIO0=%d",
@@ -98,14 +97,6 @@ static void log_lora_config(void) {
 extern "C" esp_err_t lora_init(void) {
     if (s_radio) return ESP_OK;
 
-    if (!s_lora_mutex) {
-        s_lora_mutex = xSemaphoreCreateMutex();
-        if (!s_lora_mutex) {
-            ESP_LOGE(TAG, "s_lora_mutex alloc failed");
-            return ESP_ERR_NO_MEM;
-        }
-    }
-    /* === FIX: аллоцируем s_spi_mutex === */
     if (!s_spi_mutex) {
         s_spi_mutex = xSemaphoreCreateRecursiveMutex();
         if (!s_spi_mutex) {
@@ -113,7 +104,6 @@ extern "C" esp_err_t lora_init(void) {
             return ESP_ERR_NO_MEM;
         }
     }
-    /* === END FIX === */
 
     spi_bus_config_t bus_cfg = {};
     bus_cfg.mosi_io_num = LORA_MOSI;
@@ -144,18 +134,22 @@ extern "C" esp_err_t lora_init(void) {
     cfg.use_dio2_as_rf_switch = LORA_USE_DIO2_SWITCH;
     cfg.use_dcdc_regulator = LORA_USE_DCDC;
     cfg.auto_init = false;
-    cfg.radio_config.frequency_hz = LORA_FREQ_HZ;
-    cfg.radio_config.tx_power_dbm = LORA_TX_POWER_DBM;
-    cfg.radio_config.spreading_factor = espp::Sx126x::SpreadingFactor::SF10;
-    cfg.radio_config.bandwidth = espp::Sx126x::Bandwidth::BW_125_KHZ;
-    cfg.radio_config.coding_rate = espp::Sx126x::CodingRate::CR_4_5;
-    cfg.radio_config.sync_word = LORA_SYNC_WORD;
+
+    cfg.radio_config.frequency_hz       = LORA_FREQ_HZ;
+    cfg.radio_config.tx_power_dbm       = LORA_TX_POWER_DBM;
+    cfg.radio_config.spreading_factor   = espp::Sx126x::SpreadingFactor::SF9;
+    cfg.radio_config.bandwidth          = espp::Sx126x::Bandwidth::BW_250_KHZ;
+    cfg.radio_config.coding_rate        = espp::Sx126x::CodingRate::CR_4_5;
+    cfg.radio_config.sync_word          = LORA_SYNC_WORD;
+    cfg.radio_config.preamble_length    = LORA_PREAMBLE_LEN;
+    cfg.radio_config.crc_enabled        = LORA_CRC_ON;
+    cfg.radio_config.rx_boosted_gain    = LORA_RX_BOOST_GAIN;
+
     cfg.on_receive = on_rx_packet;
     cfg.log_level = espp::Logger::Verbosity::WARN;
 
     s_radio = std::make_unique<espp::Sx126x>(cfg);
 
-    /* === FIX: initialize() тоже трогает SPI — берём мьютекс === */
     if (s_spi_mutex) xSemaphoreTakeRecursive(s_spi_mutex, portMAX_DELAY);
 
     std::error_code ec;
@@ -167,75 +161,65 @@ extern "C" esp_err_t lora_init(void) {
     }
 
     log_lora_config();
-    ESP_LOGI(TAG, "LoRa ready (LLCC68, %lu MHz, SF%d/BW%d)",
+
+    auto toa_64 = s_radio->time_on_air(64);
+    auto toa_25 = s_radio->time_on_air(25);
+    ESP_LOGI(TAG, "ToA: 25B=%lld ms, 64B=%lld ms",
+             (long long)toa_25.count(), (long long)toa_64.count());
+
+    ESP_LOGI(TAG, "LoRa ready (LLCC68, %lu MHz, SF%d/BW%d, %d dBm)",
              (unsigned long)(LORA_FREQ_HZ / 1000000),
-             LORA_SF, LORA_BW_KHZ);
+             LORA_SF, LORA_BW_KHZ, LORA_TX_POWER_DBM);
 
     s_radio->start_receive(ec);
-    if (ec) {
-        ESP_LOGE(TAG, "start_receive failed: %s", ec.message().c_str());
-    } else {
-        ESP_LOGI(TAG, "LoRa RX mode enabled");
-    }
+    if (ec) ESP_LOGE(TAG, "start_receive failed: %s", ec.message().c_str());
+    else    ESP_LOGI(TAG, "LoRa RX mode enabled");
 
     if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
-    /* === END FIX === */
-
     return ESP_OK;
 }
 
 extern "C" void lora_receive(void) {
     if (!s_radio) return;
-
-    /* === FIX: SPI-мьютекс вокруг start_receive === */
     if (s_spi_mutex &&
         xSemaphoreTakeRecursive(s_spi_mutex, pdMS_TO_TICKS(1000)) != pdTRUE) {
         ESP_LOGW(TAG, "lora_receive: spi mutex timeout");
         return;
     }
-
     std::error_code ec;
     s_radio->start_receive(ec);
-    if (ec) {
-        ESP_LOGE(TAG, "lora_receive: %s", ec.message().c_str());
-    } else {
-        ESP_LOGI(TAG, "LoRa RX mode (re)enabled");
-    }
-
+    if (ec) ESP_LOGE(TAG, "lora_receive: %s", ec.message().c_str());
+    else    ESP_LOGI(TAG, "LoRa RX mode (re)enabled");
     if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
 }
 
+/* === FIX #1: timeout 1000 → 3000 мс === */
 extern "C" esp_err_t lora_send_packet(uint8_t *buf, uint8_t size) {
     if (!s_radio || !buf || size == 0) return ESP_ERR_INVALID_ARG;
-
-    /* === FIX: SPI-мьютекс вокруг transmit + start_receive ===
-       Recursive: если вызов пришёл из on_rx_packet (ACK),
-       тот же поток уже держит мьютекс — войдём повторно. */
     if (s_spi_mutex &&
-        xSemaphoreTakeRecursive(s_spi_mutex, pdMS_TO_TICKS(3000)) != pdTRUE) {
-        ESP_LOGW(TAG, "lora_send_packet: spi mutex timeout");
+        xSemaphoreTakeRecursive(s_spi_mutex,
+                                pdMS_TO_TICKS(LORA_SPI_TX_TIMEOUT_MS)) != pdTRUE) {
+        ESP_LOGW(TAG, "lora_send_packet: spi mutex timeout (%d ms)",
+                 LORA_SPI_TX_TIMEOUT_MS);
         return ESP_ERR_TIMEOUT;
     }
 
     std::error_code ec;
     bool ok = s_radio->transmit(std::span<const uint8_t>(buf, size),
                                 std::chrono::milliseconds(2000), ec);
-    ESP_LOGI(TAG, "tx ok=%d ec=%s", (int)ok, ec.message().c_str());
+    ESP_LOGI(TAG, "tx ok=%d size=%u ec=%s", (int)ok, (unsigned)size,
+             ec.message().c_str());
 
     std::error_code ec2;
     s_radio->start_receive(ec2);
-    if (ec2) {
-        ESP_LOGW(TAG, "start_receive after tx: %s", ec2.message().c_str());
-    }
+    if (ec2) ESP_LOGW(TAG, "start_receive after tx: %s", ec2.message().c_str());
 
     if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
 
-    if (!ok) {
-        ESP_LOGW(TAG, "tx failed: %s", ec.message().c_str());
-        return ESP_FAIL;
-    }
+    if (!ok) { ESP_LOGW(TAG, "tx failed: %s", ec.message().c_str()); return ESP_FAIL; }
     return ESP_OK;
 }
+/* === END FIX #1 === */
 
 extern "C" uint8_t lora_receive_packet(uint8_t *buf, uint8_t size) {
     (void)buf; (void)size;
@@ -245,21 +229,23 @@ extern "C" uint8_t lora_receive_packet(uint8_t *buf, uint8_t size) {
 extern "C" void lora_set_rx_callback(lora_raw_rx_cb_t cb) { s_raw_cb = cb; }
 extern "C" bool lora_is_ready(void) { return (bool)s_radio; }
 
+/* === FIX #2: lora_poll timeout 50 → 200 мс === */
 extern "C" void lora_poll(void) {
     if (!s_radio) return;
-
-    /* === FIX: service_interrupts() трогает SPI и s_radio ===
-       Не блокируемся надолго — пропускаем опрос, если мьютекс занят. */
     if (s_spi_mutex &&
-        xSemaphoreTakeRecursive(s_spi_mutex, pdMS_TO_TICKS(50)) != pdTRUE) {
+        xSemaphoreTakeRecursive(s_spi_mutex,
+                                pdMS_TO_TICKS(LORA_SPI_POLL_TIMEOUT_MS)) != pdTRUE) {
         return;
     }
 
     std::error_code ec;
-    s_radio->service_interrupts(ec);
-    if (ec) {
-        ESP_LOGW(TAG, "service_interrupts: %s", ec.message().c_str());
-    }
+    uint16_t irq = s_radio->service_interrupts(ec);
+    if (ec) ESP_LOGW(TAG, "service_interrupts: %s", ec.message().c_str());
+
+    if (irq & espp::Sx126x::IRQ_CRC_ERR)    ESP_LOGW(TAG, "IRQ: CRC_ERR");
+    if (irq & espp::Sx126x::IRQ_HEADER_ERR) ESP_LOGW(TAG, "IRQ: HEADER_ERR");
+    if (irq & espp::Sx126x::IRQ_RX_DONE)    ESP_LOGD(TAG, "IRQ: RX_DONE");
 
     if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
 }
+/* === END FIX #2 === */

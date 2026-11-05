@@ -1,6 +1,12 @@
 /* ============================================================
    traffic_fault.c — аварии: apply_fault_mode, try_recovery,
    check_faults, set_fault, build_fault_report.
+
+   === FIX #10: try_recovery сбрасывает s_vin_off_counter[] и
+   s_suspect_counter[] при успехе — иначе вечный цикл ALL_OFF. ===
+   === FIX #13: порог TRAFFIC_UNDERLOAD_MAX_MA поднят до 150 мА
+   (LED-светофор потребляет ~100-200 мА на канал; 50 мА — ложный
+   underload). Значение вынесено в traffic_light.h. ===
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -30,14 +36,9 @@ static inline uint32_t fault_blink_period_ms(void)
     return (p >= BLINK_MIN_PERIOD_MS) ? p : 500;
 }
 
-/* ============================================================
-   === apply_fault_mode ===
-   ВСЕГДА вызывает set_all_off() — все выходы выключены.
-   При TRAFFIC_FAULT_ALL_OFF — просто return (выходы уже 0).
-   ============================================================ */
 void apply_fault_mode(traffic_fault_t fault)
 {
-    set_all_off();              // ← ВСЕ ВЫХОДЫ ВЫКЛЮЧЕНЫ
+    set_all_off();
     s_fault_yellow_mask = 0;
 
     if (fault == TRAFFIC_FAULT_ALL_OFF) {
@@ -128,6 +129,8 @@ void try_recovery(uint32_t now_ms, uint32_t *blink_last)
     }
 
     bool fire = false;
+    bool node_needs_root_confirm = false;
+
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
         if (all_ok) {
             s_recovery_attempts++;
@@ -142,18 +145,30 @@ void try_recovery(uint32_t now_ms, uint32_t *blink_last)
                 return;
             }
             s_ok_streak = 0;
-            ESP_LOGW(TAG, "Recovery #%lu CONFIRMED → resume phase %u",
-                     (unsigned long)s_recovery_attempts, s_phase);
-            s_fault = TRAFFIC_FAULT_NONE;
-            s_fault_count = 0;
-            s_fault_yellow_mask = 0;
-            s_last_fault_notify_ms = 0;
-            s_last_recovery_ok_ms = now_ms;
-            s_fault_blink_state = false;
-            apply_stage_dd(s_phase);
-            s_phase_start_ms = now_ms;
-            s_last_recovery_ms = now_ms;
-            fire = true;
+
+            for (int ch = 0; ch < 16; ch++) {
+                s_vin_off_counter[ch] = 0;
+                s_suspect_counter[ch] = 0;
+            }
+
+            /* === FIX #4: NODE не снимает fault локально === */
+            if (s_follow_root) {
+                node_needs_root_confirm = true;
+                s_last_recovery_ms = now_ms;  /* откладываем следующий try */
+            } else {
+                ESP_LOGW(TAG, "Recovery #%lu CONFIRMED → resume phase %u",
+                         (unsigned long)s_recovery_attempts, s_phase);
+                s_fault = TRAFFIC_FAULT_NONE;
+                s_fault_count = 0;
+                s_fault_yellow_mask = 0;
+                s_last_fault_notify_ms = 0;
+                s_last_recovery_ok_ms = now_ms;
+                s_fault_blink_state = false;
+                s_phase_start_ms = now_ms;
+                s_last_recovery_ms = now_ms;
+                fire = true;
+            }
+            /* === END FIX #4 === */
         } else {
             s_ok_streak = 0;
             s_recovery_attempts++;
@@ -162,8 +177,23 @@ void try_recovery(uint32_t now_ms, uint32_t *blink_last)
         }
         xSemaphoreGive(s_mutex);
     }
+
+    /* === FIX #4: NODE просит ROOT подтвердить снятие === */
+    if (node_needs_root_confirm) {
+        extern esp_err_t transport_send_evt(const char *evt, size_t len);
+        ESP_LOGW(TAG, "recovery: NODE ok → request ROOT (fault:recover_ok)");
+        transport_send_evt("fault:recover_ok", 16);
+        return;
+    }
+    /* === END FIX #4 === */
+
+    if (fire) {
+        apply_stage_dd(s_phase);
+    }
+
     if (fire && s_fault_notify) s_fault_notify(TRAFFIC_FAULT_NONE);
 }
+
 
 const char *reason_str(uint8_t reason)
 {
@@ -222,11 +252,13 @@ uint8_t classify_channel(uint8_t ch, bool should_be_on,
             *out_detail = "overload";
             return TRAFFIC_REASON_OVERLOAD;
         }
+        /* === FIX #13: порог underload поднят до 150 мА === */
         if (data->i_load[ch] > TRAFFIC_UNDERLOAD_MIN_MA &&
             data->i_load[ch] < TRAFFIC_UNDERLOAD_MAX_MA) {
             *out_detail = "underload";
             return TRAFFIC_REASON_UNDERLOAD;
         }
+        /* === END FIX #13 === */
     } else {
         if (data->v_in[ch] >= g_config.traffic.fault.vin_off_min_v) {
             *out_detail = "V_IN present while OFF";
@@ -240,10 +272,7 @@ void traffic_light_check_faults(const mux_data_t *data)
 {
     if (s_state != TRAFFIC_STATE_RUNNING) return;
     if (!data || !data->valid) return;
-
-    if (s_fault != TRAFFIC_FAULT_NONE) {
-        return;
-    }
+    if (s_fault != TRAFFIC_FAULT_NONE) return;
 
     uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (now_ms - s_phase_start_ms < g_config.traffic.fault.phase_grace_ms) return;
@@ -371,14 +400,19 @@ void traffic_light_check_faults(const mux_data_t *data)
         s_last_recovery_ms = now_ms;
 
         if (!already || s_fault_count != prev_count) {
-            apply_fault_mode(nf);
-            s_fault_blink_state = false;
             fire = true;
             s_ok_streak = 0;
             s_last_recovery_ok_ms = 0;
         }
         if (fire) s_last_fault_notify_ms = now_ms;
         xSemaphoreGive(s_mutex);
+
+        /* === FIX #4: apply_fault_mode ВНЕ s_mutex === */
+        if (fire) {
+            apply_fault_mode(nf);
+            s_fault_blink_state = false;
+        }
+        /* === END FIX #4 === */
     }
     if (fire && s_fault_notify) s_fault_notify(nf);
 }
@@ -396,8 +430,6 @@ void traffic_light_set_fault(traffic_fault_t fault)
     if (fault != TRAFFIC_FAULT_NONE) {
         s_last_recovery_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
         if (!already) {
-            apply_fault_mode(fault);
-            s_fault_blink_state = false;
             fire = true;
             s_ok_streak = 0;
             s_last_recovery_ok_ms = 0;
@@ -409,11 +441,22 @@ void traffic_light_set_fault(traffic_fault_t fault)
         s_last_fault_notify_ms = 0;
         s_fault_blink_state = false;
         s_phase_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    }
+    xSemaphoreGive(s_mutex);
+
+    /* === FIX #4: apply_fault_mode / apply_stage_dd ВНЕ s_mutex === */
+    if (fault != TRAFFIC_FAULT_NONE) {
+        if (fire) {
+            apply_fault_mode(fault);
+            s_fault_blink_state = false;
+        }
+    } else {
         if (s_state == TRAFFIC_STATE_RUNNING) {
             apply_stage_dd(s_phase);
         }
     }
-    xSemaphoreGive(s_mutex);
+    /* === END FIX #4 === */
+
     if (fire && s_fault_notify) s_fault_notify(fault);
 }
 

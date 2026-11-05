@@ -1,16 +1,3 @@
-/* ============================================================
-   connectivity.c — PPPoS (модем) + RS485/CAN.
-   Wi-Fi STA fallback отключён — только PPP для MQTT.
-
-   === NEW: PPP watchdog ===
-   Если MQTT не подключён дольше MQTT_DOWN_RESTART_MS (5 мин),
-   wifi_mqtt_force_restart_modem() уже вызвал modem_ppp_stop().
-   Здесь modem_retry_task поднимает PPP заново.
-
-   Дополнительно: если PPP «подключён», но MQTT down > 5 мин —
-   принудительно останавливаем PPP и перезапускаем модем.
-   ============================================================ */
-
 #include "connectivity.h"
 #include "app_shared.h"
 #include "wifi_mqtt.h"
@@ -29,70 +16,69 @@ static const char *TAG = "connectivity";
 #define MODEM_APN             "internet"
 #define MODEM_PPP_TIMEOUT_MS  8000
 #define MODEM_RETRY_PERIOD_MS 5000
+#define PPP_RETRY_MAX_DOWN_MS (5 * 60 * 1000)
+#define CFG_WAIT_MAX_MS       (120 * 1000)
 
-/* === NEW: PPP watchdog === */
-#define PPP_RETRY_MAX_DOWN_MS    (5 * 60 * 1000)   /* 5 мин PPP down → force reset */
-#define PPP_CHECK_PERIOD_MS      10000
-
-/* === NEW: счётчик последовательных неудач PPP === */
 static int s_ppp_fail_count = 0;
 
-/* === NEW: внешние геттеры из wifi_mqtt.c === */
 extern uint32_t wifi_mqtt_get_down_ms(void);
 extern void     wifi_mqtt_force_restart_modem(void);
+extern volatile bool s_cfg_applied_and_started;
 
-/* ============================================================
-   modem_retry_task — поднимает PPP, если его нет.
-   Если PPP поднят, но MQTT down > 5 мин → принудительный
-   перезапуск модема.
-   ============================================================ */
-static void modem_retry_task(void *arg)
-{
+static void modem_retry_task(void *arg) {
     ESP_LOGI(TAG, "modem_retry_task started (NO Wi-Fi STA fallback)");
 
-    uint32_t ppp_down_since_ms = 0;   /* когда PPP «упал» (0 = PPP up) */
+    uint32_t waited_ms = 0;
+    while (!s_cfg_applied_and_started && waited_ms < CFG_WAIT_MAX_MS) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        waited_ms += 1000;
+        if ((waited_ms % 10000) == 0)
+            ESP_LOGI(TAG, "modem_retry: waiting for CFG+traffic (%u s)", waited_ms / 1000);
+    }
+    if (!s_cfg_applied_and_started)
+        ESP_LOGW(TAG, "modem_retry: CFG not applied in %d s — start PPP anyway",
+                 CFG_WAIT_MAX_MS / 1000);
+    else
+        ESP_LOGI(TAG, "modem_retry: CFG+traffic ready → starting PPP");
+
+    uint32_t ppp_down_since_ms = 0;
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(MODEM_RETRY_PERIOD_MS));
-
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
 
-        /* ─── PPP уже поднят ─── */
         if (modem_ppp_is_connected()) {
             s_ppp_fail_count = 0;
             ppp_down_since_ms = 0;
-
-            /* Проверка: PPP up, но MQTT down > 5 мин → рестарт модема */
             if (g_config.role == DEVICE_ROLE_MASTER) {
                 uint32_t mqtt_down = wifi_mqtt_get_down_ms();
                 if (mqtt_down > PPP_RETRY_MAX_DOWN_MS) {
-                    ESP_LOGE(TAG, "PPP up but MQTT down %lu ms → "
-                                  "force restart modem",
+                    ESP_LOGE(TAG, "PPP up but MQTT down %lu ms → force restart",
                              (unsigned long)mqtt_down);
-                    wifi_mqtt_force_restart_modem();   /* = modem_ppp_stop() */
+                    wifi_mqtt_force_restart_modem();
                     vTaskDelay(pdMS_TO_TICKS(3000));
                     ppp_down_since_ms = now;
-                    continue;
                 }
             }
             continue;
         }
 
-        /* ─── PPP down ─── */
         if (ppp_down_since_ms == 0) {
             ppp_down_since_ms = now;
             ESP_LOGW(TAG, "PPPoS down, starting recovery timer");
         }
-
         uint32_t down_for = now - ppp_down_since_ms;
         if (down_for > PPP_RETRY_MAX_DOWN_MS) {
-            ESP_LOGE(TAG, "PPPoS down > %lu ms → hard reset modem",
-                     (unsigned long)down_for);
-            /* modem_ppp_stop() уже мог быть вызван из wifi_mqtt.c,
-               но на всякий случай — ещё раз */
+            ESP_LOGE(TAG, "PPPoS down > %lu ms → hard reset modem", (unsigned long)down_for);
             modem_ppp_stop();
             vTaskDelay(pdMS_TO_TICKS(5000));
-            ppp_down_since_ms = 0;   /* сброс — попробуем заново */
+            ppp_down_since_ms = 0;
+            continue;
+        }
+
+        /* Если SIM не готова — не спамим PPP */
+        if (!modem_ppp_sim_ready() && s_ppp_fail_count >= 3) {
+            ESP_LOGW(TAG, "SIM not ready, skip PPP (fail=%d)", s_ppp_fail_count);
             continue;
         }
 
@@ -101,7 +87,7 @@ static void modem_retry_task(void *arg)
         if (mret == ESP_OK) {
             s_ppp_fail_count = 0;
             ppp_down_since_ms = 0;
-            esp_netif_t *ppp_netif = esp_netif_get_handle_from_ifkey("PPP_DEF");
+            esp_netif_t *ppp_netif = modem_ppp_get_netif();
             if (ppp_netif) {
                 esp_netif_set_default_netif(ppp_netif);
                 ESP_LOGI(TAG, "Default netif → PPPoS");
@@ -116,22 +102,15 @@ static void modem_retry_task(void *arg)
     }
 }
 
-/* ============================================================
-   RS485 / CAN
-   ============================================================ */
-static void rs485_on_frame(const uint8_t *data, size_t len)
-{
+static void rs485_on_frame(const uint8_t *data, size_t len) {
     if (len == 0) return;
     ESP_LOGI(TAG, "RS485 RX %u bytes", (unsigned)len);
 }
-
-static void can_on_rx(uint32_t id, const uint8_t *data, uint8_t dlc, bool extended)
-{
+static void can_on_rx(uint32_t id, const uint8_t *data, uint8_t dlc, bool extended) {
     ESP_LOGI(TAG, "CAN RX id=0x%lX dlc=%u", (unsigned long)id, dlc);
 }
 
-void connectivity_register_rs485_can(void)
-{
+void connectivity_register_rs485_can(void) {
     if (rs485_init(9600) == ESP_OK) {
         rs485_set_frame_cb(rs485_on_frame, 20);
         ESP_LOGI(TAG, "RS485 background RX started");
@@ -143,8 +122,7 @@ void connectivity_register_rs485_can(void)
     }
 }
 
-void connectivity_start_tasks(void)
-{
+void connectivity_start_tasks(void) {
     if (g_config.role == DEVICE_ROLE_MASTER) {
         xTaskCreate(modem_retry_task, "modem_retry", 4096, NULL, 3, NULL);
     } else {

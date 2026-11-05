@@ -1,5 +1,6 @@
 #pragma once
 #include "esp_err.h"
+#include "esp_netif.h"
 #include <stdbool.h>
 
 #ifdef __cplusplus
@@ -20,6 +21,7 @@ bool        modem_ppp_is_connected(void);
 const char *modem_ppp_get_ip(void);
 bool modem_ppp_sim_ready(void);
 
+esp_netif_t *modem_ppp_get_netif(void);
 #ifdef __cplusplus
 }
 #endif

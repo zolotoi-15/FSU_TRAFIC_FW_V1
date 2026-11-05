@@ -1,17 +1,21 @@
 /* ============================================================
    mqtt_apply.c — применение конфига к runtime.
 
-   === ПРАВИЛО ===
-   ROOT: ALL_OFF при старте. START — только из root_node_watchdog_task
-         ПОСЛЕ cfg:ok от NODE.
-   NODE: ALL_OFF при старте. START — только по traffic:start от ROOT.
+   === FIX: mqtt_notify_phase через transport_send_cmd (LoRa),
+   а не через node_link_* (заглушки возвращали NOT_SUPPORTED).
+
+   === ВАЖНО ===
+   phase_change_cb в fault_handler.c НЕ регистрируется —
+   sync: пакеты шлёт только root_wd.c:phase_sync_task.
+   mqtt_notify_phase оставлен как fallback (вызывается только
+   из mqtt_apply, если когда-то понадобится).
    ============================================================ */
 
 #include "mqtt_internal.h"
 #include "config_manager.h"
 #include "traffic_light.h"
-#include "wifi_ap.h"
-#include "node_link.h"
+#include "transport.h"
+#include "root_wd.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <stdio.h>
@@ -19,6 +23,7 @@
 static const char *TAG = "mqtt_apply";
 
 #define PHASE_SYNC_MIN_INTERVAL_MS  250
+#define SYNC_LEAD_MS                700
 
 static volatile uint8_t  s_last_sync_phase = 0xFF;
 static volatile uint32_t s_last_sync_ms    = 0;
@@ -71,9 +76,6 @@ void mqtt_apply_config_runtime(void)
         return;
     }
 
-    /* === ПРАВИЛО: ROOT и NODE при старте — ALL_OFF.
-       START делает root_node_watchdog_task (ROOT) после cfg:ok,
-       и NODE — по traffic:start от ROOT. === */
     if (g_config.role == DEVICE_ROLE_MASTER) {
         ESP_LOGI(TAG, "ROOT: ALL_OFF at start (wait for cfg:ok from NODE)");
         traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
@@ -85,42 +87,39 @@ void mqtt_apply_config_runtime(void)
     }
 }
 
+/* === FIX: sync через transport_send_cmd, не через node_link_* ===
+   Формат: sync:phase:pm:dur:root_now_ms:apply_ms
+   Используется тот же, что в root_wd.c:send_sync_to_node(). */
 void mqtt_notify_phase(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) return;
-    if (!node_link_server_has_client()) return;
+    if (!transport_is_lora()) return;
+    if (s_cfg_pushing) return;
+    if (!s_cfg_ack) return;
 
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    uint32_t min_interval = PHASE_SYNC_MIN_INTERVAL_MS;
 
     if (phase == s_last_sync_phase &&
-        (now_ms - s_last_sync_ms) < min_interval) {
+        (now_ms - s_last_sync_ms) < PHASE_SYNC_MIN_INTERVAL_MS) {
         return;
     }
     s_last_sync_phase = phase;
     s_last_sync_ms    = now_ms;
 
+    uint32_t apply_ms = now_ms + SYNC_LEAD_MS;
+
     char cmd[128];
-    int n;
-    if (traffic_light_get_fault() == TRAFFIC_FAULT_YELLOW_BLINK) {
-        int blink_on = traffic_light_get_fault_blink_state() ? 1 : 0;
-        n = snprintf(cmd, sizeof(cmd), "sync:%u:%lu:%lu:%lu:%d",
+    int n = snprintf(cmd, sizeof(cmd), "sync:%u:%lu:%lu:%lu:%lu",
                      phase,
                      (unsigned long)phase_ms,
                      (unsigned long)duration_ms,
                      (unsigned long)now_ms,
-                     blink_on);
-    } else {
-        n = snprintf(cmd, sizeof(cmd), "sync:%u:%lu:%lu:%lu",
-                     phase,
-                     (unsigned long)phase_ms,
-                     (unsigned long)duration_ms,
-                     (unsigned long)now_ms);
-    }
-    if (n > 0) {
-        esp_err_t err = node_link_server_send_cmd_nonblock(cmd, n);
-        if (err != ESP_OK && err != ESP_ERR_TIMEOUT) {
-            ESP_LOGW(TAG, "sync send failed: %s", esp_err_to_name(err));
-        }
+                     (unsigned long)apply_ms);
+    if (n <= 0) return;
+
+    esp_err_t err = transport_send_cmd(cmd, n);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "sync TX failed: %s", esp_err_to_name(err));
     }
 }
+/* === END FIX === */

@@ -1,11 +1,15 @@
 /* ============================================================
-   fault_handler.c — зеркалирование fault между ROOT и NODE.
-   ROOT → transport_send_cmd()
-   NODE → transport_send_evt()
+   fault_handler.c — зеркалирование fault между ROOT и NODE
+   + отложенная регистрация смены фазы (pending sync).
 
-   === FIX ===
-   - NODE: не отправлять evt, пока LoRa не готова
-     (иначе событие теряется при старте).
+   === FIX P7-sync: on_phase_change НЕ шлёт sync: напрямую
+   (был бы вызов под s_mutex из apply_stage_dd → блокировка).
+   Вместо этого ставит флаг, который разбирает
+   phase_sync_task (root_wd.c) раз в 20 мс.
+
+   === FIX REQUEUE: если phase_sync_task не смог отправить sync:
+   (нет времени / LoRa / cfg_push), он возвращает pending-фазу
+   через phase_change_requeue(), чтобы не потерять.
    ============================================================ */
 
 #include "fault_handler.h"
@@ -28,6 +32,46 @@ extern volatile uint32_t s_last_fault_clear_ms;
 #define SET_REMOTE_FLAG(v) do { s_fault_from_remote = (v); s_fault_from_remote_ex = (v); } while (0)
 
 static volatile bool s_fault_from_remote = false;
+
+/* === pending sync: ставится on_phase_change, разбирается root_wd === */
+static volatile uint8_t  s_pending_sync_phase = 0xFF;
+static volatile uint32_t s_pending_sync_dur   = 0;
+
+uint8_t phase_change_take_pending(uint32_t *dur)
+{
+    uint8_t p = s_pending_sync_phase;
+    if (p == 0xFF) return 0xFF;
+    s_pending_sync_phase = 0xFF;
+    if (dur) *dur = s_pending_sync_dur;
+    return p;
+}
+
+/* === FIX REQUEUE: вернуть pending-фазу в очередь при ошибке send_sync === */
+void phase_change_requeue(uint8_t phase, uint32_t dur_ms)
+{
+    if (phase == 0xFF) return;
+    /* не перезаписываем, если уже есть более свежая pending */
+    if (s_pending_sync_phase == 0xFF) {
+        s_pending_sync_phase = phase;
+        s_pending_sync_dur   = dur_ms;
+        ESP_LOGD(TAG, "phase_change requeue phase=%u dur=%lu",
+                 phase, (unsigned long)dur_ms);
+    } else {
+        ESP_LOGD(TAG, "phase_change requeue skipped (already pending %u)",
+                 s_pending_sync_phase);
+    }
+}
+
+/* === callback при смене фазы (только ROOT, follow_root=false) === */
+static void on_phase_change(uint8_t phase, uint32_t dur_ms)
+{
+    if (g_config.role != DEVICE_ROLE_MASTER) return;
+    /* Не блокируем apply_stage_dd — только флаг */
+    s_pending_sync_phase = phase;
+    s_pending_sync_dur   = dur_ms;
+    ESP_LOGD(TAG, "phase_change → pending sync phase=%u dur=%lu",
+             phase, (unsigned long)dur_ms);
+}
 
 static void on_fault_changed(traffic_fault_t fault)
 {
@@ -78,14 +122,10 @@ static void on_fault_changed(traffic_fault_t fault)
         }
         wifi_mqtt_publish_node_fault(buf, n);
     } else {
-        /* === FIX: не отправляем evt, пока LoRa не готова ===
-           Иначе при старте NODE (LoRa init ~800 мс) событие
-           fault:all_off теряется, и ROOT не знает о состоянии NODE. */
         if (!transport_is_lora()) {
             ESP_LOGW(TAG, "node fault → root: LoRa not ready, skip '%s'", buf);
             return;
         }
-        /* === END FIX === */
         esp_err_t err = transport_send_evt(buf, n);
         if (err == ESP_OK) {
             ESP_LOGW(TAG, "node fault → root: '%s'", buf);
@@ -96,14 +136,9 @@ static void on_fault_changed(traffic_fault_t fault)
     }
 }
 
-static void on_phase_change(uint8_t phase, uint32_t dur_ms)
-{
-    if (g_config.role != DEVICE_ROLE_MASTER) return;
-    wifi_mqtt_notify_phase(phase, 0, dur_ms);
-}
-
 void fault_handler_register(void)
 {
     traffic_light_set_fault_notify(on_fault_changed);
+    /* === FIX P7-sync: регистрируем on_phase_change (только флаг) === */
     traffic_light_set_phase_change_cb(on_phase_change);
 }

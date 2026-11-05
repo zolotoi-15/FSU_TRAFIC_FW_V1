@@ -1,8 +1,3 @@
-/* ============================================================
-   buttons.c — кнопки BOOT (роль) и P7 (пешеход).
-   === FIX P3: P7 игнорируется при cfg_push / CFG rx ===
-   ============================================================ */
-
 #include "buttons.h"
 #include "app_shared.h"
 #include "board_pins.h"
@@ -27,9 +22,7 @@ static const char *TAG = "buttons";
 #define LED_SLAVE_PERIOD_MS   100
 #define LED_CONFIRM_BLINKS    3
 #define LED_CONFIRM_PERIOD_MS 150
-
 #define BTN_EXPANDER_B_PIN    7
-
 #define BTN_POLL_MS           10
 #define BTN_DEBOUNCE_COUNT    2
 #define BTN_IDLE_POLL_MS      50
@@ -39,8 +32,7 @@ static volatile bool          s_role_changing = false;
 
 static inline void led_set(bool on) { gpio_set_level(LED_PIN, on ? 1 : 0); }
 
-static void role_led_task(void *arg)
-{
+static void role_led_task(void *arg) {
     uint32_t last = 0; bool on = false;
     while (1) {
         if (s_role_changing) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
@@ -52,8 +44,7 @@ static void role_led_task(void *arg)
     }
 }
 
-static void role_button_task(void *arg)
-{
+static void role_button_task(void *arg) {
     gpio_config_t io = {
         .pin_bit_mask = (1ULL << BOOT_PIN),
         .mode = GPIO_MODE_INPUT,
@@ -63,12 +54,8 @@ static void role_button_task(void *arg)
     };
     gpio_config(&io);
 
-    ESP_LOGI(TAG, "BOOT pin initial level = %d (expect 1 if not pressed)",
-             gpio_get_level(BOOT_PIN));
-
     uint32_t press_start = 0;
-    bool     pressed = false;
-    bool     long_fired = false;
+    bool pressed = false, long_fired = false;
 
     while (1) {
         bool raw = (gpio_get_level(BOOT_PIN) == 0);
@@ -98,7 +85,7 @@ static void role_button_task(void *arg)
                 esp_restart();
             }
         } else if (!raw && pressed) {
-            if (!long_fired) {
+            if (!long_fired && g_config.role == DEVICE_ROLE_MASTER) {
                 uint8_t mac[6];
                 esp_read_mac(mac, ESP_MAC_WIFI_STA);
                 char mac_str[18];
@@ -115,66 +102,65 @@ static void role_button_task(void *arg)
     }
 }
 
-static bool p7_read_raw(void)
-{
+static bool p7_read_raw(void) {
     uint8_t in = 0;
-    esp_err_t err = pi4ioe5v6408_read_register(&expander_b,
-                                               REG_INPUT_STATUS, &in);
-    if (err != ESP_OK) {
-        return false;
-    }
+    esp_err_t err = pi4ioe5v6408_read_register(&expander_b, REG_INPUT_STATUS, &in);
+    if (err != ESP_OK) return false;
     return (in & (1 << BTN_EXPANDER_B_PIN)) == 0;
 }
 
 /* ============================================================
-   button_p7_task — LoRa вместо TCP.
-   === FIX P3: игнорируем P7 при cfg_push / CFG rx ===
+   P7 — вызывная кнопка пешехода.
+   === FIX: оба устройства (ROOT и NODE) применяют локально +
+   оповещают друг друга. ROOT дополнительно шлёт sync: через
+   phase_change_cb (см. fault_handler.c / root_wd.c).
+   === FIX: NODE получив pedestrian:request от ROOT — применяет
+   локально (см. node_proto.c).
    ============================================================ */
-static void button_p7_task(void *arg)
-{
+static void button_p7_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(100));
-
-    bool last_raw = false;
-    bool stable   = false;
-    int  same_count = 0;
+    bool last_raw = false, stable = false;
+    int same_count = 0;
 
     while (1) {
         if (!traffic_light_ped_button_enabled()) {
             vTaskDelay(pdMS_TO_TICKS(BTN_IDLE_POLL_MS));
-            last_raw = false;
-            stable = false;
-            same_count = 0;
+            last_raw = false; stable = false; same_count = 0;
             continue;
         }
-
         bool raw = p7_read_raw();
-
         if (raw == last_raw) {
             if (same_count < BTN_DEBOUNCE_COUNT) same_count++;
             if (same_count == BTN_DEBOUNCE_COUNT && raw != stable) {
                 stable = raw;
                 if (stable == true) {
-                    /* === FIX P3: не мешаем CFG === */
                     if (s_cfg_pushing || transport_is_cfg_rx_in_progress()) {
                         ESP_LOGW(TAG, "P7 ignored (CFG in progress)");
-                        last_raw = raw;
-                        same_count = 0;
-                        vTaskDelay(pdMS_TO_TICKS(BTN_POLL_MS));
-                        continue;
-                    }
-                    /* === END FIX P3 === */
-
-                    ESP_LOGI(TAG, "P7 pressed (request_mode=%u)",
-                             g_config.traffic.pedestrian.request_mode);
-
-                    if (g_config.role == DEVICE_ROLE_MASTER) {
-                        traffic_light_request_pedestrian();
-                        transport_send_cmd("pedestrian:request",
-                                           strlen("pedestrian:request"));
+                    } else if (g_config.role == DEVICE_ROLE_SLAVE && s_comm_lost) {
+                        ESP_LOGW(TAG, "P7 ignored (NODE comm lost)");
                     } else {
+                        ESP_LOGI(TAG, "P7 pressed (role=%s, request_mode=%u)",
+                                 g_config.role == DEVICE_ROLE_MASTER
+                                     ? "ROOT" : "NODE",
+                                 g_config.traffic.pedestrian.request_mode);
+
+                        /* 1. Локально — оба устройства */
                         traffic_light_request_pedestrian();
-                        transport_send_evt("pedestrian:request",
-                                           strlen("pedestrian:request"));
+
+                        /* 2. Оповестить партнёра.
+                           ROOT → CMD (NODE применит локально)
+                           NODE → EVT (ROOT применит локально) */
+                        if (g_config.role == DEVICE_ROLE_MASTER) {
+                            transport_send_cmd("pedestrian:request",
+                                               strlen("pedestrian:request"));
+                        } else {
+                            transport_send_evt("pedestrian:request",
+                                               strlen("pedestrian:request"));
+                        }
+                        /* 3. Дальше — естественная смена фазы:
+                           ROOT: phase_change_cb → pending sync
+                                 → phase_sync_task → sync: на NODE
+                           NODE: ждёт sync: от ROOT */
                     }
                 }
             }
@@ -182,29 +168,18 @@ static void button_p7_task(void *arg)
             last_raw = raw;
             same_count = 0;
         }
-
         vTaskDelay(pdMS_TO_TICKS(BTN_POLL_MS));
     }
 }
 
-void buttons_start_tasks(void)
-{
+void buttons_start_tasks(void) {
     gpio_reset_pin(LED_PIN);
     gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT);
     gpio_set_level(LED_PIN, 0);
-
     s_role = g_config.role;
-    ESP_LOGI(TAG, "buttons_start: role=%s",
-             s_role == DEVICE_ROLE_MASTER ? "MASTER" : "SLAVE");
-
     xTaskCreate(role_led_task,    "role_led",  2048, NULL, 2, NULL);
     xTaskCreate(role_button_task, "role_btn",  3072, NULL, 2, NULL);
-
     if (traffic_light_ped_button_enabled()) {
         xTaskCreate(button_p7_task, "btn_p7", 3072, NULL, 3, NULL);
-        ESP_LOGI(TAG, "P7 button task started (poll=%dms, debounce=%d)",
-                 BTN_POLL_MS, BTN_DEBOUNCE_COUNT);
-    } else {
-        ESP_LOGI(TAG, "P7 button disabled in config — task NOT created");
     }
 }

@@ -1,23 +1,8 @@
 /* ============================================================
    wifi_mqtt.c — публичный API + MQTT-клиент.
-   Модули:
-     mqtt_json.c   — build_json (телеметрия ROOT)
-     mqtt_cmd.c    — /Set + /SetJson
-     mqtt_fault.c  — зеркалирование fault + публикация NODE JSON
-     mqtt_apply.c  — apply_config_runtime, notify_phase
 
-   Топики:
-     FSU_Trafic_<MAC>           — телеметрия ROOT (JSON)
-     FSU_Trafic_<MAC>/Set       — команды
-     FSU_Trafic_<MAC>/SetJson   — конфиг
-     FSU_Trafic_<MAC>/Node      — телеметрия NODE (JSON)
-     FSU_Trafic_<MAC>/LWT       — online/offline
-     FSU_Trafic_<MAC>/Layer     — роль, IP, rssi
-     FSU_Trafic_<MAC>/key_pressed — события кнопки
-
-   === FIX ===
-   - s_mqtt_down_since_ms защищён критической секцией (race).
-   - wifi_mqtt_init: задачи MQTT создаются ТОЛЬКО на MASTER (NODE).
+   === FIX #7: URI с портом (esp-mqtt игнорирует broker.address.port) ===
+   === FIX #8: MQTT_DOWN_RESTART_MS 5 мин → 90 с ===
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -43,9 +28,6 @@ static const char *TAG = "wifi_mqtt";
 esp_mqtt_client_handle_t g_mqtt_client = NULL;
 mqtt_config_t g_mqtt_config;
 
-/* ============================================================
-   Определения общих переменных (extern в mqtt_internal.h).
-   ============================================================ */
 bool       s_mqtt_connected = false;
 char       s_topic[160];
 char       s_lwt_topic[192];
@@ -53,7 +35,7 @@ char       s_sub_topic[192];
 char       s_json_topic[192];
 char       s_layer_topic[192];
 char       s_kp_topic[192];
-char       s_node_json_topic[192];   /* === FSU_Trafic_<MAC>/Node === */
+char       s_node_json_topic[192];
 
 TickType_t s_last_event_time = 0;
 int        s_publish_fail_count = 0;
@@ -61,13 +43,13 @@ int        s_publish_fail_count = 0;
 static bool       s_restart_in_progress = false;
 static SemaphoreHandle_t s_restart_mutex = NULL;
 
-/* === MQTT watchdog === */
-#define MQTT_DOWN_RESTART_MS   (5 * 60 * 1000)
+/* === FIX #8: 5 мин → 90 с === */
+#define MQTT_DOWN_RESTART_MS   (90 * 1000)
+
 static volatile uint32_t s_mqtt_last_connected_ms    = 0;
 static volatile uint32_t s_mqtt_last_disconnected_ms = 0;
 static volatile uint32_t s_mqtt_down_since_ms        = 0;
 
-/* === FIX: критическая секция для s_mqtt_down_since_ms === */
 static portMUX_TYPE s_mqtt_state_mtx = portMUX_INITIALIZER_UNLOCKED;
 
 static inline void mqtt_set_down_since(uint32_t ms)
@@ -85,11 +67,9 @@ static inline uint32_t mqtt_get_down_since(void)
     portEXIT_CRITICAL(&s_mqtt_state_mtx);
     return v;
 }
-/* === END FIX === */
 
 #define NVS_NS_MQTT "mqtt_cfg"
 
-/* ============================================================ */
 void wifi_mqtt_load_config(void)
 {
     nvs_handle_t nvs;
@@ -143,9 +123,42 @@ void wifi_mqtt_save_config(void)
     }
 }
 
-/* ============================================================
-   build_topics — формирование MQTT-топиков.
-   ============================================================ */
+/* === FIX #7: собираем URI с портом вручную === */
+static void build_broker_uri(char *out, size_t out_len)
+{
+    const char *uri = g_mqtt_config.broker_url;
+    uint16_t port = g_mqtt_config.port;
+
+    if (!uri || !*uri) {
+        snprintf(out, out_len, "mqtt://127.0.0.1:%u", port);
+        return;
+    }
+
+    const char *scheme_end = strstr(uri, "://");
+    const char *host_start = scheme_end ? scheme_end + 3 : uri;
+    const char *host_end   = strchr(host_start, '/');
+    if (!host_end) host_end = host_start + strlen(host_start);
+
+    const char *last_colon = NULL;
+    for (const char *p = host_start; p < host_end; p++) {
+        if (*p == ':') last_colon = p;
+    }
+
+    if (last_colon) {
+        snprintf(out, out_len, "%s", uri);
+    } else {
+        size_t host_len = (size_t)(host_end - uri);
+        size_t rest_len = strlen(host_end);
+        if (host_len + 1 + 5 + rest_len + 1 > out_len) {
+            snprintf(out, out_len, "%s", uri);
+            return;
+        }
+        memcpy(out, uri, host_len);
+        out[host_len] = '\0';
+        snprintf(out + host_len, out_len - host_len, ":%u%s", port, host_end);
+    }
+}
+
 static void build_topics(void)
 {
     uint8_t mac[6];
@@ -168,61 +181,17 @@ static void build_topics(void)
     ESP_LOGI(TAG, "Node JSON:  %s", s_node_json_topic);
 }
 
-/* ============================================================
-   Публичные обёртки.
-   ============================================================ */
-int wifi_mqtt_fault_priority_ex(traffic_fault_t f)
-{
-    return mqtt_fault_priority(f);
-}
+int wifi_mqtt_fault_priority_ex(traffic_fault_t f) { return mqtt_fault_priority(f); }
+traffic_fault_t wifi_mqtt_get_node_fault(void) { return mqtt_fault_get_node(); }
+void wifi_mqtt_publish_node_json(const char *json, size_t len) { mqtt_fault_publish_node_json(json, len); }
+void wifi_mqtt_publish_node_fault(const char *fault_str, size_t len) { mqtt_fault_publish_node(fault_str, len); }
+void wifi_mqtt_apply_remote_fault(const char *fault_str, size_t len) { mqtt_fault_apply_remote(fault_str, len); }
+void wifi_mqtt_reset_node_fault_tracking(void) { mqtt_fault_reset_tracking(); }
+void wifi_mqtt_apply_config_runtime(void) { mqtt_apply_config_runtime(); }
+void wifi_mqtt_notify_phase(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms) { mqtt_notify_phase(phase, phase_ms, duration_ms); }
+void wifi_mqtt_set_phase_sync_enabled(bool en) { ESP_LOGI(TAG, "phase-sync flag=%d (ignored, sync: always on)", en); }
+const char *wifi_mqtt_last_node_fault(void) { return ""; }
 
-traffic_fault_t wifi_mqtt_get_node_fault(void)
-{
-    return mqtt_fault_get_node();
-}
-
-void wifi_mqtt_publish_node_json(const char *json, size_t len)
-{
-    mqtt_fault_publish_node_json(json, len);
-}
-
-void wifi_mqtt_publish_node_fault(const char *fault_str, size_t len)
-{
-    mqtt_fault_publish_node(fault_str, len);
-}
-
-void wifi_mqtt_apply_remote_fault(const char *fault_str, size_t len)
-{
-    mqtt_fault_apply_remote(fault_str, len);
-}
-
-void wifi_mqtt_reset_node_fault_tracking(void)
-{
-    mqtt_fault_reset_tracking();
-}
-
-void wifi_mqtt_apply_config_runtime(void)
-{
-    mqtt_apply_config_runtime();
-}
-
-void wifi_mqtt_notify_phase(uint8_t phase, uint32_t phase_ms,
-                            uint32_t duration_ms)
-{
-    mqtt_notify_phase(phase, phase_ms, duration_ms);
-}
-
-void wifi_mqtt_set_phase_sync_enabled(bool en)
-{
-    ESP_LOGI(TAG, "phase-sync flag=%d (ignored, sync: always on)", en);
-}
-
-const char *wifi_mqtt_last_node_fault(void)
-{
-    return "";
-}
-
-/* === MQTT watchdog helpers === */
 uint32_t wifi_mqtt_get_down_ms(void)
 {
     if (s_mqtt_connected) return 0;
@@ -239,9 +208,6 @@ void wifi_mqtt_force_restart_modem(void)
     modem_ppp_stop();
 }
 
-/* ============================================================
-   MQTT event handler.
-   ============================================================ */
 static void mqtt_event_handler(void *args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
@@ -314,9 +280,6 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
     }
 }
 
-/* ============================================================
-   Restart / publish / tasks.
-   ============================================================ */
 void wifi_mqtt_restart(void)
 {
     if (!s_restart_mutex) s_restart_mutex = xSemaphoreCreateMutex();
@@ -334,9 +297,12 @@ void wifi_mqtt_restart(void)
     s_mqtt_connected = false;
     s_publish_fail_count = 0;
 
+    static char s_broker_uri[192];
+    build_broker_uri(s_broker_uri, sizeof(s_broker_uri));
+    ESP_LOGI(TAG, "MQTT connect → %s", s_broker_uri);
+
     esp_mqtt_client_config_t cfg = {
-        .broker.address.uri  = g_mqtt_config.broker_url,
-        .broker.address.port = g_mqtt_config.port,
+        .broker.address.uri  = s_broker_uri,
         .credentials.username = g_mqtt_config.username,
         .credentials.authentication.password = g_mqtt_config.password,
         .session.last_will.topic = s_lwt_topic,
@@ -462,7 +428,6 @@ static void mqtt_watchdog_task(void *arg)
     }
 }
 
-/* === FIX: задачи MQTT создаются ТОЛЬКО на MASTER (NODE) === */
 esp_err_t wifi_mqtt_init(void)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) {
@@ -476,7 +441,6 @@ esp_err_t wifi_mqtt_init(void)
     xTaskCreate(mqtt_watchdog_task, "mqtt_wd", 4096, NULL, 3, NULL);
     return ESP_OK;
 }
-/* === END FIX === */
 
 void wifi_mqtt_stop(void)
 {

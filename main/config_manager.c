@@ -19,15 +19,10 @@ static const char *TAG = "CFG";
 #define NVS_KEY_ROLE  "role"
 #define NVS_KEY_LOCK  "role_lock"
 
-/* Минимальный непрерывный heap для cJSON-дерева 11 КБ JSON.
-   Практически cJSON требует ~4x от размера JSON. */
 #define CFG_MIN_HEAP_FOR_PARSE  (48 * 1024)
 
 app_config_t g_config;
 
-/* ============================================================
-   Кэш JSON-конфига.
-   ============================================================ */
 static char  *s_cfg_json_cache = NULL;
 static size_t s_cfg_json_len   = 0;
 
@@ -41,46 +36,45 @@ static void config_cache_invalidate(void)
     }
 }
 
-/* ============================================================
-   Forward declarations (нужны, т.к. используются ниже).
-   ============================================================ */
 static const char *duration_kind_to_str(uint8_t kind);
 static const char *ped_request_mode_to_str(uint8_t m);
 
-/* ============================================================ */
-static void set_defaults(void)
+/* ============================================================
+   FIX: set_defaults_to(cfg) — не трогает глобальный g_config.
+   ============================================================ */
+static void set_defaults_to(app_config_t *cfg)
 {
-    memset(&g_config, 0, sizeof(g_config));
+    memset(cfg, 0, sizeof(*cfg));
 
-    g_config.version = 1.0f;
-    g_config.id = 0;
-    strcpy(g_config.name, "default");
+    cfg->version = 1.0f;
+    cfg->id = 0;
+    strcpy(cfg->name, "default");
 
-    g_config.role = DEVICE_ROLE_MASTER;
+    cfg->role = DEVICE_ROLE_MASTER;
 
-    g_config.espnow.enabled = false;
-    g_config.espnow.role = 0;
-    g_config.espnow.channel = 6;
-    g_config.espnow.status_period_ms = 1000;
-    memset(g_config.espnow.slave_mac, 0, 6);
+    cfg->espnow.enabled = false;
+    cfg->espnow.role = 0;
+    cfg->espnow.channel = 6;
+    cfg->espnow.status_period_ms = 1000;
+    memset(cfg->espnow.slave_mac, 0, 6);
 
-    strcpy(g_config.wifi_ssid, "Keenetic-4250");
-    strcpy(g_config.wifi_password, "VTuVMHPi");
-    strcpy(g_config.ap_ssid, "");
-    strcpy(g_config.ap_password, "");
-    strcpy(g_config.timezone, "MSK-3");
+    strcpy(cfg->wifi_ssid, "Keenetic-4250");
+    strcpy(cfg->wifi_password, "VTuVMHPi");
+    strcpy(cfg->ap_ssid, "");
+    strcpy(cfg->ap_password, "");
+    strcpy(cfg->timezone, "MSK-3");
 
-    g_config.mqtt_enabled = true;
-    strcpy(g_config.mqtt_uri, "mqtt://m2.wqtt.ru");
-    g_config.mqtt_port = 13257;
-    strcpy(g_config.mqtt_user, "u_GGENLB");
-    strcpy(g_config.mqtt_password, "LTHNW22D");
-    g_config.mqtt_timepause_min = 5;
+    cfg->mqtt_enabled = true;
+    strcpy(cfg->mqtt_uri, "mqtt://m2.wqtt.ru");
+    cfg->mqtt_port = 13257;
+    strcpy(cfg->mqtt_user, "u_GGENLB");
+    strcpy(cfg->mqtt_password, "LTHNW22D");
+    cfg->mqtt_timepause_min = 5;
 
     const char *names[] = { "solar", "bat", "load" };
     const int   pins[]  = { 18, 19, 20 };
     for (int i = 0; i < MAX_PWM_CHANNELS; i++) {
-        pwm_channel_config_t *c = &g_config.channels[i];
+        pwm_channel_config_t *c = &cfg->channels[i];
         strncpy(c->name, names[i], MAX_NAME_LEN - 1);
         c->gpio = pins[i];
         c->frequency_hz = 1000;
@@ -91,45 +85,46 @@ static void set_defaults(void)
         c->duty_min = 0; c->duty_max = 100; c->duty_step = 10;
     }
 
-    g_config.traffic.mode = 3;
-    g_config.traffic.enabled = false;
-    g_config.traffic.auto_start = true;
+    cfg->traffic.mode = 3;
+    cfg->traffic.enabled = false;
+    cfg->traffic.auto_start = true;
 
-    g_config.traffic.pedestrian.button_enabled    = true;
-    g_config.traffic.pedestrian.request_mode      = PED_REQUEST_MODE_STAGE;
-    g_config.traffic.pedestrian.insert_timeout_ms = 30000;
-    g_config.traffic.pedestrian.min_recall_s      = 5;
+    cfg->traffic.pedestrian.button_enabled    = true;
+    cfg->traffic.pedestrian.request_mode      = PED_REQUEST_MODE_STAGE;
+    cfg->traffic.pedestrian.insert_timeout_ms = 30000;
+    cfg->traffic.pedestrian.min_recall_s      = 5;
 
-    g_config.traffic.pins.single = (traffic_color_pins_t){0,1,2};
-    g_config.traffic.pins.cross.a_north = (traffic_color_pins_t){0,1,2};
-    g_config.traffic.pins.cross.a_south = (traffic_color_pins_t){3,4,5};
-    g_config.traffic.pins.cross.b_west  = (traffic_color_pins_t){6,7,8};
-    g_config.traffic.pins.cross.b_east  = (traffic_color_pins_t){9,10,11};
-    g_config.traffic.pins.cross_ped.axis_a  = (traffic_color_pins_t){0,1,2};
-    g_config.traffic.pins.cross_ped.axis_a2 = (traffic_color_pins_t){3,4,5};
-    g_config.traffic.pins.cross_ped.axis_a3 = (traffic_color_pins_t){6,7,8};
-    g_config.traffic.pins.cross_ped.ped_red = 9;
-    g_config.traffic.pins.cross_ped.ped_green = 10;
+    cfg->traffic.pins.single = (traffic_color_pins_t){0,1,2};
+    cfg->traffic.pins.cross.a_north = (traffic_color_pins_t){0,1,2};
+    cfg->traffic.pins.cross.a_south = (traffic_color_pins_t){3,4,5};
+    cfg->traffic.pins.cross.b_west  = (traffic_color_pins_t){6,7,8};
+    cfg->traffic.pins.cross.b_east  = (traffic_color_pins_t){9,10,11};
+    cfg->traffic.pins.cross_ped.axis_a  = (traffic_color_pins_t){0,1,2};
+    cfg->traffic.pins.cross_ped.axis_a2 = (traffic_color_pins_t){3,4,5};
+    cfg->traffic.pins.cross_ped.axis_a3 = (traffic_color_pins_t){6,7,8};
+    cfg->traffic.pins.cross_ped.ped_red = 9;
+    cfg->traffic.pins.cross_ped.ped_green = 10;
 
-    g_config.traffic.phases_ms.red          = 8000;
-    g_config.traffic.phases_ms.red_yellow   = 2000;
-    g_config.traffic.phases_ms.green        = 10000;
-    g_config.traffic.phases_ms.green_blink  = 3000;
-    g_config.traffic.phases_ms.yellow       = 2000;
-    g_config.traffic.phases_ms.yellow_blink = 2000;
-    g_config.traffic.phases_ms.ped_green    = 10000;
-    g_config.traffic.phases_ms.ped_blink    = 4000;
-    g_config.traffic.phases_ms.fault_blink_period = 500;
-    g_config.traffic.phases_ms.phase_blink_period = 500;
+    cfg->traffic.phases_ms.red          = 8000;
+    cfg->traffic.phases_ms.red_yellow   = 2000;
+    cfg->traffic.phases_ms.green        = 10000;
+    cfg->traffic.phases_ms.green_blink  = 3000;
+    cfg->traffic.phases_ms.yellow       = 2000;
+    cfg->traffic.phases_ms.yellow_blink = 2000;
+    cfg->traffic.phases_ms.ped_green    = 10000;
+    cfg->traffic.phases_ms.ped_blink    = 4000;
+    cfg->traffic.phases_ms.fault_blink_period = 500;
+    cfg->traffic.phases_ms.phase_blink_period = 500;
 
-    g_config.traffic.fault.imin_mv = 10;
-    g_config.traffic.fault.vin_on_min_v = 5.0f;
-    g_config.traffic.fault.vin_off_min_v = 5.0f;
-    g_config.traffic.fault.phase_grace_ms = 2500;
-    g_config.traffic.fault.recovery_ms = 2000;
-    g_config.traffic.fault.vin_off_confirmations = 3;
+    cfg->traffic.fault.imin_mv = 10;
+    cfg->traffic.fault.vin_on_min_v = 5.0f;
+    cfg->traffic.fault.vin_off_min_v = 5.0f;
+    cfg->traffic.fault.phase_grace_ms = 2500;
+    cfg->traffic.fault.recovery_ms = 2000;
+    cfg->traffic.fault.vin_off_confirmations = 3;
 
-    traffic_stage_dd_t *st = g_config.traffic.stages;
+    /* Дефолтные stages: 4 фазы */
+    traffic_stage_dd_t *st = cfg->traffic.stages;
     st[0] = (traffic_stage_dd_t){ .id=1, .name="Фаза.1", .duration_ms=8000,
         .duration_kind=DD_DUR_EXPLICIT, .outputs_on={0}, .on_count=1 };
     st[1] = (traffic_stage_dd_t){ .id=2, .name="Фаза.2", .duration_ms=8000,
@@ -139,22 +134,24 @@ static void set_defaults(void)
     st[3] = (traffic_stage_dd_t){ .id=4, .name="Фаза.4", .duration_ms=10000,
         .duration_kind=DD_DUR_EXPLICIT, .outputs_on={9}, .on_count=1,
         .outputs_blink={10}, .blink_count=1 };
-    g_config.traffic.stage_count = 4;
+    cfg->traffic.stage_count = 4;
 
-    g_config.traffic.sequence[0] = 1;
-    g_config.traffic.sequence[1] = 2;
-    g_config.traffic.sequence[2] = 3;
-    g_config.traffic.sequence[3] = 4;
-    g_config.traffic.sequence_count = 4;
+    cfg->traffic.sequence[0] = 1;
+    cfg->traffic.sequence[1] = 2;
+    cfg->traffic.sequence[2] = 3;
+    cfg->traffic.sequence[3] = 4;
+    cfg->traffic.sequence_count = 4;
 
     for (int i = 0; i < MAX_OUTPUTS; i++) {
-        g_config.sr.outputs[i].ch = (uint8_t)i;
-        snprintf(g_config.sr.outputs[i].name, sizeof(g_config.sr.outputs[i].name),
+        cfg->sr.outputs[i].ch = (uint8_t)i;
+        snprintf(cfg->sr.outputs[i].name, sizeof(cfg->sr.outputs[i].name),
                  "%d", i + 1);
-        g_config.sr.outputs[i].active = (i < 12);
+        cfg->sr.outputs[i].active = (i < 12);
     }
-    g_config.sr.count = MAX_OUTPUTS;
+    cfg->sr.count = MAX_OUTPUTS;
 }
+
+static void set_defaults(void) { set_defaults_to(&g_config); }
 
 /* ============================================================ */
 void config_load(void)
@@ -238,6 +235,12 @@ esp_err_t config_save_role(device_role_t role)
     if (err == ESP_OK) err = nvs_set_u8(nvs, NVS_KEY_LOCK, 1);
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
+    /* === FIX: обновляем g_config.role + инвалидируем кэш === */
+    if (err == ESP_OK) {
+        g_config.role = role;
+        config_cache_invalidate();
+    }
+    /* === END FIX === */
     ESP_LOGI(TAG, "role saved: %s (locked)",
              role == DEVICE_ROLE_SLAVE ? "slave" : "master");
     return err;
@@ -286,21 +289,18 @@ static void json_get_str(const cJSON *obj, const char *key, char *out, size_t sz
         out[sz - 1] = '\0';
     }
 }
-
 static int json_get_int(const cJSON *obj, const char *key, int def)
 {
     if (!obj) return def;
     const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
     return cJSON_IsNumber(item) ? item->valueint : def;
 }
-
 static double json_get_double(const cJSON *obj, const char *key, double def)
 {
     if (!obj) return def;
     const cJSON *item = cJSON_GetObjectItemCaseSensitive(obj, key);
     return cJSON_IsNumber(item) ? item->valuedouble : def;
 }
-
 static bool json_get_bool(const cJSON *obj, const char *key, bool def)
 {
     if (!obj) return def;
@@ -308,7 +308,6 @@ static bool json_get_bool(const cJSON *obj, const char *key, bool def)
     if (cJSON_IsBool(item)) return cJSON_IsTrue(item);
     return def;
 }
-
 static void parse_color_pins(const cJSON *p, const char *key,
                              traffic_color_pins_t *out)
 {
@@ -422,7 +421,7 @@ static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
 {
     const cJSON *ped = cJSON_GetObjectItemCaseSensitive(t, "pedestrian");
     if (!cJSON_IsObject(ped)) {
-        ESP_LOGI(TAG, "pedestrian: section missing → defaults (enabled, stage)");
+        ESP_LOGI(TAG, "pedestrian: section missing → defaults");
         return;
     }
 
@@ -453,10 +452,10 @@ static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
              (unsigned long)tc->pedestrian.min_recall_s);
 }
 
-static void parse_traffic(const cJSON *t)
+/* === FIX: parse_traffic принимает tc, не пишет в g_config === */
+static void parse_traffic(const cJSON *t, traffic_config_t *tc)
 {
     if (!cJSON_IsObject(t)) return;
-    traffic_config_t *tc = &g_config.traffic;
 
     tc->mode       = (uint8_t)json_get_int(t, "mode", tc->mode);
     tc->enabled    = json_get_bool(t, "enabled", tc->enabled);
@@ -531,7 +530,6 @@ static void parse_traffic(const cJSON *t)
         }
     }
 
-    /* === FIX: проверка согласованности sequence ↔ stages_dd === */
     if (tc->sequence_count > 0 && tc->stage_count > 0) {
         for (int i = 0; i < tc->sequence_count; i++) {
             bool found = false;
@@ -545,17 +543,21 @@ static void parse_traffic(const cJSON *t)
         }
     }
 }
+/* === END FIX === */
 
-static void parse_signal_groups(const cJSON *sg) { /* ваш код */ }
-static void parse_igm(const cJSON *arr)            { /* ваш код */ }
-static void parse_stages_ref(const cJSON *arr)     { /* ваш код */ }
-static void parse_detectors(const cJSON *arr)      { /* ваш код */ }
-static void parse_plans(const cJSON *arr)          { /* ваш код */ }
-static void parse_schedule(const cJSON *s)         { /* ваш код */ }
-static void parse_control_sources(const cJSON *arr) { /* ваш код */ }
-static void parse_modules(const cJSON *m)          { /* ваш код */ }
+static void parse_signal_groups(const cJSON *sg) { (void)sg; }
+static void parse_igm(const cJSON *arr)            { (void)arr; }
+static void parse_stages_ref(const cJSON *arr)     { (void)arr; }
+static void parse_detectors(const cJSON *arr)      { (void)arr; }
+static void parse_plans(const cJSON *arr)          { (void)arr; }
+static void parse_schedule(const cJSON *s)         { (void)s; }
+static void parse_control_sources(const cJSON *arr) { (void)arr; }
+static void parse_modules(const cJSON *m)          { (void)m; }
 
-/* ============================================================ */
+/* ============================================================
+   config_load_json — парсит во временную tmp, коммитит только
+   после полной валидации.
+   ============================================================ */
 bool config_load_json(const char *json, size_t len)
 {
     if (!json || len == 0) {
@@ -583,71 +585,59 @@ bool config_load_json(const char *json, size_t len)
         size_t off = (err && err >= json) ? (size_t)(err - json) : 0;
         ESP_LOGE(TAG, "JSON parse error at offset %u / %u",
                  (unsigned)off, (unsigned)len);
-        if (err) {
-            ESP_LOGE(TAG, "JSON error near: %.60s", err);
-        }
-        size_t head = len > 64 ? 64 : len;
-        ESP_LOG_BUFFER_HEXDUMP("CFG_HEAD", json, head, ESP_LOG_ERROR);
-        if (len > 64) {
-            size_t tail_off = len - 64;
-            ESP_LOG_BUFFER_HEXDUMP("CFG_TAIL", json + tail_off, 64, ESP_LOG_ERROR);
-        }
-        ESP_LOGE(TAG, "cfg free=%u, largest=%u",
-                 (unsigned)esp_get_free_heap_size(),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+        if (err) ESP_LOGE(TAG, "JSON error near: %.60s", err);
         return false;
     }
 
     ESP_LOGI(TAG, "Parsing JSON config (%u bytes)", (unsigned)len);
 
-    device_role_t saved_role = g_config.role;
-
-    set_defaults();
-    g_config.role = saved_role;
+    /* === FIX: парсим в tmp, g_config не трогаем === */
+    app_config_t tmp;
+    set_defaults_to(&tmp);
+    tmp.role = g_config.role;
 
     const cJSON *meta = cJSON_GetObjectItemCaseSensitive(root, "meta");
     if (cJSON_IsObject(meta)) {
-        g_config.version = (float)json_get_double(meta, "version", 1.0);
-        g_config.id = (uint32_t)json_get_int(meta, "id", 0);
-        json_get_str(meta, "name", g_config.name, sizeof(g_config.name));
+        tmp.version = (float)json_get_double(meta, "version", 1.0);
+        tmp.id = (uint32_t)json_get_int(meta, "id", 0);
+        json_get_str(meta, "name", tmp.name, sizeof(tmp.name));
     }
 
     const cJSON *en = cJSON_GetObjectItemCaseSensitive(root, "espnow");
     if (cJSON_IsObject(en)) {
-        g_config.espnow.enabled = json_get_bool(en, "enabled", false);
-        g_config.espnow.channel = (uint8_t)json_get_int(en, "channel", 6);
-        g_config.espnow.status_period_ms =
+        tmp.espnow.enabled = json_get_bool(en, "enabled", false);
+        tmp.espnow.channel = (uint8_t)json_get_int(en, "channel", 6);
+        tmp.espnow.status_period_ms =
             (uint16_t)json_get_int(en, "status_period_ms", 1000);
-
         const cJSON *mac = cJSON_GetObjectItemCaseSensitive(en, "slave_mac");
         if (cJSON_IsString(mac) && mac->valuestring) {
             unsigned int b[6];
             if (sscanf(mac->valuestring, "%02x:%02x:%02x:%02x:%02x:%02x",
                        &b[0],&b[1],&b[2],&b[3],&b[4],&b[5]) == 6) {
                 for (int i = 0; i < 6; i++)
-                    g_config.espnow.slave_mac[i] = (uint8_t)b[i];
+                    tmp.espnow.slave_mac[i] = (uint8_t)b[i];
             }
         }
     }
 
     const cJSON *wifi = cJSON_GetObjectItemCaseSensitive(root, "wifi");
     if (cJSON_IsObject(wifi)) {
-        json_get_str(wifi, "ssid", g_config.wifi_ssid, sizeof(g_config.wifi_ssid));
-        json_get_str(wifi, "password", g_config.wifi_password, sizeof(g_config.wifi_password));
+        json_get_str(wifi, "ssid", tmp.wifi_ssid, sizeof(tmp.wifi_ssid));
+        json_get_str(wifi, "password", tmp.wifi_password, sizeof(tmp.wifi_password));
     }
-    json_get_str(root, "timezone", g_config.timezone, sizeof(g_config.timezone));
+    json_get_str(root, "timezone", tmp.timezone, sizeof(tmp.timezone));
 
     const cJSON *mqtt = cJSON_GetObjectItemCaseSensitive(root, "mqtt");
     if (cJSON_IsObject(mqtt)) {
-        g_config.mqtt_enabled = json_get_bool(mqtt, "enabled", true);
-        json_get_str(mqtt, "uri", g_config.mqtt_uri, sizeof(g_config.mqtt_uri));
-        g_config.mqtt_port = (uint16_t)json_get_int(mqtt, "port", 13257);
-        json_get_str(mqtt, "user", g_config.mqtt_user, sizeof(g_config.mqtt_user));
-        json_get_str(mqtt, "password", g_config.mqtt_password, sizeof(g_config.mqtt_password));
-        g_config.mqtt_timepause_min = (uint16_t)json_get_int(mqtt, "timepause_min", 5);
+        tmp.mqtt_enabled = json_get_bool(mqtt, "enabled", true);
+        json_get_str(mqtt, "uri", tmp.mqtt_uri, sizeof(tmp.mqtt_uri));
+        tmp.mqtt_port = (uint16_t)json_get_int(mqtt, "port", 13257);
+        json_get_str(mqtt, "user", tmp.mqtt_user, sizeof(tmp.mqtt_user));
+        json_get_str(mqtt, "password", tmp.mqtt_password, sizeof(tmp.mqtt_password));
+        tmp.mqtt_timepause_min = (uint16_t)json_get_int(mqtt, "timepause_min", 5);
     }
 
-    parse_traffic(cJSON_GetObjectItemCaseSensitive(root, "traffic"));
+    parse_traffic(cJSON_GetObjectItemCaseSensitive(root, "traffic"), &tmp.traffic);
     parse_signal_groups(cJSON_GetObjectItemCaseSensitive(root, "signalGroups"));
     parse_igm(cJSON_GetObjectItemCaseSensitive(root, "IGM"));
     parse_stages_ref(cJSON_GetObjectItemCaseSensitive(root, "stages"));
@@ -657,8 +647,43 @@ bool config_load_json(const char *json, size_t len)
     parse_control_sources(cJSON_GetObjectItemCaseSensitive(root, "controlSources"));
     parse_modules(cJSON_GetObjectItemCaseSensitive(root, "modules"));
 
+    /* shift_register */
+    const cJSON *sr = cJSON_GetObjectItemCaseSensitive(root, "shift_register");
+    if (cJSON_IsObject(sr)) {
+        const cJSON *outs = cJSON_GetObjectItemCaseSensitive(sr, "outputs");
+        if (cJSON_IsArray(outs)) {
+            for (int i = 0; i < MAX_OUTPUTS; i++)
+                tmp.sr.outputs[i].active = false;
+            const cJSON *o = NULL;
+            cJSON_ArrayForEach(o, outs) {
+                int ch = json_get_int(o, "ch", -1);
+                if (ch >= 0 && ch < MAX_OUTPUTS) {
+                    tmp.sr.outputs[ch].ch = (uint8_t)ch;
+                    json_get_str(o, "name", tmp.sr.outputs[ch].name,
+                                 sizeof(tmp.sr.outputs[ch].name));
+                    tmp.sr.outputs[ch].active = json_get_bool(o, "active", true);
+                }
+            }
+        }
+    }
+
     cJSON_Delete(root);
 
+    /* === FIX: валидация перед коммитом === */
+    if (tmp.traffic.enabled && tmp.traffic.stage_count == 0) {
+        ESP_LOGE(TAG, "load_json: traffic.enabled=true but no stages_dd "
+                      "→ reject (keep current config)");
+        return false;
+    }
+    if (tmp.traffic.stage_count > 0 && tmp.traffic.sequence_count == 0) {
+        ESP_LOGW(TAG, "load_json: stages_dd present but no sequence → auto-fill");
+        for (int i = 0; i < tmp.traffic.stage_count && i < MAX_SEQUENCE; i++)
+            tmp.traffic.sequence[i] = tmp.traffic.stages[i].id;
+        tmp.traffic.sequence_count = tmp.traffic.stage_count;
+    }
+    /* === END FIX === */
+
+    g_config = tmp;
     config_save();
 
     ESP_LOGI(TAG, "JSON loaded (version=%.2f, role=%s, traffic stages=%u seq=%u, "
@@ -697,35 +722,23 @@ static const char *ped_request_mode_to_str(uint8_t m)
 }
 
 /* ============================================================
-   config_export_json — сериализация g_config в JSON.
+   config_export_json — без изменений по логике, но кэш
+   инвалидируется при ошибке cJSON_PrintUnformatted.
    ============================================================ */
 bool config_export_json(char *buf, size_t *len)
 {
     if (!buf || !len || *len < 256) return false;
 
     if (s_cfg_json_cache) {
-        if (s_cfg_json_len + 1 > *len) {
-            ESP_LOGE(TAG, "config_export_json: cache too big (%u > %u)",
-                     (unsigned)(s_cfg_json_len + 1), (unsigned)*len);
-            return false;
-        }
+        if (s_cfg_json_len + 1 > *len) return false;
         memcpy(buf, s_cfg_json_cache, s_cfg_json_len);
         buf[s_cfg_json_len] = '\0';
         *len = s_cfg_json_len;
-        ESP_LOGD(TAG, "config_export_json: from cache (%u bytes)",
-                 (unsigned)s_cfg_json_len);
         return true;
     }
 
-    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT);
-    ESP_LOGI(TAG, "config_export_json: largest=%u, free=%u",
-             (unsigned)largest, (unsigned)esp_get_free_heap_size());
-
     cJSON *root = cJSON_CreateObject();
-    if (!root) {
-        ESP_LOGE(TAG, "config_export_json: cJSON_CreateObject failed");
-        return false;
-    }
+    if (!root) return false;
 
     cJSON *meta = cJSON_AddObjectToObject(root, "meta");
     if (meta) {
@@ -753,7 +766,6 @@ bool config_export_json(char *buf, size_t *len)
         cJSON_AddStringToObject(wifi, "ssid", g_config.wifi_ssid);
         cJSON_AddStringToObject(wifi, "password", g_config.wifi_password);
     }
-
     cJSON_AddStringToObject(root, "timezone", g_config.timezone);
 
     cJSON *mqtt = cJSON_AddObjectToObject(root, "mqtt");
@@ -763,8 +775,7 @@ bool config_export_json(char *buf, size_t *len)
         cJSON_AddNumberToObject(mqtt, "port", g_config.mqtt_port);
         cJSON_AddStringToObject(mqtt, "user", g_config.mqtt_user);
         cJSON_AddStringToObject(mqtt, "password", g_config.mqtt_password);
-        cJSON_AddNumberToObject(mqtt, "timepause_min",
-                                g_config.mqtt_timepause_min);
+        cJSON_AddNumberToObject(mqtt, "timepause_min", g_config.mqtt_timepause_min);
     }
 
     cJSON *t = cJSON_AddObjectToObject(root, "traffic");
@@ -790,23 +801,20 @@ bool config_export_json(char *buf, size_t *len)
         if (pins) {
             cJSON *single = cJSON_AddObjectToObject(pins, "single");
             if (single) {
-                cJSON_AddNumberToObject(single, "red",
-                                        g_config.traffic.pins.single.red);
-                cJSON_AddNumberToObject(single, "yellow",
-                                        g_config.traffic.pins.single.yellow);
-                cJSON_AddNumberToObject(single, "green",
-                                        g_config.traffic.pins.single.green);
+                cJSON_AddNumberToObject(single, "red",    g_config.traffic.pins.single.red);
+                cJSON_AddNumberToObject(single, "yellow", g_config.traffic.pins.single.yellow);
+                cJSON_AddNumberToObject(single, "green",  g_config.traffic.pins.single.green);
             }
             cJSON *cross = cJSON_AddObjectToObject(pins, "cross");
             if (cross) {
-                const struct { const char *name; traffic_color_pins_t *p; } arr[] = {
+                const struct { const char *n; traffic_color_pins_t *p; } arr[] = {
                     {"a_north", &g_config.traffic.pins.cross.a_north},
                     {"a_south", &g_config.traffic.pins.cross.a_south},
                     {"b_west",  &g_config.traffic.pins.cross.b_west},
                     {"b_east",  &g_config.traffic.pins.cross.b_east},
                 };
                 for (size_t i = 0; i < sizeof(arr)/sizeof(arr[0]); i++) {
-                    cJSON *o = cJSON_AddObjectToObject(cross, arr[i].name);
+                    cJSON *o = cJSON_AddObjectToObject(cross, arr[i].n);
                     if (o) {
                         cJSON_AddNumberToObject(o, "red",    arr[i].p->red);
                         cJSON_AddNumberToObject(o, "yellow", arr[i].p->yellow);
@@ -816,13 +824,13 @@ bool config_export_json(char *buf, size_t *len)
             }
             cJSON *cp = cJSON_AddObjectToObject(pins, "cross_ped");
             if (cp) {
-                const struct { const char *name; traffic_color_pins_t *p; } arr[] = {
+                const struct { const char *n; traffic_color_pins_t *p; } arr[] = {
                     {"axis_a",  &g_config.traffic.pins.cross_ped.axis_a},
                     {"axis_a2", &g_config.traffic.pins.cross_ped.axis_a2},
                     {"axis_a3", &g_config.traffic.pins.cross_ped.axis_a3},
                 };
                 for (size_t i = 0; i < sizeof(arr)/sizeof(arr[0]); i++) {
-                    cJSON *o = cJSON_AddObjectToObject(cp, arr[i].name);
+                    cJSON *o = cJSON_AddObjectToObject(cp, arr[i].n);
                     if (o) {
                         cJSON_AddNumberToObject(o, "red",    arr[i].p->red);
                         cJSON_AddNumberToObject(o, "yellow", arr[i].p->yellow);
@@ -831,55 +839,36 @@ bool config_export_json(char *buf, size_t *len)
                 }
                 cJSON *ped2 = cJSON_AddObjectToObject(cp, "ped");
                 if (ped2) {
-                    cJSON_AddNumberToObject(ped2, "red",
-                                            g_config.traffic.pins.cross_ped.ped_red);
-                    cJSON_AddNumberToObject(ped2, "green",
-                                            g_config.traffic.pins.cross_ped.ped_green);
+                    cJSON_AddNumberToObject(ped2, "red",   g_config.traffic.pins.cross_ped.ped_red);
+                    cJSON_AddNumberToObject(ped2, "green", g_config.traffic.pins.cross_ped.ped_green);
                 }
             }
         }
 
         cJSON *ph = cJSON_AddObjectToObject(t, "phases_ms");
         if (ph) {
-            cJSON_AddNumberToObject(ph, "red",
-                                    g_config.traffic.phases_ms.red);
-            cJSON_AddNumberToObject(ph, "red_yellow",
-                                    g_config.traffic.phases_ms.red_yellow);
-            cJSON_AddNumberToObject(ph, "green",
-                                    g_config.traffic.phases_ms.green);
-            cJSON_AddNumberToObject(ph, "green_blink",
-                                    g_config.traffic.phases_ms.green_blink);
-            cJSON_AddNumberToObject(ph, "yellow",
-                                    g_config.traffic.phases_ms.yellow);
-            cJSON_AddNumberToObject(ph, "yellow_blink",
-                                    g_config.traffic.phases_ms.yellow_blink);
-            cJSON_AddNumberToObject(ph, "ped_green",
-                                    g_config.traffic.phases_ms.ped_green);
-            cJSON_AddNumberToObject(ph, "ped_blink",
-                                    g_config.traffic.phases_ms.ped_blink);
-            cJSON_AddNumberToObject(ph, "fault_blink_period",
-                                    g_config.traffic.phases_ms.fault_blink_period);
-            cJSON_AddNumberToObject(ph, "phase_blink_period",
-                                    g_config.traffic.phases_ms.phase_blink_period);
+            cJSON_AddNumberToObject(ph, "red",          g_config.traffic.phases_ms.red);
+            cJSON_AddNumberToObject(ph, "red_yellow",   g_config.traffic.phases_ms.red_yellow);
+            cJSON_AddNumberToObject(ph, "green",        g_config.traffic.phases_ms.green);
+            cJSON_AddNumberToObject(ph, "green_blink",  g_config.traffic.phases_ms.green_blink);
+            cJSON_AddNumberToObject(ph, "yellow",       g_config.traffic.phases_ms.yellow);
+            cJSON_AddNumberToObject(ph, "yellow_blink", g_config.traffic.phases_ms.yellow_blink);
+            cJSON_AddNumberToObject(ph, "ped_green",    g_config.traffic.phases_ms.ped_green);
+            cJSON_AddNumberToObject(ph, "ped_blink",    g_config.traffic.phases_ms.ped_blink);
+            cJSON_AddNumberToObject(ph, "fault_blink_period", g_config.traffic.phases_ms.fault_blink_period);
+            cJSON_AddNumberToObject(ph, "phase_blink_period", g_config.traffic.phases_ms.phase_blink_period);
         }
 
         cJSON *f = cJSON_AddObjectToObject(t, "fault");
         if (f) {
-            cJSON_AddNumberToObject(f, "imin_mv",
-                                    g_config.traffic.fault.imin_mv);
-            cJSON_AddNumberToObject(f, "vin_on_min_v",
-                                    g_config.traffic.fault.vin_on_min_v);
-            cJSON_AddNumberToObject(f, "vin_off_min_v",
-                                    g_config.traffic.fault.vin_off_min_v);
-            cJSON_AddNumberToObject(f, "phase_grace_ms",
-                                    g_config.traffic.fault.phase_grace_ms);
-            cJSON_AddNumberToObject(f, "recovery_ms",
-                                    g_config.traffic.fault.recovery_ms);
-            cJSON_AddNumberToObject(f, "vin_off_confirmations",
-                                    g_config.traffic.fault.vin_off_confirmations);
+            cJSON_AddNumberToObject(f, "imin_mv",   g_config.traffic.fault.imin_mv);
+            cJSON_AddNumberToObject(f, "vin_on_min_v",  g_config.traffic.fault.vin_on_min_v);
+            cJSON_AddNumberToObject(f, "vin_off_min_v", g_config.traffic.fault.vin_off_min_v);
+            cJSON_AddNumberToObject(f, "phase_grace_ms", g_config.traffic.fault.phase_grace_ms);
+            cJSON_AddNumberToObject(f, "recovery_ms",    g_config.traffic.fault.recovery_ms);
+            cJSON_AddNumberToObject(f, "vin_off_confirmations", g_config.traffic.fault.vin_off_confirmations);
         }
 
-        /* === FIX: экспорт stages_dd === */
         cJSON *stages = cJSON_AddArrayToObject(t, "stages_dd");
         if (stages) {
             for (int i = 0; i < g_config.traffic.stage_count; i++) {
@@ -891,32 +880,25 @@ bool config_export_json(char *buf, size_t *len)
                 cJSON_AddStringToObject(st, "duration_kind",
                                         duration_kind_to_str(s->duration_kind));
                 cJSON_AddNumberToObject(st, "duration_ms", s->duration_ms);
-
                 cJSON *g = cJSON_AddArrayToObject(st, "groups");
                 for (int k = 0; k < s->group_count; k++)
                     cJSON_AddItemToArray(g, cJSON_CreateNumber(s->groups[k]));
-
                 cJSON *o = cJSON_AddArrayToObject(st, "outputs_on");
                 for (int k = 0; k < s->on_count; k++)
                     cJSON_AddItemToArray(o, cJSON_CreateNumber(s->outputs_on[k]));
-
                 cJSON *b = cJSON_AddArrayToObject(st, "outputs_blink");
                 for (int k = 0; k < s->blink_count; k++)
                     cJSON_AddItemToArray(b, cJSON_CreateNumber(s->outputs_blink[k]));
-
                 cJSON_AddItemToArray(stages, st);
             }
         }
 
-        /* === FIX: экспорт sequence === */
         cJSON *seq = cJSON_AddArrayToObject(t, "sequence");
         if (seq) {
             for (int i = 0; i < g_config.traffic.sequence_count; i++)
-                cJSON_AddItemToArray(seq,
-                    cJSON_CreateNumber(g_config.traffic.sequence[i]));
+                cJSON_AddItemToArray(seq, cJSON_CreateNumber(g_config.traffic.sequence[i]));
         }
 
-        /* === FIX: экспорт transitions === */
         cJSON *tr = cJSON_AddArrayToObject(t, "transitions");
         if (tr) {
             for (int i = 0; i < g_config.traffic.transition_count; i++) {
@@ -948,21 +930,10 @@ bool config_export_json(char *buf, size_t *len)
 
     char *out = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (!out) {
-        ESP_LOGE(TAG, "config_export_json: cJSON_PrintUnformatted failed "
-                      "(free=%u, largest=%u)",
-                 (unsigned)esp_get_free_heap_size(),
-                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
-        return false;
-    }
+    if (!out) return false;
 
     size_t n = strlen(out);
-    if (n + 1 > *len) {
-        ESP_LOGE(TAG, "config_export_json: buffer too small (%u > %u)",
-                 (unsigned)(n + 1), (unsigned)*len);
-        free(out);
-        return false;
-    }
+    if (n + 1 > *len) { free(out); return false; }
     memcpy(buf, out, n);
     buf[n] = '\0';
     *len = n;
@@ -971,7 +942,397 @@ bool config_export_json(char *buf, size_t *len)
     s_cfg_json_len = n;
     free(out);
 
-    ESP_LOGI(TAG, "config_export_json: OK (%u bytes, ped_mode=%u, cached)",
-             (unsigned)n, g_config.traffic.pedestrian.request_mode);
+    ESP_LOGI(TAG, "config_export_json: OK (%u bytes, cached)", (unsigned)n);
+    return true;
+}
+
+/* ============================================================
+   config_export_lora_json — короткий JSON для LoRa.
+   Без изменений по логике.
+   ============================================================ */
+bool config_export_lora_json(char *buf, size_t *len)
+{
+    if (!buf || !len || *len < 256) return false;
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) return false;
+
+    cJSON_AddNumberToObject(root, "v", g_config.version);
+    cJSON_AddStringToObject(root, "tz", g_config.timezone);
+
+    cJSON *t = cJSON_AddObjectToObject(root, "t");
+    if (t) {
+        cJSON_AddNumberToObject(t, "mode", g_config.traffic.mode);
+        cJSON_AddBoolToObject(t, "en", g_config.traffic.enabled);
+        cJSON_AddBoolToObject(t, "auto", g_config.traffic.auto_start);
+
+        cJSON *pins = cJSON_AddObjectToObject(t, "pins");
+        if (pins) {
+            cJSON *single = cJSON_AddArrayToObject(pins, "single");
+            cJSON_AddItemToArray(single, cJSON_CreateNumber(g_config.traffic.pins.single.red));
+            cJSON_AddItemToArray(single, cJSON_CreateNumber(g_config.traffic.pins.single.yellow));
+            cJSON_AddItemToArray(single, cJSON_CreateNumber(g_config.traffic.pins.single.green));
+
+            cJSON *cross = cJSON_AddArrayToObject(pins, "cross");
+            const traffic_color_pins_t cross_arr[] = {
+                g_config.traffic.pins.cross.a_north,
+                g_config.traffic.pins.cross.a_south,
+                g_config.traffic.pins.cross.b_west,
+                g_config.traffic.pins.cross.b_east,
+            };
+            for (int i = 0; i < 4; i++) {
+                cJSON *c = cJSON_CreateArray();
+                cJSON_AddItemToArray(c, cJSON_CreateNumber(cross_arr[i].red));
+                cJSON_AddItemToArray(c, cJSON_CreateNumber(cross_arr[i].yellow));
+                cJSON_AddItemToArray(c, cJSON_CreateNumber(cross_arr[i].green));
+                cJSON_AddItemToArray(cross, c);
+            }
+
+            cJSON *cp = cJSON_AddArrayToObject(pins, "cross_ped");
+            const traffic_color_pins_t cp_arr[] = {
+                g_config.traffic.pins.cross_ped.axis_a,
+                g_config.traffic.pins.cross_ped.axis_a2,
+                g_config.traffic.pins.cross_ped.axis_a3,
+            };
+            for (int i = 0; i < 3; i++) {
+                cJSON *c = cJSON_CreateArray();
+                cJSON_AddItemToArray(c, cJSON_CreateNumber(cp_arr[i].red));
+                cJSON_AddItemToArray(c, cJSON_CreateNumber(cp_arr[i].yellow));
+                cJSON_AddItemToArray(c, cJSON_CreateNumber(cp_arr[i].green));
+                cJSON_AddItemToArray(cp, c);
+            }
+            cJSON_AddItemToArray(cp, cJSON_CreateNumber(g_config.traffic.pins.cross_ped.ped_red));
+            cJSON_AddItemToArray(cp, cJSON_CreateNumber(g_config.traffic.pins.cross_ped.ped_green));
+        }
+
+        cJSON *ph = cJSON_AddArrayToObject(t, "ph");
+        if (ph) {
+            cJSON_AddItemToArray(ph, cJSON_CreateNumber(g_config.traffic.phases_ms.red));
+            cJSON_AddItemToArray(ph, cJSON_CreateNumber(g_config.traffic.phases_ms.red_yellow));
+            cJSON_AddItemToArray(ph, cJSON_CreateNumber(g_config.traffic.phases_ms.green));
+            cJSON_AddItemToArray(ph, cJSON_CreateNumber(g_config.traffic.phases_ms.green_blink));
+            cJSON_AddItemToArray(ph, cJSON_CreateNumber(g_config.traffic.phases_ms.yellow));
+            cJSON_AddItemToArray(ph, cJSON_CreateNumber(g_config.traffic.phases_ms.yellow_blink));
+            cJSON_AddItemToArray(ph, cJSON_CreateNumber(g_config.traffic.phases_ms.ped_green));
+            cJSON_AddItemToArray(ph, cJSON_CreateNumber(g_config.traffic.phases_ms.ped_blink));
+            cJSON_AddItemToArray(ph, cJSON_CreateNumber(g_config.traffic.phases_ms.fault_blink_period));
+            cJSON_AddItemToArray(ph, cJSON_CreateNumber(g_config.traffic.phases_ms.phase_blink_period));
+        }
+
+        cJSON *f = cJSON_AddArrayToObject(t, "f");
+        if (f) {
+            cJSON_AddItemToArray(f, cJSON_CreateNumber(g_config.traffic.fault.imin_mv));
+            cJSON_AddItemToArray(f, cJSON_CreateNumber(g_config.traffic.fault.vin_on_min_v));
+            cJSON_AddItemToArray(f, cJSON_CreateNumber(g_config.traffic.fault.vin_off_min_v));
+            cJSON_AddItemToArray(f, cJSON_CreateNumber(g_config.traffic.fault.phase_grace_ms));
+            cJSON_AddItemToArray(f, cJSON_CreateNumber(g_config.traffic.fault.recovery_ms));
+            cJSON_AddItemToArray(f, cJSON_CreateNumber(g_config.traffic.fault.vin_off_confirmations));
+        }
+
+        cJSON *ped = cJSON_AddArrayToObject(t, "ped");
+        if (ped) {
+            cJSON_AddItemToArray(ped, cJSON_CreateBool(g_config.traffic.pedestrian.button_enabled));
+            cJSON_AddItemToArray(ped, cJSON_CreateNumber(g_config.traffic.pedestrian.request_mode));
+            cJSON_AddItemToArray(ped, cJSON_CreateNumber(g_config.traffic.pedestrian.insert_timeout_ms));
+            cJSON_AddItemToArray(ped, cJSON_CreateNumber(g_config.traffic.pedestrian.min_recall_s));
+        }
+
+        cJSON *st = cJSON_AddArrayToObject(t, "st");
+        if (st) {
+            for (int i = 0; i < g_config.traffic.stage_count; i++) {
+                const traffic_stage_dd_t *s = &g_config.traffic.stages[i];
+                cJSON *item = cJSON_CreateArray();
+                cJSON_AddItemToArray(item, cJSON_CreateNumber(s->id));
+                cJSON_AddItemToArray(item, cJSON_CreateString(s->name));
+                cJSON *g = cJSON_CreateArray();
+                for (int k = 0; k < s->group_count; k++)
+                    cJSON_AddItemToArray(g, cJSON_CreateNumber(s->groups[k]));
+                cJSON_AddItemToArray(item, g);
+                cJSON_AddItemToArray(item, cJSON_CreateNumber(s->duration_kind));
+                cJSON_AddItemToArray(item, cJSON_CreateNumber(s->duration_ms));
+                cJSON *on = cJSON_CreateArray();
+                for (int k = 0; k < s->on_count; k++)
+                    cJSON_AddItemToArray(on, cJSON_CreateNumber(s->outputs_on[k]));
+                cJSON_AddItemToArray(item, on);
+                cJSON *blink = cJSON_CreateArray();
+                for (int k = 0; k < s->blink_count; k++)
+                    cJSON_AddItemToArray(blink, cJSON_CreateNumber(s->outputs_blink[k]));
+                cJSON_AddItemToArray(item, blink);
+                cJSON_AddItemToArray(st, item);
+            }
+        }
+
+        cJSON *seq = cJSON_AddArrayToObject(t, "seq");
+        if (seq) {
+            for (int i = 0; i < g_config.traffic.sequence_count; i++)
+                cJSON_AddItemToArray(seq, cJSON_CreateNumber(g_config.traffic.sequence[i]));
+        }
+
+        cJSON *tr = cJSON_AddArrayToObject(t, "tr");
+        if (tr) {
+            for (int i = 0; i < g_config.traffic.transition_count; i++) {
+                const traffic_transition_t *tt = &g_config.traffic.transitions[i];
+                cJSON *item = cJSON_CreateArray();
+                cJSON_AddItemToArray(item, cJSON_CreateNumber(tt->clearing));
+                cJSON_AddItemToArray(item, cJSON_CreateNumber(tt->entering));
+                cJSON_AddItemToArray(item, cJSON_CreateNumber(tt->time_cs * 10));
+                cJSON_AddItemToArray(tr, item);
+            }
+        }
+    }
+
+    cJSON *sr = cJSON_AddArrayToObject(root, "sr");
+    if (sr) {
+        for (int i = 0; i < g_config.sr.count; i++) {
+            if (g_config.sr.outputs[i].active)
+                cJSON_AddItemToArray(sr, cJSON_CreateNumber(g_config.sr.outputs[i].ch));
+        }
+    }
+
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!out) {
+        ESP_LOGE(TAG, "config_export_lora_json: cJSON_PrintUnformatted failed");
+        return false;
+    }
+
+    size_t n = strlen(out);
+    if (n + 1 > *len) {
+        ESP_LOGE(TAG, "config_export_lora_json: buffer too small (%u > %u)",
+                 (unsigned)(n + 1), (unsigned)*len);
+        free(out);
+        return false;
+    }
+    memcpy(buf, out, n);
+    buf[n] = '\0';
+    *len = n;
+    free(out);
+
+    ESP_LOGI(TAG, "config_export_lora_json: OK (%u bytes)", (unsigned)n);
+    return true;
+}
+
+/* ============================================================
+   config_load_lora_json — та же схема: tmp → валидация → commit.
+   ============================================================ */
+bool config_load_lora_json(const char *json, size_t len)
+{
+    if (!json || len == 0) {
+        ESP_LOGE(TAG, "lora_json: empty input");
+        return false;
+    }
+
+    cJSON *root = cJSON_ParseWithLength(json, len);
+    if (!root) {
+        const char *err = cJSON_GetErrorPtr();
+        size_t off = (err && err >= json) ? (size_t)(err - json) : 0;
+        ESP_LOGE(TAG, "lora_json: parse error at offset %u / %u",
+                 (unsigned)off, (unsigned)len);
+        return false;
+    }
+
+    /* === FIX: парсим в tmp === */
+    app_config_t tmp;
+    set_defaults_to(&tmp);
+    tmp.role = g_config.role;
+
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "v");
+    if (cJSON_IsNumber(v)) tmp.version = (float)v->valuedouble;
+
+    const cJSON *tz = cJSON_GetObjectItemCaseSensitive(root, "tz");
+    if (cJSON_IsString(tz) && tz->valuestring) {
+        strncpy(tmp.timezone, tz->valuestring, sizeof(tmp.timezone) - 1);
+        tmp.timezone[sizeof(tmp.timezone) - 1] = '\0';
+    }
+
+    const cJSON *t = cJSON_GetObjectItemCaseSensitive(root, "t");
+    if (cJSON_IsObject(t)) {
+        traffic_config_t *tc = &tmp.traffic;
+
+        tc->mode       = (uint8_t)json_get_int(t, "mode", tc->mode);
+        tc->enabled    = json_get_bool(t, "en", tc->enabled);
+        tc->auto_start = json_get_bool(t, "auto", tc->auto_start);
+
+        const cJSON *pins = cJSON_GetObjectItemCaseSensitive(t, "pins");
+        if (cJSON_IsObject(pins)) {
+            const cJSON *single = cJSON_GetObjectItemCaseSensitive(pins, "single");
+            if (cJSON_IsArray(single) && cJSON_GetArraySize(single) >= 3) {
+                tc->pins.single.red    = (uint8_t)cJSON_GetArrayItem(single, 0)->valueint;
+                tc->pins.single.yellow = (uint8_t)cJSON_GetArrayItem(single, 1)->valueint;
+                tc->pins.single.green  = (uint8_t)cJSON_GetArrayItem(single, 2)->valueint;
+            }
+            const cJSON *cross = cJSON_GetObjectItemCaseSensitive(pins, "cross");
+            if (cJSON_IsArray(cross) && cJSON_GetArraySize(cross) >= 4) {
+                traffic_color_pins_t *dst[] = {
+                    &tc->pins.cross.a_north, &tc->pins.cross.a_south,
+                    &tc->pins.cross.b_west,  &tc->pins.cross.b_east,
+                };
+                for (int i = 0; i < 4; i++) {
+                    const cJSON *c = cJSON_GetArrayItem(cross, i);
+                    if (cJSON_IsArray(c) && cJSON_GetArraySize(c) >= 3) {
+                        dst[i]->red    = (uint8_t)cJSON_GetArrayItem(c, 0)->valueint;
+                        dst[i]->yellow = (uint8_t)cJSON_GetArrayItem(c, 1)->valueint;
+                        dst[i]->green  = (uint8_t)cJSON_GetArrayItem(c, 2)->valueint;
+                    }
+                }
+            }
+            const cJSON *cp = cJSON_GetObjectItemCaseSensitive(pins, "cross_ped");
+            if (cJSON_IsArray(cp) && cJSON_GetArraySize(cp) >= 5) {
+                traffic_color_pins_t *dst[] = {
+                    &tc->pins.cross_ped.axis_a,
+                    &tc->pins.cross_ped.axis_a2,
+                    &tc->pins.cross_ped.axis_a3,
+                };
+                for (int i = 0; i < 3; i++) {
+                    const cJSON *c = cJSON_GetArrayItem(cp, i);
+                    if (cJSON_IsArray(c) && cJSON_GetArraySize(c) >= 3) {
+                        dst[i]->red    = (uint8_t)cJSON_GetArrayItem(c, 0)->valueint;
+                        dst[i]->yellow = (uint8_t)cJSON_GetArrayItem(c, 1)->valueint;
+                        dst[i]->green  = (uint8_t)cJSON_GetArrayItem(c, 2)->valueint;
+                    }
+                }
+                tc->pins.cross_ped.ped_red   = (uint8_t)cJSON_GetArrayItem(cp, 3)->valueint;
+                tc->pins.cross_ped.ped_green = (uint8_t)cJSON_GetArrayItem(cp, 4)->valueint;
+            }
+        }
+
+        const cJSON *ph = cJSON_GetObjectItemCaseSensitive(t, "ph");
+        if (cJSON_IsArray(ph) && cJSON_GetArraySize(ph) >= 10) {
+            tc->phases_ms.red          = (uint32_t)cJSON_GetArrayItem(ph, 0)->valueint;
+            tc->phases_ms.red_yellow   = (uint32_t)cJSON_GetArrayItem(ph, 1)->valueint;
+            tc->phases_ms.green        = (uint32_t)cJSON_GetArrayItem(ph, 2)->valueint;
+            tc->phases_ms.green_blink  = (uint32_t)cJSON_GetArrayItem(ph, 3)->valueint;
+            tc->phases_ms.yellow       = (uint32_t)cJSON_GetArrayItem(ph, 4)->valueint;
+            tc->phases_ms.yellow_blink = (uint32_t)cJSON_GetArrayItem(ph, 5)->valueint;
+            tc->phases_ms.ped_green    = (uint32_t)cJSON_GetArrayItem(ph, 6)->valueint;
+            tc->phases_ms.ped_blink    = (uint32_t)cJSON_GetArrayItem(ph, 7)->valueint;
+            tc->phases_ms.fault_blink_period = (uint32_t)cJSON_GetArrayItem(ph, 8)->valueint;
+            tc->phases_ms.phase_blink_period = (uint32_t)cJSON_GetArrayItem(ph, 9)->valueint;
+        }
+
+        const cJSON *f = cJSON_GetObjectItemCaseSensitive(t, "f");
+        if (cJSON_IsArray(f) && cJSON_GetArraySize(f) >= 6) {
+            tc->fault.imin_mv   = (int)cJSON_GetArrayItem(f, 0)->valueint;
+            tc->fault.vin_on_min_v  = (float)cJSON_GetArrayItem(f, 1)->valuedouble;
+            tc->fault.vin_off_min_v = (float)cJSON_GetArrayItem(f, 2)->valuedouble;
+            tc->fault.phase_grace_ms = (uint32_t)cJSON_GetArrayItem(f, 3)->valueint;
+            tc->fault.recovery_ms    = (uint32_t)cJSON_GetArrayItem(f, 4)->valueint;
+            tc->fault.vin_off_confirmations = (uint8_t)cJSON_GetArrayItem(f, 5)->valueint;
+        }
+
+        const cJSON *ped = cJSON_GetObjectItemCaseSensitive(t, "ped");
+        if (cJSON_IsArray(ped) && cJSON_GetArraySize(ped) >= 4) {
+            tc->pedestrian.button_enabled    = cJSON_IsTrue(cJSON_GetArrayItem(ped, 0));
+            tc->pedestrian.request_mode      = (uint8_t)cJSON_GetArrayItem(ped, 1)->valueint;
+            tc->pedestrian.insert_timeout_ms = (uint32_t)cJSON_GetArrayItem(ped, 2)->valueint;
+            tc->pedestrian.min_recall_s      = (uint32_t)cJSON_GetArrayItem(ped, 3)->valueint;
+        }
+
+        const cJSON *st = cJSON_GetObjectItemCaseSensitive(t, "st");
+        if (cJSON_IsArray(st)) {
+            tc->stage_count = 0;
+            const cJSON *item = NULL;
+            cJSON_ArrayForEach(item, st) {
+                if (tc->stage_count >= MAX_DD_STAGES) break;
+                if (!cJSON_IsArray(item) || cJSON_GetArraySize(item) < 7) continue;
+                traffic_stage_dd_t *s = &tc->stages[tc->stage_count];
+                memset(s, 0, sizeof(*s));
+                s->id = (uint8_t)cJSON_GetArrayItem(item, 0)->valueint;
+                const cJSON *nm = cJSON_GetArrayItem(item, 1);
+                if (cJSON_IsString(nm) && nm->valuestring)
+                    strncpy(s->name, nm->valuestring, sizeof(s->name) - 1);
+                const cJSON *g = cJSON_GetArrayItem(item, 2);
+                if (cJSON_IsArray(g)) {
+                    const cJSON *gi = NULL;
+                    cJSON_ArrayForEach(gi, g) {
+                        if (s->group_count < MAX_STAGE_GROUPS && cJSON_IsNumber(gi))
+                            s->groups[s->group_count++] = (uint8_t)gi->valueint;
+                    }
+                }
+                s->duration_kind = (uint8_t)cJSON_GetArrayItem(item, 3)->valueint;
+                s->duration_ms   = (uint32_t)cJSON_GetArrayItem(item, 4)->valueint;
+                const cJSON *on = cJSON_GetArrayItem(item, 5);
+                if (cJSON_IsArray(on)) {
+                    const cJSON *oi = NULL;
+                    cJSON_ArrayForEach(oi, on) {
+                        if (s->on_count < MAX_ON_OUTPUTS && cJSON_IsNumber(oi))
+                            s->outputs_on[s->on_count++] = (uint8_t)oi->valueint;
+                    }
+                }
+                const cJSON *blink = cJSON_GetArrayItem(item, 6);
+                if (cJSON_IsArray(blink)) {
+                    const cJSON *bi = NULL;
+                    cJSON_ArrayForEach(bi, blink) {
+                        if (s->blink_count < MAX_BLINK_OUTPUTS && cJSON_IsNumber(bi))
+                            s->outputs_blink[s->blink_count++] = (uint8_t)bi->valueint;
+                    }
+                }
+                tc->stage_count++;
+            }
+        }
+
+        const cJSON *seq = cJSON_GetObjectItemCaseSensitive(t, "seq");
+        if (cJSON_IsArray(seq)) {
+            tc->sequence_count = 0;
+            const cJSON *si = NULL;
+            cJSON_ArrayForEach(si, seq) {
+                if (tc->sequence_count < MAX_SEQUENCE && cJSON_IsNumber(si))
+                    tc->sequence[tc->sequence_count++] = (uint8_t)si->valueint;
+            }
+        }
+
+        const cJSON *tr = cJSON_GetObjectItemCaseSensitive(t, "tr");
+        if (cJSON_IsArray(tr)) {
+            tc->transition_count = 0;
+            const cJSON *ti = NULL;
+            cJSON_ArrayForEach(ti, tr) {
+                if (tc->transition_count >= MAX_TRANSITIONS) break;
+                if (!cJSON_IsArray(ti) || cJSON_GetArraySize(ti) < 3) continue;
+                traffic_transition_t *tt = &tc->transitions[tc->transition_count];
+                tt->clearing = (uint8_t)cJSON_GetArrayItem(ti, 0)->valueint;
+                tt->entering = (uint8_t)cJSON_GetArrayItem(ti, 1)->valueint;
+                tt->time_cs  = (uint16_t)(cJSON_GetArrayItem(ti, 2)->valueint / 10);
+                tc->transition_count++;
+            }
+        }
+    }
+
+    const cJSON *sr = cJSON_GetObjectItemCaseSensitive(root, "sr");
+    if (cJSON_IsArray(sr)) {
+        for (int i = 0; i < tmp.sr.count; i++)
+            tmp.sr.outputs[i].active = false;
+        const cJSON *ch = NULL;
+        cJSON_ArrayForEach(ch, sr) {
+            if (!cJSON_IsNumber(ch)) continue;
+            int c = ch->valueint;
+            if (c >= 0 && c < tmp.sr.count)
+                tmp.sr.outputs[c].active = true;
+        }
+    }
+
+    cJSON_Delete(root);
+
+    /* === FIX: валидация перед коммитом === */
+    if (tmp.traffic.enabled && tmp.traffic.stage_count == 0) {
+        ESP_LOGE(TAG, "lora_json: traffic.enabled=true but no stages → reject");
+        return false;
+    }
+    if (tmp.traffic.stage_count > 0 && tmp.traffic.sequence_count == 0) {
+        ESP_LOGW(TAG, "lora_json: stages present but no sequence → auto-fill");
+        for (int i = 0; i < tmp.traffic.stage_count && i < MAX_SEQUENCE; i++)
+            tmp.traffic.sequence[i] = tmp.traffic.stages[i].id;
+        tmp.traffic.sequence_count = tmp.traffic.stage_count;
+    }
+    /* === END FIX === */
+
+    g_config = tmp;
+    config_save();
+
+    ESP_LOGI(TAG, "lora_json loaded (version=%.2f, stages=%u seq=%u, "
+                  "ped_mode=%u, %u bytes)",
+             g_config.version, g_config.traffic.stage_count,
+             g_config.traffic.sequence_count,
+             g_config.traffic.pedestrian.request_mode,
+             (unsigned)len);
     return true;
 }

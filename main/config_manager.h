@@ -10,17 +10,11 @@
 #define MAX_PWM_CHANNELS 3
 #define MAX_NAME_LEN     32
 
-/* ============================================================
-   Роль устройства (master/slave)
-   ============================================================ */
 typedef enum {
     DEVICE_ROLE_MASTER = 0,
     DEVICE_ROLE_SLAVE  = 1,
 } device_role_t;
 
-/* ============================================================
-   ESP-NOW
-   ============================================================ */
 typedef struct {
     bool     enabled;
     uint8_t  role;
@@ -29,9 +23,6 @@ typedef struct {
     uint16_t status_period_ms;
 } espnow_config_t;
 
-/* ============================================================
-   PWM канал
-   ============================================================ */
 typedef struct {
     char     name[MAX_NAME_LEN];
     int      gpio;
@@ -69,9 +60,6 @@ typedef struct {
     uint8_t  end_hour,   end_minute;
 } sequential_config_t;
 
-/* ============================================================
-   DD: сигнальные группы
-   ============================================================ */
 #define MAX_SIGNAL_GROUPS   16
 typedef struct {
     uint8_t id;
@@ -80,9 +68,6 @@ typedef struct {
     uint8_t minRed;
 } signal_group_t;
 
-/* ============================================================
-   DD: IGM
-   ============================================================ */
 #define MAX_TRANSITIONS     32
 typedef struct {
     uint8_t  clearing;
@@ -99,9 +84,6 @@ typedef struct {
     uint8_t  item_count;
 } igm_config_t;
 
-/* ============================================================
-   DD: stages (справочно)
-   ============================================================ */
 #define MAX_STAGES          16
 #define MAX_STAGE_GROUPS    4
 typedef struct {
@@ -111,18 +93,12 @@ typedef struct {
     uint8_t group_count;
 } stage_ref_t;
 
-/* ============================================================
-   DD: детекторы
-   ============================================================ */
 #define MAX_DETECTORS       8
 typedef struct {
     uint8_t id;
     char    name[32];
 } detector_ref_t;
 
-/* ============================================================
-   DD: планы
-   ============================================================ */
 #define MAX_PLANS           4
 typedef struct {
     uint8_t id;
@@ -134,9 +110,6 @@ typedef struct {
     bool    coordinated;
 } plan_ref_t;
 
-/* ============================================================
-   DD: расписание
-   ============================================================ */
 #define MAX_SCHEDULE_DAYS   8
 typedef struct {
     uint8_t id;
@@ -156,9 +129,6 @@ typedef struct {
     uint8_t day_count;
 } schedule_config_t;
 
-/* ============================================================
-   DD: controlSources
-   ============================================================ */
 #define MAX_CONTROL_SOURCES 8
 typedef struct {
     uint8_t  id;
@@ -168,9 +138,6 @@ typedef struct {
     char     url[96];
 } control_source_t;
 
-/* ============================================================
-   DD: модули (справочно)
-   ============================================================ */
 #define MAX_KSK1_SWITCHES   32
 typedef struct {
     uint8_t id;
@@ -226,9 +193,6 @@ typedef struct {
     uint8_t           stream_count;
 } modules_config_t;
 
-/* ============================================================
-   DD: тип длительности фазы
-   ============================================================ */
 typedef enum {
     DD_DUR_EXPLICIT     = 0,
     DD_DUR_RED          = 1,
@@ -243,9 +207,6 @@ typedef enum {
 
 #define DD_DURATION_KIND_MAX  9
 
-/* ============================================================
-   DD: этап data-driven сценария
-   ============================================================ */
 #define MAX_DD_STAGES       16
 #define MAX_ON_OUTPUTS      8
 #define MAX_BLINK_OUTPUTS   4
@@ -263,9 +224,6 @@ typedef struct {
     uint8_t  blink_count;
 } traffic_stage_dd_t;
 
-/* ============================================================
-   DD: конфигурация traffic
-   ============================================================ */
 #define MAX_SEQUENCE        16
 #define MAX_OUTPUTS         16
 
@@ -306,20 +264,17 @@ typedef struct {
     uint8_t  vin_off_confirmations;
 } traffic_fault_config_t;
 
-/* ============================================================
-   NEW: PED_BUTTON — конфигурация вызывной кнопки пешехода (P7).
-   ============================================================ */
 typedef enum {
-    PED_REQUEST_MODE_STAGE      = 0,   /* вставить пешеходную фазу следующей */
-    PED_REQUEST_MODE_INSERT     = 1,   /* вставить в текущий цикл (min green) */
-    PED_REQUEST_MODE_MIN_RECALL = 2,   /* гарантировать min зелёный в след. цикле */
+    PED_REQUEST_MODE_STAGE      = 0,
+    PED_REQUEST_MODE_INSERT     = 1,
+    PED_REQUEST_MODE_MIN_RECALL = 2,
 } ped_request_mode_t;
 
 typedef struct {
-    bool     button_enabled;      /* false — вызывной кнопки нет */
-    uint8_t  request_mode;        /* ped_request_mode_t */
-    uint32_t insert_timeout_ms;   /* для INSERT: сколько ждать окна */
-    uint32_t min_recall_s;        /* для MIN_RECALL: минимальный зелёный */
+    bool     button_enabled;
+    uint8_t  request_mode;
+    uint32_t insert_timeout_ms;
+    uint32_t min_recall_s;
 } pedestrian_button_config_t;
 
 typedef struct {
@@ -327,7 +282,7 @@ typedef struct {
     bool     enabled;
     bool     auto_start;
 
-    pedestrian_button_config_t pedestrian;   /* NEW: PED_BUTTON */
+    pedestrian_button_config_t pedestrian;
 
     traffic_pins_config_t   pins;
     traffic_phases_ms_t     phases_ms;
@@ -343,9 +298,6 @@ typedef struct {
     uint8_t                 sequence_count;
 } traffic_config_t;
 
-/* ============================================================
-   Shift register outputs
-   ============================================================ */
 typedef struct {
     uint8_t ch;
     char    name[16];
@@ -357,9 +309,6 @@ typedef struct {
     uint8_t         count;
 } sr_config_t;
 
-/* ============================================================
-   Вся конфигурация устройства
-   ============================================================ */
 typedef struct {
     float version;
     uint32_t id;
@@ -415,5 +364,31 @@ bool config_role_is_locked(void);
 
 esp_err_t      config_save_role(device_role_t role);
 device_role_t  config_load_role(void);
+
+/* ============================================================
+   NEW: короткий JSON только для передачи ROOT → NODE по LoRa.
+   ROOT формирует из g_config (полный хранится в NVS).
+   NODE принимает и применяет.
+
+   Формат (~800 байт vs 3413):
+   {
+     "v": 1.0, "tz": "MSK-3",
+     "t": { "mode":3, "en":true, "auto":true,
+            "pins": { "single":[r,y,g],
+                      "cross":[[r,y,g]×4],
+                      "cross_ped":[[r,y,g]×3, pr, pg] },
+            "ph": [red, red_yellow, green, green_blink, yellow,
+                   yellow_blink, ped_green, ped_blink,
+                   fault_blink, phase_blink],
+            "f": [imin_mv, vin_on, vin_off, grace, recovery, vin_off_conf],
+            "ped": [enabled, mode, insert_timeout, min_recall],
+            "st": [[id, name, groups, dur_kind, dur_ms, on[], blink[]], ...],
+            "seq": [id, ...],
+            "tr": [[clearing, entering, time_ms], ...] },
+     "sr": [ch, ...]    // только active
+   }
+   ============================================================ */
+bool config_export_lora_json(char *buf, size_t *len);
+bool config_load_lora_json(const char *json, size_t len);
 
 #endif

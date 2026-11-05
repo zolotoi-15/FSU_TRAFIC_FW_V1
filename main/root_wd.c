@@ -1,22 +1,38 @@
 /* ============================================================
    root_wd.c — ROOT: CFG на NODE → cfg:ok → START ROOT+NODE.
 
-   === ПОРЯДОК ===
-   1. ROOT в ALL_OFF (mqtt_apply_config_runtime).
-   2. cfg_push_task шлёт CFG на NODE, пока не получит cfg:ok.
-   3. После cfg:ok root_node_watchdog_task:
-      a. отправляет traffic:start на NODE (ПЕРВЫМ)
-      b. запускает traffic_light_start() на ROOT
-      c. отправляет sync: с pm=0
-      d. ставит s_cfg_applied_and_started = true
-   4. phase_sync_task начинает слать sync: только после
-      s_cfg_applied_and_started.
+   === FIX SYNC-PM + SYNC-MASK ===
+       ROOT шлёт sync:ph:pm_target:next:on_mask:blink_mask.
+       pm_target = pm + SYNC_LEAD_MS (pm НА МОМЕНТ применения).
+       on_mask/blink_mask — маски каналов из stage_dd ROOT
+       (через ПУБЛИЧНЫЙ traffic_light_get_stage_masks).
 
-   === FIX ===
-   - traffic:start ПЕРВЫМ, traffic_light_start() ВТОРЫМ.
-   - ping не шлётся, пока !s_cfg_ack (не мешаем CFG).
-   - cfg_push_task: фиксированная задержка 5 с вместо ожидания STATUS.
-   - traffic:start повторяется не более 3 раз.
+       ROOT ждёт SYNC_LEAD_MS после отправки, затем применяет
+       force_phase(pm_target + lag, dur).
+
+       NODE применяет ту же маску через apply_mask().
+
+   === FIX NO-DOUBLE-SYNC ===
+       root_node_watchdog_task re-send traffic:start БЕЗ sync:.
+       Раньше: watchdog слал sync: каждые 2 с пока s_node_running
+               не обновится → ДУБЛИ (sync:ph:300 и sync:ph:600
+               с интервалом 500 мс), pm «прыгал» 600→300→600,
+               фазы не переключались.
+       Теперь: sync: шлёт ТОЛЬКО phase_sync_task (из pending
+               phase_change, force_resync, fallback 30s).
+               Watchdog шлёт только traffic:start.
+
+   === FIX SYNC-ASYNC ===
+       send_sync_to_node_async — только отправка.
+       apply_sync_at_utc — ждёт + применяет.
+
+   === FIX REQUEUE ===
+       При ошибке send_sync pending-фаза возвращается в очередь.
+
+   === FIX ROOT-START-NO-TIME ===
+       traffic:start ВСЕГДА, sync: — только когда time валиден.
+       При отсутствии time: phase_sync_task дошлёт sync: при
+       появлении времени.
    ============================================================ */
 
 #include "root_wd.h"
@@ -37,16 +53,32 @@
 static const char *TAG = "root_wd";
 
 #define ROOT_NODE_CHECK_MS          2000
-#define NODE_COMM_LOST_MS           60000
-#define LORA_SYNC_INTERVAL_MS       1000
+#define NODE_COMM_LOST_MS           20000
+#define LORA_SYNC_INTERVAL_MS       30000
 #define CFG_PUSH_RX_WAIT_MS         3000
-#define SYNC_APPLY_AHEAD_MS         500
 #define CFG_RETRY_PERIOD_MS         10000
 #define NO_CFG_ALL_OFF_MS           (60 * 1000)
-#define TRAFFIC_START_MAX_RETRIES   3
-/* === FIX: фиксированная задержка перед первым CFG === */
+
 #define CFG_INITIAL_DELAY_MS        5000
-/* === END FIX === */
+#define CFG_MAX_ATTEMPTS            10
+#define CFG_RETRY_COOLDOWN_MS       2000
+#define CFG_RESET_ACK_DELAY_MS      500
+#define HEARTBEAT_INTERVAL_MS       10000
+
+#define CFG_LORA_BUF_SIZE           2048
+
+/* === FIX SYNC-PM: SYNC_LEAD_MS = запас на ToA (112) + ack_tx. === */
+#define SYNC_LEAD_MS                300
+#define SYNC_TOA_EST_MS             112
+/* === END FIX SYNC-PM === */
+
+#define TRAFFIC_START_MAX_RETRIES   3
+#define TRAFFIC_START_RETRY_MS      2000
+#define FRESH_STATUS_MS             5000
+
+#define TIME_PUSH_PERIOD_MS         30000
+#define SYNC_PRE_DELAY_MS           50
+#define TIME_PUSH_BEFORE_START_MS   300
 
 extern volatile uint32_t s_last_fault_clear_ms;
 extern volatile uint32_t s_last_node_msg_ms;
@@ -54,35 +86,139 @@ extern volatile bool s_node_running;
 
 volatile bool s_cfg_ack = false;
 volatile bool s_cfg_pushing = false;
-
-/* === Глобальный флаг: CFG применён + traffic:start отправлен === */
 volatile bool s_cfg_applied_and_started = false;
-
-static volatile bool s_follow_root_set = false;
+volatile bool s_cfg_req_pending = false;
+volatile bool s_force_resync_pending = false;
 
 #define SET_REMOTE_FLAG(v) do { s_fault_from_remote_ex = (v); } while (0)
 
-/* === Мгновенный sync: apply_ms = 0 === */
-uint32_t send_sync_to_node(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms)
+extern uint8_t phase_change_take_pending(uint32_t *dur);
+extern void    phase_change_requeue(uint8_t phase, uint32_t dur_ms);
+
+/* ============================================================
+   send_sync_to_node_async — только отправка sync:.
+   Формат: sync:ph:pm_target:next:on_mask:blink_mask
+     ph         — номер фазы (для логов)
+     pm_target  — pm НА МОМЕНТ применения (= pm + lead)
+     next       — следующая фаза
+     on_mask    — 16-битная маска включённых каналов (hex)
+     blink_mask — 16-битная маска мигающих каналов (hex)
+
+   Маски получаются через ПУБЛИЧНЫЙ
+   traffic_light_get_stage_masks() — БЕЗ traffic_internal.h.
+
+   Возвращает:
+     > 0  — apply_ms (момент применения)
+     0    — ошибка/пропуск (pending можно вернуть в очередь)
+   ============================================================ */
+uint32_t send_sync_to_node_async(uint8_t phase, uint32_t phase_ms,
+                                 uint32_t duration_ms,
+                                 uint8_t *out_next_phase)
 {
+    (void)duration_ms;
     if (g_config.role != DEVICE_ROLE_MASTER) return 0;
     if (!transport_is_lora()) return 0;
     if (s_cfg_pushing) return 0;
 
-    char cmd[96];
-    int n = snprintf(cmd, sizeof(cmd), "sync:%u:%lu:%lu:0",
-                     phase,
-                     (unsigned long)phase_ms,
-                     (unsigned long)duration_ms);
-    if (n > 0) {
-        esp_err_t err = transport_send_cmd(cmd, n);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "send_sync: %s failed: %s",
-                     cmd, esp_err_to_name(err));
-            return 0;
-        }
+    if (g_config.traffic.sequence_count == 0) {
+        ESP_LOGW(TAG, "send_sync: sequence_count=0, skip");
+        return 0;
     }
+    if (phase >= g_config.traffic.sequence_count) {
+        ESP_LOGW(TAG, "send_sync: phase=%u >= seq_count=%u, skip",
+                 phase, g_config.traffic.sequence_count);
+        return 0;
+    }
+
+    /* pm_target = pm + SYNC_LEAD_MS (pm НА МОМЕНТ применения) */
+    uint32_t pm_target = phase_ms + SYNC_LEAD_MS;
+    uint8_t next_phase = (phase + 1) % g_config.traffic.sequence_count;
+
+    /* === FIX SYNC-MASK: маски из stage_dd ROOT (публичный геттер) === */
+    uint16_t on_mask = 0;
+    uint16_t blink_mask = 0;
+    traffic_light_get_stage_masks(phase, &on_mask, &blink_mask);
+    /* === END FIX SYNC-MASK === */
+
+    char cmd[80];
+    int n = snprintf(cmd, sizeof(cmd), "sync:%u:%lu:%u:0x%04X:0x%04X",
+                     phase,
+                     (unsigned long)pm_target,
+                     next_phase,
+                     (unsigned)on_mask,
+                     (unsigned)blink_mask);
+    if (n <= 0) return 0;
+
+    ESP_LOGD(TAG, "sync: TX '%s' (pm=%lu + lead=%u = %lu, "
+                  "on=0x%04X blink=0x%04X)",
+             cmd, (unsigned long)phase_ms, SYNC_LEAD_MS,
+             (unsigned long)pm_target,
+             (unsigned)on_mask, (unsigned)blink_mask);
+
+    esp_err_t err = transport_send_cmd(cmd, n);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "send_sync: %s failed: %s", cmd, esp_err_to_name(err));
+        return 0;
+    }
+
+    if (out_next_phase) *out_next_phase = next_phase;
+
+    /* apply_ms — момент применения. esp_timer — монотонный. */
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t apply_ms = now_ms + SYNC_LEAD_MS;
+
+    ESP_LOGI(TAG, "sync: ph=%u pm_target=%lu apply_ms=%lu next=%u "
+                  "on=0x%04X blink=0x%04X",
+             phase, (unsigned long)pm_target,
+             (unsigned long)apply_ms, next_phase,
+             (unsigned)on_mask, (unsigned)blink_mask);
+
+    return apply_ms;
+}
+
+/* ============================================================
+   apply_sync_at_utc — ждём apply_ms, применяем force_phase.
+   На ROOT force_phase использует stage_dd ROOT — это нормально,
+   ROOT — источник правды. NODE применяет ту же маску через
+   apply_mask() (в node_proto.c).
+   ============================================================ */
+uint32_t apply_sync_at_utc(uint8_t phase, uint32_t phase_ms,
+                           uint32_t duration_ms, uint32_t apply_ms)
+{
+    if (apply_ms == 0) return 0;
+
+    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    int32_t wait_ms = (int32_t)(apply_ms - now_ms);
+    if (wait_ms > 2000) {
+        ESP_LOGW(TAG, "apply_sync: wait_ms=%ld > 2000 → clamp", (long)wait_ms);
+        wait_ms = 2000;
+    }
+    if (wait_ms > 0) vTaskDelay(pdMS_TO_TICKS(wait_ms));
+
+    now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    int32_t lag = (int32_t)(now_ms - apply_ms);
+    if (lag < 0) lag = 0;
+
+    uint32_t pm_target = phase_ms + SYNC_LEAD_MS;
+    uint32_t pm_apply = pm_target + (uint32_t)lag;
+    if (duration_ms > 0 && pm_apply >= duration_ms) pm_apply = duration_ms - 1;
+
+    traffic_light_force_phase(phase, pm_apply, duration_ms);
+
+    ESP_LOGI(TAG, "sync applied (ROOT): ph=%u pm=%lu lag=%ld dur=%lu",
+             phase, (unsigned long)pm_apply, (long)lag,
+             (unsigned long)duration_ms);
     return 1;
+}
+
+/* Синхронная обёртка (для watchdog / fallback 30s) */
+uint32_t send_sync_to_node(uint8_t phase, uint32_t phase_ms,
+                           uint32_t duration_ms)
+{
+    uint32_t apply_ms = send_sync_to_node_async(phase, phase_ms,
+                                                duration_ms, NULL);
+    if (apply_ms == 0) return 0;
+    return apply_sync_at_utc(phase, phase_ms, duration_ms, apply_ms);
 }
 
 void apply_sync_at(uint8_t phase, uint32_t phase_ms,
@@ -93,23 +229,24 @@ void apply_sync_at(uint8_t phase, uint32_t phase_ms,
 }
 
 /* ============================================================
-   root_node_watchdog_task — ROOT: ждёт cfg:ok,
-   затем шлёт traffic:start на NODE ПЕРВЫМ,
-   запускает traffic_light_start() на ROOT,
-   шлёт sync:, ставит s_cfg_applied_and_started.
+   root_node_watchdog_task
+   === FIX NO-DOUBLE-SYNC ===
+       Watchdog НЕ шлёт sync: при re-send traffic:start.
+       sync: шлёт ТОЛЬКО phase_sync_task (из pending phase_change,
+       force_resync, fallback 30s). Иначе — ДУБЛИ: sync:ph:300
+       и sync:ph:600 с интервалом 500 мс, pm «прыгает»
+       600→300→600, фазы не переключаются.
    ============================================================ */
 static void root_node_watchdog_task(void *arg)
 {
-    ESP_LOGI(TAG, "root_node_watchdog_task started");
-
+    ESP_LOGI(TAG, "root_node_watchdog_task started (SYNC-MASK, lead=%d ms, "
+                  "NO-DOUBLE-SYNC)", SYNC_LEAD_MS);
     bool     was_connected = false;
     uint32_t lost_since_ms = 0;
     bool     in_comm_lost_all_off = false;
     uint32_t boot_ms = (uint32_t)(esp_timer_get_time() / 1000);
-
     uint32_t node_seen_ms = 0;
     bool     no_cfg_all_off = false;
-
     uint32_t last_start_ms = 0;
     uint32_t start_retry_count = 0;
 
@@ -130,51 +267,55 @@ static void root_node_watchdog_task(void *arg)
 
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
         bool has_node = false;
+
         if (transport_is_lora() && s_last_node_msg_ms != 0) {
-            has_node = (now - s_last_node_msg_ms) < NODE_COMM_LOST_MS;
+            has_node = !link_monitor_root_lost();
         }
-        if (s_cfg_pushing) {
-            has_node = true;
-        }
+        if (s_cfg_pushing) has_node = true;
 
         if (has_node && node_seen_ms == 0) {
             node_seen_ms = now;
         }
-        if (s_cfg_ack) {
-            no_cfg_all_off = false;
-        }
+        if (s_cfg_ack) no_cfg_all_off = false;
 
-        /* === ЗАПУСК: cfg:ok + NODE на связи → один раз === */
         if (s_cfg_ack && has_node && !s_cfg_applied_and_started) {
             ESP_LOGW(TAG, "cfg:ok + NODE present → START на ROOT и NODE");
 
-            /* 1. Снять ALL_OFF на ROOT (без START) */
             if (traffic_light_get_fault() == TRAFFIC_FAULT_ALL_OFF) {
                 SET_REMOTE_FLAG(true);
                 traffic_light_set_fault(TRAFFIC_FAULT_NONE);
                 SET_REMOTE_FLAG(false);
             }
 
-            /* 2. traffic:start на NODE — ПЕРВЫМ */
-            transport_send_cmd("traffic:start", strlen("traffic:start"));
-
-            /* 3. Запустить traffic на ROOT */
-            traffic_light_set_follow_root(true);
-            traffic_light_start();
-
-            /* 4. sync: с pm=0 */
-            if (traffic_light_get_state() == TRAFFIC_STATE_RUNNING) {
-                uint8_t phase = traffic_light_get_phase();
-                uint32_t dur = traffic_light_get_phase_duration_ms();
-                send_sync_to_node(phase, 0, dur);
-                traffic_light_force_phase(phase, 0, dur);
+            /* time: первым, если валиден */
+            uint32_t utc_sec = 0; uint16_t utc_ms = 0;
+            bool time_ok = time_sync_get(&utc_sec, &utc_ms);
+            if (time_ok) {
+                time_sync_root_push_force(0);
+                vTaskDelay(pdMS_TO_TICKS(TIME_PUSH_BEFORE_START_MS));
+                ESP_LOGI(TAG, "ROOT: time: pushed → starting traffic");
+            } else {
+                ESP_LOGW(TAG, "ROOT: no valid time yet → traffic:start "
+                              "без time: (sync: отложен)");
             }
 
-            time_sync_root_push(0);
+            /* traffic:start — ВСЕГДА */
+            transport_send_cmd("traffic:start", strlen("traffic:start"));
 
-            /* 5. Разрешаем phase_sync_task слать sync: */
+            traffic_light_set_follow_root(false);
+            traffic_light_start();
+
+            /* sync: с pm=0 сразу после старта, если time валиден.
+               Если time нет — phase_sync_task дошлёт при появлении. */
+            if (time_ok) {
+                if (traffic_light_get_state() == TRAFFIC_STATE_RUNNING) {
+                    uint8_t phase = traffic_light_get_phase();
+                    uint32_t dur = traffic_light_get_phase_duration_ms();
+                    send_sync_to_node(phase, 0, dur);
+                }
+            }
+
             s_cfg_applied_and_started = true;
-
             was_connected = true;
             lost_since_ms = 0;
             in_comm_lost_all_off = false;
@@ -183,21 +324,32 @@ static void root_node_watchdog_task(void *arg)
             wifi_mqtt_reset_node_fault_tracking();
             wifi_mqtt_set_root_comm_lost(false);
 
-            ESP_LOGI(TAG, "ROOT: cfg applied + traffic:start + sync: sent");
+            ESP_LOGI(TAG, "ROOT: cfg applied + traffic:start%s",
+                     time_ok ? " + sync:" : " (sync: deferred)");
         }
 
-        /* === Повтор traffic:start, пока NODE не RUNNING (не более 3 раз) === */
         if (s_cfg_applied_and_started && has_node && !s_node_running) {
+            bool fresh_status = (s_last_node_msg_ms != 0) &&
+                                ((now - s_last_node_msg_ms) < FRESH_STATUS_MS);
+            if (!fresh_status) {
+                vTaskDelay(pdMS_TO_TICKS(ROOT_NODE_CHECK_MS));
+                continue;
+            }
             if (start_retry_count < TRAFFIC_START_MAX_RETRIES &&
-                (now - last_start_ms) >= 2000) {
-                ESP_LOGI(TAG, "ROOT: NODE not RUNNING → re-send traffic:start (%u/%u)",
+                (now - last_start_ms) >= TRAFFIC_START_RETRY_MS) {
+                ESP_LOGI(TAG, "ROOT: NODE not RUNNING → re-send traffic:start "
+                              "(%u/%u) — БЕЗ sync: (NO-DOUBLE-SYNC)",
                          start_retry_count + 1, TRAFFIC_START_MAX_RETRIES);
                 transport_send_cmd("traffic:start", strlen("traffic:start"));
                 last_start_ms = now;
                 start_retry_count++;
+                /* === FIX NO-DOUBLE-SYNC ===
+                   НЕ шлём sync: — phase_sync_task дошлёт из pending
+                   или fallback (30 с). Иначе — ДУБЛИ sync: каждые
+                   2 с: sync:ph:300 и sync:ph:600, pm «прыгает»
+                   600→300→600, фазы не переключаются. === */
             } else if (start_retry_count >= TRAFFIC_START_MAX_RETRIES) {
-                ESP_LOGW(TAG, "ROOT: traffic:start retries exhausted (%u), "
-                              "waiting for STATUS RUNNING",
+                ESP_LOGW(TAG, "ROOT: traffic:start retries exhausted (%u)",
                          TRAFFIC_START_MAX_RETRIES);
                 start_retry_count = TRAFFIC_START_MAX_RETRIES + 1;
             }
@@ -213,7 +365,7 @@ static void root_node_watchdog_task(void *arg)
         }
 
         if (!has_node && was_connected) {
-            ESP_LOGW(TAG, "ROOT: NODE lost on LoRa → STOP + ALL_OFF");
+            ESP_LOGW(TAG, "ROOT: NODE lost → STOP + ALL_OFF");
             traffic_light_stop();
             SET_REMOTE_FLAG(true);
             traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
@@ -221,6 +373,8 @@ static void root_node_watchdog_task(void *arg)
             transport_send_cmd("traffic:stop", strlen("traffic:stop"));
             was_connected = false;
             lost_since_ms = now;
+            s_cfg_applied_and_started = false;
+            s_cfg_ack = false;
             start_retry_count = 0;
         }
 
@@ -232,7 +386,6 @@ static void root_node_watchdog_task(void *arg)
             SET_REMOTE_FLAG(true);
             traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
             SET_REMOTE_FLAG(false);
-            wifi_mqtt_set_root_comm_lost(true);
             no_cfg_all_off = true;
         }
 
@@ -260,76 +413,134 @@ static void root_node_watchdog_task(void *arg)
 }
 
 /* ============================================================
-   phase_sync_task — ROOT шлёт sync: при смене фазы,
-   но только если s_cfg_applied_and_started == true.
+   phase_sync_task
+   ЕДИНСТВЕННЫЙ источник sync: на ROOT.
+
+   === FIX SYNC-MASK: pm в пакете = pm_target (pm + lead),
+       on_mask/blink_mask — из stage_dd ROOT (публичный геттер).
+
+   === FIX NO-DOUBLE-SYNC: sync: шлётся ТОЛЬКО отсюда:
+       1) первый sync после старта, когда появится time:
+       2) phase_change из fault_handler.c (P7-sync)
+       3) force_resync_pending (NODE перезапустился)
+       4) fallback 30 с (если фаза не менялась)
    ============================================================ */
 static void phase_sync_task(void *arg)
 {
-    ESP_LOGI(TAG, "phase_sync_task started (instant sync)");
+    ESP_LOGI(TAG, "phase_sync_task started (SYNC-MASK, lead=%d ms, "
+                  "NO-DOUBLE-SYNC)", SYNC_LEAD_MS);
 
-    if (!s_follow_root_set) {
-        traffic_light_set_follow_root(true);
-        s_follow_root_set = true;
-    }
-
-    uint8_t  last_phase  = 0xFF;
-    uint32_t last_ms     = 0;
+    uint32_t last_ms = 0;
+    uint32_t last_time_push_ms = 0;
+    bool     time_pushed_since_start = false;
 
     while (1) {
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+
         if (g_config.role == DEVICE_ROLE_MASTER) {
-            if (s_cfg_pushing) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                continue;
-            }
-            if (!s_cfg_ack) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                continue;
-            }
-            /* не шлём sync:, пока root_wd не отправил traffic:start */
-            if (!s_cfg_applied_and_started) {
+            if (s_cfg_pushing || !s_cfg_ack || !s_cfg_applied_and_started) {
                 vTaskDelay(pdMS_TO_TICKS(100));
                 continue;
             }
 
             traffic_state_t st = traffic_light_get_state();
-            uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
             bool in_all_off = (traffic_light_get_fault() == TRAFFIC_FAULT_ALL_OFF);
             bool has_node = transport_is_lora() && s_last_node_msg_ms != 0 &&
-                            (now - s_last_node_msg_ms) < NODE_COMM_LOST_MS;
+                            !link_monitor_root_lost();
             if (s_cfg_pushing) has_node = true;
 
-            if (has_node && st == TRAFFIC_STATE_RUNNING && !in_all_off) {
-                uint8_t  phase = traffic_light_get_phase();
-                uint32_t dur   = traffic_light_get_phase_duration_ms();
-                uint32_t pm    = traffic_light_get_phase_ms();
-
-                bool phase_changed = (phase != last_phase);
-                bool fallback      = (now - last_ms >= LORA_SYNC_INTERVAL_MS);
-
-                if (phase_changed || fallback) {
-                    uint32_t pm_send = pm;
-                    if (dur > 0 && pm_send >= dur) pm_send = 0;
-
-                    uint32_t r = send_sync_to_node(phase, pm_send, dur);
-                    if (r != 0) {
-                        traffic_light_force_phase(phase, pm_send, dur);
+            /* 1) Первый sync после старта, как только появится время */
+            if (has_node && st == TRAFFIC_STATE_RUNNING && !in_all_off &&
+                !time_pushed_since_start) {
+                uint32_t ts = 0; uint16_t tm = 0;
+                if (time_sync_get(&ts, &tm)) {
+                    time_pushed_since_start = true;
+                    last_time_push_ms = now;
+                    time_sync_root_push_force(0);
+                    ESP_LOGI(TAG, "phase_sync: first time: pushed → "
+                                  "sync:current phase now");
+                    uint8_t phase = traffic_light_get_phase();
+                    uint32_t dur = traffic_light_get_phase_duration_ms();
+                    uint32_t pm  = traffic_light_get_phase_ms();
+                    uint32_t apply_ms = send_sync_to_node_async(
+                        phase, pm, dur, NULL);
+                    if (apply_ms != 0) {
+                        apply_sync_at_utc(phase, pm, dur, apply_ms);
                     }
-                    last_phase = phase;
-                    last_ms    = now;
                 }
             }
+
+            /* time: периодически */
+            if (has_node && st == TRAFFIC_STATE_RUNNING && !in_all_off &&
+                time_pushed_since_start) {
+                if (last_time_push_ms == 0 ||
+                    (now - last_time_push_ms) >= TIME_PUSH_PERIOD_MS) {
+                    last_time_push_ms = now;
+                    time_sync_root_push(0);
+                }
+            }
+
+            /* 2) phase_change из fault_handler.c (P7-sync) */
+            if (has_node && st == TRAFFIC_STATE_RUNNING && !in_all_off) {
+                uint32_t dur_pending = 0;
+                uint8_t ph_pending = phase_change_take_pending(&dur_pending);
+                if (ph_pending != 0xFF) {
+                    vTaskDelay(pdMS_TO_TICKS(SYNC_PRE_DELAY_MS));
+
+                    uint32_t apply_ms = send_sync_to_node_async(
+                        ph_pending, 0, dur_pending, NULL);
+                    if (apply_ms == 0) {
+                        ESP_LOGW(TAG, "phase_change → sync:%u TX failed, "
+                                      "re-queue", ph_pending);
+                        phase_change_requeue(ph_pending, dur_pending);
+                    } else {
+                        vTaskDelay(pdMS_TO_TICKS(SYNC_LEAD_MS));
+                        apply_sync_at_utc(ph_pending, 0, dur_pending, apply_ms);
+                        ESP_LOGI(TAG, "phase_change → sync:%u:lead:%lu (r=1)",
+                                 ph_pending, (unsigned long)dur_pending);
+                    }
+                    last_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                }
+            }
+
+            /* 3) force_resync_pending (NODE перезапустился) */
+            if (s_force_resync_pending) {
+                s_force_resync_pending = false;
+                if (traffic_light_get_state() == TRAFFIC_STATE_RUNNING) {
+                    uint8_t phase = traffic_light_get_phase();
+                    uint32_t dur = traffic_light_get_phase_duration_ms();
+                    uint32_t pm  = traffic_light_get_phase_ms();
+                    ESP_LOGW(TAG, "force resync: phase=%u pm=%lu dur=%lu",
+                             phase, (unsigned long)pm, (unsigned long)dur);
+                    send_sync_to_node(phase, pm, dur);
+                    last_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                }
+            }
+
+            /* 4) fallback (30 с) — если фаза не менялась */
+            if (has_node && st == TRAFFIC_STATE_RUNNING && !in_all_off) {
+                if (last_ms != 0 && (now - last_ms >= LORA_SYNC_INTERVAL_MS)) {
+                    uint8_t  phase = traffic_light_get_phase();
+                    uint32_t dur   = traffic_light_get_phase_duration_ms();
+                    uint32_t pm    = traffic_light_get_phase_ms();
+                    vTaskDelay(pdMS_TO_TICKS(SYNC_PRE_DELAY_MS));
+                    send_sync_to_node(phase, pm, dur);
+                    last_ms = (uint32_t)(esp_timer_get_time() / 1000);
+                }
+            }
+        } else {
+            time_pushed_since_start = false;
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }
 
 /* ============================================================
-   cfg_push_task — ROOT шлёт CFG на NODE, пока не получит cfg:ok.
-   === FIX: фиксированная задержка 5 с вместо ожидания STATUS ===
+   cfg_push_task
    ============================================================ */
 static void cfg_push_task(void *arg)
 {
-    ESP_LOGI(TAG, "cfg_push_task started (continuous retry)");
+    ESP_LOGI(TAG, "cfg_push_task started (short JSON for LoRa)");
 
     uint32_t waited = 0;
     while (!transport_is_lora() && waited < 10000) {
@@ -340,43 +551,59 @@ static void cfg_push_task(void *arg)
         ESP_LOGE(TAG, "cfg_push: LoRa not ready");
     }
 
-    /* === FIX: фиксированная задержка 5 с — NODE успевает поднять LoRa === */
-    ESP_LOGI(TAG, "cfg_push: initial delay %d ms before first CFG",
-             CFG_INITIAL_DELAY_MS);
+    ESP_LOGI(TAG, "cfg_push: wait for cfg:req from NODE");
     vTaskDelay(pdMS_TO_TICKS(CFG_INITIAL_DELAY_MS));
-    /* === END FIX === */
 
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(CFG_RETRY_PERIOD_MS));
-
-        if (g_config.role != DEVICE_ROLE_MASTER) continue;
-        if (!transport_is_lora()) continue;
-        if (s_cfg_pushing) continue;
-        if (s_cfg_ack) continue;
-
-        ESP_LOGI(TAG, "cfg_push: retry (s_cfg_ack=false)");
-
-        extern bool config_export_json(char *b, size_t *l);
-        char *buf = malloc(8192);
-        size_t blen = 8192;
-        if (!buf || !config_export_json(buf, &blen)) {
-            free(buf);
+        if (g_config.role != DEVICE_ROLE_MASTER) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        if (!transport_is_lora()) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        if (s_cfg_pushing) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        if (s_cfg_ack) {
+            vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
 
-        s_cfg_pushing = true;
+        if (!s_cfg_req_pending) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+        s_cfg_req_pending = false;
+        ESP_LOGI(TAG, "cfg_push: cfg:req from NODE → start push");
 
+        extern bool config_export_lora_json(char *b, size_t *l);
+        char *buf = malloc(CFG_LORA_BUF_SIZE);
+        size_t blen = CFG_LORA_BUF_SIZE;
+        if (!buf || !config_export_lora_json(buf, &blen)) {
+            ESP_LOGE(TAG, "cfg_push: short JSON export failed");
+            if (buf) free(buf);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        ESP_LOGI(TAG, "cfg_push: short JSON ready (%u bytes)", (unsigned)blen);
+
+        s_cfg_pushing = true;
         vTaskDelay(pdMS_TO_TICKS(CFG_PUSH_RX_WAIT_MS));
 
-        for (int attempt = 0; attempt < 10; attempt++) {
+        for (int attempt = 0; attempt < CFG_MAX_ATTEMPTS; attempt++) {
             if (s_cfg_ack) break;
 
             transport_send_cmd("cfg:reset", strlen("cfg:reset"));
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(CFG_RESET_ACK_DELAY_MS));
 
-            ESP_LOGI(TAG, "cfg_push → LoRa attempt %d/10 (%u bytes)",
-                     attempt + 1, (unsigned)blen);
+            ESP_LOGI(TAG, "cfg_push → LoRa attempt %d/%d (%u bytes)",
+                     attempt + 1, CFG_MAX_ATTEMPTS, (unsigned)blen);
+
             esp_err_t err = transport_send_cfg(buf, blen);
+
             if (err == ESP_OK) {
                 for (int w = 0; w < 50; w++) {
                     if (s_cfg_ack) break;
@@ -386,28 +613,56 @@ static void cfg_push_task(void *arg)
                     ESP_LOGI(TAG, "cfg_push: cfg:ok received");
                     break;
                 }
+                ESP_LOGW(TAG, "cfg_push: TX OK but no cfg:ok within 5s");
             } else {
                 ESP_LOGW(TAG, "cfg_push: failed (attempt %d): %s",
                          attempt + 1, esp_err_to_name(err));
             }
-            vTaskDelay(pdMS_TO_TICKS(10000));
+
+            if (attempt < CFG_MAX_ATTEMPTS - 1) {
+                vTaskDelay(pdMS_TO_TICKS(CFG_RETRY_COOLDOWN_MS));
+            }
         }
 
         s_cfg_pushing = false;
         free(buf);
 
         if (s_cfg_ack) {
-            ESP_LOGI(TAG, "cfg_push: success — wait %d ms before next check",
-                     CFG_RETRY_PERIOD_MS);
+            vTaskDelay(pdMS_TO_TICKS(500));
         } else {
-            ESP_LOGE(TAG, "cfg_push: NODE did not confirm cfg after 10 attempts");
+            ESP_LOGE(TAG, "cfg_push: NODE did not confirm cfg after %d attempts",
+                     CFG_MAX_ATTEMPTS);
+            vTaskDelay(pdMS_TO_TICKS(2000));
+        }
+    }
+}
+
+/* ============================================================
+   root_heartbeat_task
+   ============================================================ */
+static void root_heartbeat_task(void *arg)
+{
+    ESP_LOGI(TAG, "root_heartbeat_task started (periodic ping every %d ms)",
+             HEARTBEAT_INTERVAL_MS);
+    vTaskDelay(pdMS_TO_TICKS(CFG_INITIAL_DELAY_MS));
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_INTERVAL_MS));
+        if (g_config.role != DEVICE_ROLE_MASTER) continue;
+        if (!transport_is_lora()) continue;
+        if (s_cfg_pushing) continue;
+        esp_err_t err = transport_send_cmd("ping", 4);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "ROOT: heartbeat ping failed: %s", esp_err_to_name(err));
         }
     }
 }
 
 void root_wd_start_tasks(void)
 {
-    xTaskCreate(phase_sync_task,          "phase_sync",   4096, NULL, 4, NULL);
-    xTaskCreate(root_node_watchdog_task,  "root_node_wd", 8192, NULL, 3, NULL);
-    xTaskCreate(cfg_push_task,            "cfg_push",     8192, NULL, 3, NULL);
+    ESP_LOGI(TAG, "Starting ROOT watchdog tasks (SYNC-MASK, lead=%d ms, "
+                  "NO-DOUBLE-SYNC)...", SYNC_LEAD_MS);
+    xTaskCreate(phase_sync_task,          "phase_sync",    4096, NULL, 4, NULL);
+    xTaskCreate(root_node_watchdog_task,  "root_node_wd",  8192, NULL, 3, NULL);
+    xTaskCreate(cfg_push_task,            "cfg_push",      8192, NULL, 3, NULL);
+    xTaskCreate(root_heartbeat_task,      "root_hb",       3072, NULL, 3, NULL);
 }

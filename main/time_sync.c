@@ -1,7 +1,6 @@
 #include "time_sync.h"
 #include "config_manager.h"
-#include "wifi_ap.h"
-#include "node_link.h"
+#include "transport.h"
 #include "ds1307.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -24,13 +23,17 @@ static volatile int64_t  s_t0_us    = 0;
 static volatile bool     s_valid    = false;
 static SemaphoreHandle_t s_mtx      = NULL;
 
+/* === FIX #3a: дельта ROOT/NODE по последнему sync: === */
+static volatile int32_t  s_last_delta_ms = 0;
+static volatile uint32_t s_last_delta_update_ms = 0;
+/* === END FIX #3a === */
+
 #define TIME_SYNC_PUSH_PERIOD_MS   30000
 #define TIME_SYNC_REPORT_PERIOD_MS 5000
 
 static uint32_t s_last_push_ms   = 0;
 static uint32_t s_last_report_ms = 0;
 
-/* FIX: picolibc (CONFIG_LIBC_PICOLIBC=y) не имеет timegm(). */
 static time_t timegm_compat(const struct tm *tm)
 {
     static const int mdays[] = {0,31,59,90,120,151,181,212,243,273,304,334};
@@ -132,6 +135,28 @@ void time_sync_set(uint32_t unix_sec, uint16_t ms, uint32_t rtt_us)
     set_base(unix_sec, ms, rtt_us);
 }
 
+/* === FIX #3a: дельта ROOT/NODE === */
+void time_sync_note_delta_ms(int32_t delta_ms)
+{
+    s_last_delta_ms = delta_ms;
+    s_last_delta_update_ms = now_ms_tick();
+    ESP_LOGI(TAG, "delta noted: %ld ms", (long)delta_ms);
+}
+
+int32_t time_sync_get_delta_ms(void)
+{
+    return s_last_delta_ms;
+}
+
+uint32_t time_sync_get_delta_age_ms(void)
+{
+    if (s_last_delta_update_ms == 0) return 0;
+    uint32_t now = now_ms_tick();
+    if (now < s_last_delta_update_ms) return 0;
+    return now - s_last_delta_update_ms;
+}
+/* === END FIX #3a === */
+
 static void sntp_sync_cb(struct timeval *tv)
 {
     if (!tv) return;
@@ -153,21 +178,22 @@ esp_err_t time_sync_start_sntp(void)
     return ESP_OK;
 }
 
-void time_sync_root_push(uint32_t rtt_us)
+/* ============================================================
+   time_sync_root_push_ex — внутренняя реализация с флагом force.
+   force=true обходит 30-секундный троттлинг.
+   ============================================================ */
+static void time_sync_root_push_ex(uint32_t rtt_us, bool force)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) return;
-    if (!node_link_server_has_client()) return;
+    if (!transport_is_lora()) return;
 
-    /* FIX: throttle ДО проверки s_valid — иначе при !s_valid
-       s_last_push_ms не обновляется и warning спамит каждые
-       100 мс (phase_sync_task). */
     uint32_t now = now_ms_tick();
-    if (s_last_push_ms != 0 && (now - s_last_push_ms) < TIME_SYNC_PUSH_PERIOD_MS)
+    if (!force && s_last_push_ms != 0 &&
+        (now - s_last_push_ms) < TIME_SYNC_PUSH_PERIOD_MS)
         return;
     s_last_push_ms = now;
 
     if (!s_valid) {
-        /* FIX: DEBUG, а не WARN — не засоряем лог. */
         ESP_LOGD(TAG, "root push: time not valid yet (no RTC/SNTP)");
         return;
     }
@@ -180,15 +206,29 @@ void time_sync_root_push(uint32_t rtt_us)
                      (unsigned long)sec, (unsigned)ms,
                      (unsigned long)rtt_us);
     if (n > 0) {
-        node_link_server_send_cmd(cmd, n);
-        ESP_LOGD(TAG, "→ node: %s", cmd);
+        esp_err_t err = transport_send_cmd(cmd, n);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "time_sync_root_push: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGD(TAG, "→ node: %s", cmd);
+        }
     }
+}
+
+void time_sync_root_push(uint32_t rtt_us)
+{
+    time_sync_root_push_ex(rtt_us, false);
+}
+
+void time_sync_root_push_force(uint32_t rtt_us)
+{
+    time_sync_root_push_ex(rtt_us, true);
 }
 
 void time_sync_node_report(void)
 {
     if (g_config.role != DEVICE_ROLE_SLAVE) return;
-    if (!node_link_client_connected()) return;
+    if (!transport_is_lora()) return;
 
     uint32_t now = now_ms_tick();
     if (s_last_report_ms != 0 && (now - s_last_report_ms) < TIME_SYNC_REPORT_PERIOD_MS)
@@ -203,5 +243,10 @@ void time_sync_node_report(void)
     int n = snprintf(evt, sizeof(evt), "time:%lu:%u:%lu",
                      (unsigned long)sec, (unsigned)ms,
                      (unsigned long)now_ms_tick());
-    if (n > 0) node_link_client_send_evt(evt, n);
+    if (n > 0) {
+        esp_err_t err = transport_send_evt(evt, n);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "time_sync_node_report: %s", esp_err_to_name(err));
+        }
+    }
 }

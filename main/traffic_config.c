@@ -1,6 +1,10 @@
 /* ============================================================
    traffic_config.c — data-driven helpers.
-   Стадии, длительности, next_phase_smooth_ped, apply_stage_dd.
+
+   === FIX #9: expected_sr_mask переименована в stage_sr_mask
+   (семантика: маска всех выходов фазы, включая blink) ===
+   === FIX #14: ESP_LOGI в apply_stage_dd → ESP_LOGD
+   (чтобы не засорять лог при try_recovery) ===
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -14,9 +18,6 @@
 
 static const char *TAG = "traffic_cfg";
 
-/* ------------------------------------------------------------ */
-/* find_stage / stage_is_*                                      */
-/* ------------------------------------------------------------ */
 const traffic_stage_dd_t *find_stage(uint8_t id)
 {
     for (int i = 0; i < g_config.traffic.stage_count; i++) {
@@ -48,9 +49,6 @@ bool stage_is_transport_green(uint8_t seq_idx)
     return false;
 }
 
-/* ------------------------------------------------------------ */
-/* next_phase_smooth_ped — ищем ближайший group 7 (ped_green).  */
-/* ------------------------------------------------------------ */
 uint8_t next_phase_smooth_ped(uint8_t cur_seq)
 {
     if (cur_seq >= g_config.traffic.sequence_count) return 0;
@@ -66,9 +64,6 @@ uint8_t next_phase_smooth_ped(uint8_t cur_seq)
     return (cur_seq + 1) % g_config.traffic.sequence_count;
 }
 
-/* ------------------------------------------------------------ */
-/* stage_duration_ms / effective_stage_duration_ms              */
-/* ------------------------------------------------------------ */
 uint32_t stage_duration_ms(uint8_t seq_idx)
 {
     if (seq_idx >= g_config.traffic.sequence_count) return 1000;
@@ -99,9 +94,6 @@ uint32_t effective_stage_duration_ms(uint8_t seq_idx)
     return dur;
 }
 
-/* ------------------------------------------------------------ */
-/* SR-маски                                                     */
-/* ------------------------------------------------------------ */
 uint16_t traffic_light_active_sr_mask_internal(void)
 {
     uint16_t m = 0;
@@ -114,7 +106,9 @@ uint16_t traffic_light_active_sr_mask_internal(void)
     return m;
 }
 
-uint16_t traffic_light_expected_sr_mask_internal(void)
+/* === FIX #9: переименовано в stage_sr_mask_internal
+   (семантика: ВСЕ выходы фазы, включая blink) === */
+uint16_t traffic_light_stage_sr_mask_internal(void)
 {
     if (g_config.traffic.sequence_count == 0) return 0;
     const traffic_stage_dd_t *st = find_stage(g_config.traffic.sequence[s_phase]);
@@ -125,9 +119,14 @@ uint16_t traffic_light_expected_sr_mask_internal(void)
     return m;
 }
 
-/* ------------------------------------------------------------ */
-/* set_all_off / apply_stage_dd                                 */
-/* ------------------------------------------------------------ */
+/* Backward-compat alias для существующего кода (traffic_fault.c).
+   Семантика: все выходы фазы (on + blink). */
+uint16_t traffic_light_expected_sr_mask_internal(void)
+{
+    return traffic_light_stage_sr_mask_internal();
+}
+/* === END FIX #9 === */
+
 void set_all_off(void)
 {
     for (int i = 0; i < 16; i++) sr_output_off(i);
@@ -160,11 +159,13 @@ void apply_stage_dd(uint8_t seq_idx)
     s_blink_last_phase = 0;
 
     uint32_t dur = stage_duration_ms(seq_idx);
-    ESP_LOGI(TAG, "Stage → %u (%s) kind=%u dur=%lu on=%u blink=%u%s",
+    /* === FIX #14: LOGD вместо LOGI — не засоряем лог при recovery === */
+    ESP_LOGD(TAG, "Stage → %u (%s) kind=%u dur=%lu on=%u blink=%u%s",
              st->id, st->name, st->duration_kind,
              (unsigned long)dur,
              st->on_count, st->blink_count,
              stage_is_pedestrian(seq_idx) ? " (PED)" : "");
+    /* === END FIX #14 === */
 
     if (!s_follow_root && s_phase_change_cb) {
         s_phase_change_cb(seq_idx, dur);

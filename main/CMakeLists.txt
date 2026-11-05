@@ -11,7 +11,7 @@ idf_component_register(
         "connectivity.c"
         "i2c_bus.c"
         "pi4ioe5v6408.c"
-        "lora.cpp"
+        "lora.cpp"        
         "transport.c"
         "mux.c"
         "shift_register.c"
@@ -24,6 +24,7 @@ idf_component_register(
         "rs485.c"
         "can_bus.c"
         "time_sync.c"
+        "wifi_ap_stub.c"
     INCLUDE_DIRS "." "include"
     REQUIRES
         driver esp_driver_gpio esp_driver_uart esp_driver_spi

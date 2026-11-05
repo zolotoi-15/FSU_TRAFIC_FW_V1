@@ -15,7 +15,7 @@ bool      transport_is_tcp(void);
 
 esp_err_t transport_send_cmd(const char *cmd, size_t len);
 esp_err_t transport_send_cfg(const char *json, size_t len);
-esp_err_t transport_send_status(const char *json, size_t len);   /* только NODE */
+esp_err_t transport_send_status(const char *json, size_t len);
 esp_err_t transport_send_evt(const char *evt, size_t len);
 
 void transport_set_cmd_cb(transport_rx_cb_t cb);
@@ -26,11 +26,16 @@ void transport_set_evt_cb(transport_rx_cb_t cb);
 void transport_force_lora(void);
 void transport_force_tcp(void);
 
+/* Сброс accum_cfg на приёмнике (по cfg:reset) */
 void transport_reset_cfg_accum(void);
 
-/* === FIX: NODE приостанавливает STATUS во время приёма CFG === */
+/* NODE приостанавливает STATUS во время приёма CFG.
+   === FIX: учитывает s_cfg_expected (после cfg:reset) === */
 bool transport_is_cfg_rx_in_progress(void);
 bool transport_is_tx_idle(void);
+
+/* === FIX: сброс флага ожидания CFG после успешного приёма === */
+void transport_clear_cfg_expected(void);
 
 #ifdef __cplusplus
 }
