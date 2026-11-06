@@ -270,14 +270,13 @@ typedef enum {
     PED_REQUEST_MODE_MIN_RECALL = 2,
 } ped_request_mode_t;
 
-/* === NEW: hold/insert === */
 #define MAX_INSERT_SEQ      8
 #define MAX_HOLD_STAGES     4
 
 typedef enum {
-    HOLD_PED_INSERT     = 0,   /* при P7 — плавная вставка insert_sequence */
-    HOLD_PED_MIN_RECALL = 1,   /* при P7 — сократить текущую зелёную */
-    HOLD_PED_IGNORE     = 2,   /* при P7 — ничего не делать */
+    HOLD_PED_INSERT     = 0,
+    HOLD_PED_MIN_RECALL = 1,
+    HOLD_PED_IGNORE     = 2,
 } hold_ped_request_t;
 
 typedef struct {
@@ -286,27 +285,29 @@ typedef struct {
     uint32_t insert_timeout_ms;
     uint32_t min_recall_s;
 
-    /* === NEW: insert sequence (для hold.on_ped_request=insert) === */
     uint8_t  insert_sequence[MAX_INSERT_SEQ];
     uint8_t  insert_count;
     uint32_t insert_lead_ms;
-    /* === FIX INSERT-RED-SHORT: длительность red-фазы в insert.
-       0 = использовать phases_ms.red; > 0 = сократить.
-       Например, insert_sequence = [4,5,1,6,7,1] с insert_red_ms=3000
-       даст 4→5→1(3000)→6→7→1(3000) вместо 1(8000). === */
     uint32_t insert_red_ms;
-    /* === END FIX INSERT-RED-SHORT === */
     bool     return_to_hold;
+
+    /* === FIX-SAFE-EXIT-CFG: настраиваемая последовательность
+       безопасного завершения пешеходного зелёного перед
+       return_to_hold. ID стадий из stages_dd.
+       Пример: [1, 2] → red → red_yellow → hold.
+       Пусто → fallback [red, red_yellow] (если есть в stages_dd). */
+    uint8_t  safe_exit_sequence[MAX_INSERT_SEQ];
+    uint8_t  safe_exit_count;
+    /* === END FIX-SAFE-EXIT-CFG === */
 } pedestrian_button_config_t;
 
 typedef struct {
     bool     enabled;
-    uint8_t  stage_ids[MAX_HOLD_STAGES];   /* ID из stages_dd, которые удерживаются */
+    uint8_t  stage_ids[MAX_HOLD_STAGES];
     uint8_t  stage_count;
-    uint32_t max_hold_ms;                  /* 0 = бесконечно */
-    uint8_t  on_ped_request;               /* hold_ped_request_t */
+    uint32_t max_hold_ms;
+    uint8_t  on_ped_request;
 } traffic_hold_config_t;
-/* === END NEW: hold/insert === */
 
 typedef struct {
     uint8_t  mode;
@@ -314,9 +315,7 @@ typedef struct {
     bool     auto_start;
 
     pedestrian_button_config_t pedestrian;
-    /* === NEW: hold/insert === */
     traffic_hold_config_t      hold;
-    /* === END NEW: hold/insert === */
 
     traffic_pins_config_t   pins;
     traffic_phases_ms_t     phases_ms;
@@ -400,48 +399,23 @@ esp_err_t      config_save_role(device_role_t role);
 device_role_t  config_load_role(void);
 
 /* ============================================================
-   NEW: короткий JSON только для передачи ROOT → NODE по LoRa.
-   ROOT формирует из g_config (полный хранится в NVS).
-   NODE принимает и применяет.
+   LoRa JSON (short) — формат "ped" (FIX INSERT-RED-SHORT + FIX-SAFE-EXIT-CFG):
 
-   Формат (~985 байт):
-   {
-     "v": 1.0, "tz": "MSK-3",
-     "t": { "mode":3, "en":true, "auto":true,
-            "pins": { "single":[r,y,g],
-                      "cross":[[r,y,g]×4],
-                      "cross_ped":[[r,y,g]×3, pr, pg] },
-            "ph": [red, red_yellow, green, green_blink, yellow,
-                   yellow_blink, ped_green, ped_blink,
-                   fault_blink, phase_blink],
-            "f": [imin_mv, vin_on, vin_off, grace, recovery, vin_off_conf],
-            "ped": [enabled, mode, insert_timeout, min_recall,
-                    insert_lead_ms, return_to_hold, insert_red_ms,
-                    insert_count, insert_seq...],
-            "hold": { "en":bool, "max_ms":int, "on_ped":0/1/2,
-                      "ids":[id,...] },
-            "st": [[id, name, groups, dur_kind, dur_ms, on[], blink[]], ...],
-            "seq": [id, ...],
-            "tr": [[clearing, entering, time_ms], ...] },
-     "sr": [ch, ...]    // только active
-   }
-
-   === FIX INSERT-RED-SHORT ===
-   В "ped" добавлен 7-й элемент insert_red_ms.
-   Индексы:
      [0]=button_enabled    [1]=request_mode
      [2]=insert_timeout    [3]=min_recall_s
      [4]=insert_lead_ms    [5]=return_to_hold
      [6]=insert_red_ms     [7]=insert_count
-     [8..]=insert_sequence[]
-   Старые NODE (без insert_red_ms) совместимы через fallback
-   (см. config_load_lora_json: psz >= 8 → новый, иначе legacy).
-   === END FIX INSERT-RED-SHORT ===
+     [8..8+insert_count-1]=insert_sequence[]
+     [8+insert_count]=safe_exit_count
+     [9+insert_count ..]=safe_exit_sequence[]
+
+   Legacy NODE (без safe_exit): psz будет меньше — safe_exit_count = 0
+   → fallback [red, red_yellow] на NODE.
    ============================================================ */
 bool config_export_lora_json(char *buf, size_t *len);
 bool config_load_lora_json(const char *json, size_t len);
 
-/* Полный JSON (FULL) — с meta и всеми секциями. */
+/* Полный JSON (FULL). */
 bool config_export_json(char *buf, size_t *len);
 
 #endif

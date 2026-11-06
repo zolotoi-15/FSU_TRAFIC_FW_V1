@@ -33,9 +33,7 @@ static const char *TAG = "node_proto";
 #define STATUS_FORCE_MS       5000
 
 /* === FIX CFG-ACK-HEARTBEAT: NODE шлёт cfg:ok периодически,
-   чтобы ROOT не считал s_cfg_ack протухшим. Раньше ROOT сбрасывал
-   s_cfg_ack через CFG_ACK_STALE_MS (60 сек), и запускалась
-   циклическая перезагрузка CFG. Период 15 сек < 60 сек. === */
+   чтобы ROOT не считал s_cfg_ack протухшим. === */
 #define CFG_OK_HEARTBEAT_MS   15000
 /* === END FIX CFG-ACK-HEARTBEAT === */
 
@@ -61,11 +59,7 @@ static volatile uint32_t s_status_force_until_ms = 0;
 #define FAIL_NO_ROOT_DATA_MS    60000
 #define FAIL_REBOOT_DELAY_MS    500
 
-/* === FIX CFG-FROM-ROOT: NODE не стартует трафик без реального CFG
-   от ROOT. NVS CFG даёт только пины/stages для предварительной
-   настройки, но не разрешает traffic:start. === */
 #define CFG_FROM_ROOT_TIMEOUT_MS  30000
-/* === END FIX CFG-FROM-ROOT === */
 
 static volatile uint8_t  s_fail_cfg_parse    = 0;
 static volatile uint8_t  s_fail_sync_format  = 0;
@@ -602,9 +596,10 @@ static void on_node_status_from_transport(const char *json, size_t len)
 
     if (g_config.role == DEVICE_ROLE_MASTER) {
         /* === FIX PHASE-MISMATCH: если NODE на другой фазе, чем ROOT —
-           форсируем resync. Критично после insert и return_to_hold:
-           ROOT вернулся в hold-фазу, а NODE остался на последней
-           insert-фазе. phase_sync_task в hold сам resync шлёт редко,
+           форсируем resync НЕМЕДЛЕННО, не полагаясь на phase_sync_task.
+           Критично после insert и return_to_hold: ROOT вернулся в
+           hold-фазу, а NODE остался на последней insert-фазе
+           (PED blink). phase_sync_task в hold сам resync шлёт редко,
            поэтому без этого NODE застревает навсегда. === */
         if (!s_cfg_pushing &&
             traffic_light_get_state() == TRAFFIC_STATE_RUNNING) {
@@ -615,10 +610,24 @@ static void on_node_status_from_transport(const char *json, size_t len)
             }
             if (node_phase >= 0 &&
                 node_phase != (int)traffic_light_get_phase()) {
-                ESP_LOGW(TAG, "NODE phase=%d != ROOT phase=%u → force resync",
+                ESP_LOGW(TAG, "NODE phase=%d != ROOT phase=%u → force resync NOW",
                          node_phase, traffic_light_get_phase());
+
                 extern volatile bool s_force_resync_pending;
                 s_force_resync_pending = true;
+
+                /* FIX: шлём sync сразу, не полагаясь на phase_sync_task.
+                   force=false — send_sync_to_node_async_ex сам обойдёт
+                   SYNC_MIN_INTERVAL_MS при смене фазы (s_last_sent_sync_phase). */
+                extern uint32_t send_sync_to_node_async_ex(uint8_t phase,
+                                                           uint32_t phase_ms,
+                                                           uint32_t duration_ms,
+                                                           bool force,
+                                                           uint8_t *out_next_phase);
+                uint8_t phase = traffic_light_get_phase();
+                uint32_t dur = traffic_light_get_phase_duration_ms();
+                uint32_t pm  = traffic_light_get_phase_ms();
+                send_sync_to_node_async_ex(phase, pm, dur, false, NULL);
             }
         }
         /* === END FIX PHASE-MISMATCH === */

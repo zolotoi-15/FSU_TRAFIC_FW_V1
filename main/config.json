@@ -181,11 +181,12 @@
       "button_enabled": true,
       "request_mode": "insert",
       "insert_timeout_ms": 30000,
-      "min_recall_s": 5,
-      "insert_sequence": [3, 2, 6, 7],
-      "insert_lead_ms": 300,
+      "min_recall_s": 15,
+      "insert_sequence": [3, 5, 1, 6, 7],
+      "insert_lead_ms": 100,
       "insert_red_ms": 0,
-      "return_to_hold": true
+      "return_to_hold": true,
+      "safe_exit_sequence": [1, 2]
     },
 
     "stages_dd": [

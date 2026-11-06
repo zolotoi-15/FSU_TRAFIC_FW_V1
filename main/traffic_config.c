@@ -4,10 +4,17 @@
    === FIX NODE-BLINK-AND-ON ===
        apply_stage_dd() сначала выключает ВСЕ каналы (active
        mask), потом включает outputs_on.
+
    === FIX INSERT-NO-DOUBLE-SYNC ===
        apply_stage_dd не дёргает s_phase_change_cb, если
        s_in_force_phase == true (вызывающий сам отправит sync:).
        Используется в traffic_light_force_phase и в insert-блоке.
+
+   === FIX PED-BLINK-MASK ===
+       apply_stage_dd устанавливает s_blink_mask ДО вызова
+       s_phase_change_cb. Для PED-фазы с мигающим зелёным
+       (stage id=7) blink_mask = outputs_blink. ROOT должен
+       blink-ать так же, как NODE.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -130,6 +137,22 @@ void set_all_off(void)
     for (int i = 0; i < 16; i++) sr_output_off(i);
 }
 
+/* ============================================================
+   apply_stage_dd
+
+   === FIX PED-BLINK-MASK ===
+   blink_mask вычисляется и сохраняется в s_blink_mask ДО
+   вызова s_phase_change_cb. Для PED-фазы (stage id=7)
+   blink_mask = outputs_blink = [ped_green], ROOT начинает
+   мигать сразу (первый тик через phase_blink_period).
+   Раньше ROOT применял blink_mask, но s_phase_change_cb
+   вызывался до того, как blink-логика в traffic_task_loop
+   успевала запуститься — на практике blink_mask был 0
+   в момент cb. Теперь blink_mask гарантированно установлен.
+
+   === FIX INSERT-NO-DOUBLE-SYNC ===
+   не дёргаем cb, если вызывающий сам отправит sync:.
+   ============================================================ */
 void apply_stage_dd(uint8_t seq_idx)
 {
     if (seq_idx >= g_config.traffic.sequence_count) return;
@@ -155,10 +178,14 @@ void apply_stage_dd(uint8_t seq_idx)
         blink_mask |= (1u << st->outputs_blink[i]);
     }
     blink_mask &= ~on_mask;
-    s_blink_mask = blink_mask;
 
+    /* === FIX PED-BLINK-MASK: устанавливаем s_blink_mask ДО cb,
+       чтобы при следующей итерации traffic_task_loop blink
+       гарантированно стартовал (в т.ч. для PED blink). === */
+    s_blink_mask = blink_mask;
     s_blink_on = false;
     s_blink_last_phase = 0;
+    /* === END FIX PED-BLINK-MASK === */
 
     uint32_t dur = stage_duration_ms(seq_idx);
     ESP_LOGD(TAG, "Stage → %u (%s) kind=%u dur=%lu on=0x%04X blink=0x%04X%s",

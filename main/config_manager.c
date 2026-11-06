@@ -65,6 +65,9 @@ static const char *hold_on_ped_to_str(uint8_t m);
 /* ============================================================
    set_defaults_to(cfg) — не трогает глобальный g_config.
    ============================================================ */
+/* ============================================================
+   set_defaults_to — добавить инициализацию safe_exit_count.
+   ============================================================ */
 static void set_defaults_to(app_config_t *cfg)
 {
     memset(cfg, 0, sizeof(*cfg));
@@ -72,7 +75,6 @@ static void set_defaults_to(app_config_t *cfg)
     cfg->version = 1.0f;
     cfg->id = 0;
     strcpy(cfg->name, "default");
-
     cfg->role = DEVICE_ROLE_MASTER;
 
     cfg->espnow.enabled = false;
@@ -117,19 +119,19 @@ static void set_defaults_to(app_config_t *cfg)
     cfg->traffic.pedestrian.insert_timeout_ms = 30000;
     cfg->traffic.pedestrian.min_recall_s      = 5;
 
-    /* === NEW: hold/insert defaults === */
     cfg->traffic.pedestrian.insert_count      = 0;
     cfg->traffic.pedestrian.insert_lead_ms    = 300;
-    /* === FIX INSERT-RED-SHORT: 0 = использовать phases_ms.red === */
     cfg->traffic.pedestrian.insert_red_ms     = 0;
-    /* === END FIX INSERT-RED-SHORT === */
     cfg->traffic.pedestrian.return_to_hold    = true;
+
+    /* === FIX-SAFE-EXIT-CFG: пусто → fallback [red, red_yellow] === */
+    cfg->traffic.pedestrian.safe_exit_count   = 0;
+    /* === END FIX-SAFE-EXIT-CFG === */
 
     cfg->traffic.hold.enabled        = false;
     cfg->traffic.hold.stage_count    = 0;
     cfg->traffic.hold.max_hold_ms    = 0;
     cfg->traffic.hold.on_ped_request = HOLD_PED_INSERT;
-    /* === END NEW: hold/insert === */
 
     cfg->traffic.pins.single = (traffic_color_pins_t){0,1,2};
     cfg->traffic.pins.cross.a_north = (traffic_color_pins_t){0,1,2};
@@ -160,7 +162,6 @@ static void set_defaults_to(app_config_t *cfg)
     cfg->traffic.fault.recovery_ms = 2000;
     cfg->traffic.fault.vin_off_confirmations = 3;
 
-    /* Дефолтные stages: 4 фазы */
     traffic_stage_dd_t *st = cfg->traffic.stages;
     st[0] = (traffic_stage_dd_t){ .id=1, .name="Фаза.1", .duration_ms=8000,
         .duration_kind=DD_DUR_EXPLICIT, .outputs_on={0}, .on_count=1 };
@@ -459,6 +460,9 @@ static void parse_transitions(const cJSON *arr, traffic_config_t *tc)
     ESP_LOGI(TAG, "Parsed %u transitions", tc->transition_count);
 }
 
+/* ============================================================
+   parse_pedestrian — добавить парсинг safe_exit_sequence.
+   ============================================================ */
 static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
 {
     const cJSON *ped = cJSON_GetObjectItemCaseSensitive(t, "pedestrian");
@@ -476,10 +480,8 @@ static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
 
     tc->pedestrian.insert_lead_ms =
         (uint32_t)json_get_int(ped, "insert_lead_ms", 300);
-    /* === FIX INSERT-RED-SHORT: 0 = использовать phases_ms.red === */
     tc->pedestrian.insert_red_ms =
         (uint32_t)json_get_int(ped, "insert_red_ms", 0);
-    /* === END FIX INSERT-RED-SHORT === */
     tc->pedestrian.return_to_hold =
         json_get_bool(ped, "return_to_hold", true);
 
@@ -509,8 +511,23 @@ static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
         }
     }
 
+    /* === FIX-SAFE-EXIT-CFG: safe_exit_sequence === */
+    tc->pedestrian.safe_exit_count = 0;
+    const cJSON *ses = cJSON_GetObjectItemCaseSensitive(ped, "safe_exit_sequence");
+    if (cJSON_IsArray(ses)) {
+        const cJSON *it = NULL;
+        cJSON_ArrayForEach(it, ses) {
+            if (tc->pedestrian.safe_exit_count < MAX_INSERT_SEQ &&
+                cJSON_IsNumber(it)) {
+                tc->pedestrian.safe_exit_sequence[
+                    tc->pedestrian.safe_exit_count++] = (uint8_t)it->valueint;
+            }
+        }
+    }
+    /* === END FIX-SAFE-EXIT-CFG === */
+
     ESP_LOGI(TAG, "pedestrian: button=%d mode=%u insert=%lu min_recall=%lu "
-                  "insert_seq=%u lead=%lu red=%lu return_hold=%d",
+                  "insert_seq=%u lead=%lu red=%lu return_hold=%d safe_exit=%u",
              tc->pedestrian.button_enabled,
              tc->pedestrian.request_mode,
              (unsigned long)tc->pedestrian.insert_timeout_ms,
@@ -518,7 +535,8 @@ static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
              tc->pedestrian.insert_count,
              (unsigned long)tc->pedestrian.insert_lead_ms,
              (unsigned long)tc->pedestrian.insert_red_ms,
-             tc->pedestrian.return_to_hold);
+             tc->pedestrian.return_to_hold,
+             tc->pedestrian.safe_exit_count);
 }
 
 static void parse_hold(const cJSON *t, traffic_config_t *tc)
@@ -884,7 +902,7 @@ static const char *hold_on_ped_to_str(uint8_t m)
 }
 
 /* ============================================================
-   config_export_json (FULL) — выгрузка g_config в JSON (кэш).
+   config_export_json — сериализовать safe_exit_sequence.
    ============================================================ */
 bool config_export_json(char *buf, size_t *len)
 {
@@ -972,10 +990,8 @@ bool config_export_json(char *buf, size_t *len)
                                     g_config.traffic.pedestrian.min_recall_s);
             cJSON_AddNumberToObject(ped, "insert_lead_ms",
                                     g_config.traffic.pedestrian.insert_lead_ms);
-            /* === FIX INSERT-RED-SHORT === */
             cJSON_AddNumberToObject(ped, "insert_red_ms",
                                     g_config.traffic.pedestrian.insert_red_ms);
-            /* === END FIX INSERT-RED-SHORT === */
             cJSON_AddBoolToObject(ped, "return_to_hold",
                                   g_config.traffic.pedestrian.return_to_hold);
             cJSON *iseq = cJSON_AddArrayToObject(ped, "insert_sequence");
@@ -983,6 +999,14 @@ bool config_export_json(char *buf, size_t *len)
                 cJSON_AddItemToArray(iseq,
                     cJSON_CreateNumber(
                         g_config.traffic.pedestrian.insert_sequence[i]));
+
+            /* === FIX-SAFE-EXIT-CFG: safe_exit_sequence === */
+            cJSON *sex = cJSON_AddArrayToObject(ped, "safe_exit_sequence");
+            for (int i = 0; i < g_config.traffic.pedestrian.safe_exit_count; i++)
+                cJSON_AddItemToArray(sex,
+                    cJSON_CreateNumber(
+                        g_config.traffic.pedestrian.safe_exit_sequence[i]));
+            /* === END FIX-SAFE-EXIT-CFG === */
         }
 
         cJSON *pins = cJSON_AddObjectToObject(t, "pins");
@@ -1135,9 +1159,9 @@ bool config_export_json(char *buf, size_t *len)
 }
 
 /* ============================================================
-   config_export_lora_json — короткий JSON для LoRa.
-   === FIX INSERT-RED-SHORT: в "ped" добавлен insert_red_ms
-       на позицию [6]. insert_count сдвинут на [7], sequence с [8].
+   config_export_lora_json — расширенный формат "ped".
+   === FIX-SAFE-EXIT-CFG: safe_exit_count + safe_exit_sequence[]
+       в конце массива ped. ===
    ============================================================ */
 bool config_export_lora_json(char *buf, size_t *len)
 {
@@ -1230,13 +1254,14 @@ bool config_export_lora_json(char *buf, size_t *len)
                     cJSON_CreateNumber(g_config.traffic.hold.stage_ids[i]));
         }
 
-        /* === FIX INSERT-RED-SHORT: порядок элементов в "ped":
+        /* Формат "ped":
            [0]=button_enabled   [1]=request_mode
            [2]=insert_timeout   [3]=min_recall_s
            [4]=insert_lead_ms   [5]=return_to_hold
            [6]=insert_red_ms    [7]=insert_count
-           [8..]=insert_sequence[]
-        === */
+           [8..8+insert_count-1]=insert_sequence[]
+           [8+insert_count]=safe_exit_count
+           [9+insert_count ..]=safe_exit_sequence[] */
         cJSON *ped = cJSON_AddArrayToObject(t, "ped");
         if (ped) {
             cJSON_AddItemToArray(ped, cJSON_CreateBool(g_config.traffic.pedestrian.button_enabled));
@@ -1250,8 +1275,16 @@ bool config_export_lora_json(char *buf, size_t *len)
             for (int i = 0; i < g_config.traffic.pedestrian.insert_count; i++)
                 cJSON_AddItemToArray(ped,
                     cJSON_CreateNumber(g_config.traffic.pedestrian.insert_sequence[i]));
+
+            /* === FIX-SAFE-EXIT-CFG === */
+            cJSON_AddItemToArray(ped,
+                cJSON_CreateNumber(g_config.traffic.pedestrian.safe_exit_count));
+            for (int i = 0; i < g_config.traffic.pedestrian.safe_exit_count; i++)
+                cJSON_AddItemToArray(ped,
+                    cJSON_CreateNumber(
+                        g_config.traffic.pedestrian.safe_exit_sequence[i]));
+            /* === END FIX-SAFE-EXIT-CFG === */
         }
-        /* === END FIX INSERT-RED-SHORT === */
 
         cJSON *st = cJSON_AddArrayToObject(t, "st");
         if (st) {
@@ -1329,12 +1362,8 @@ bool config_export_lora_json(char *buf, size_t *len)
 }
 
 /* ============================================================
-   config_load_lora_json
-
-   === FIX STACK-OVERFLOW: static tmp + mutex (как в config_load_json).
-   === FIX INSERT-RED-SHORT: поддержка как нового формата "ped"
-       (psz >= 8, insert_red_ms на [6], insert_count на [7],
-       sequence с [8]), так и legacy (psz >= 7, без insert_red_ms).
+   config_load_lora_json — парсинг "ped" с safe_exit_sequence
+   (FIX-SAFE-EXIT-CFG).
    ============================================================ */
 bool config_load_lora_json(const char *json, size_t len)
 {
@@ -1352,7 +1381,6 @@ bool config_load_lora_json(const char *json, size_t len)
         return false;
     }
 
-    /* === FIX STACK-OVERFLOW: static tmp + mutex === */
     if (!cfg_load_lock()) {
         ESP_LOGE(TAG, "config_load_lora_json: mutex timeout");
         cJSON_Delete(root);
@@ -1361,7 +1389,6 @@ bool config_load_lora_json(const char *json, size_t len)
     app_config_t *tmp = &s_cfg_load_tmp;
     set_defaults_to(tmp);
     tmp->role = g_config.role;
-    /* === END FIX STACK-OVERFLOW === */
 
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "v");
     if (cJSON_IsNumber(v)) tmp->version = (float)v->valuedouble;
@@ -1467,20 +1494,6 @@ bool config_load_lora_json(const char *json, size_t len)
             }
         }
 
-        /* ============================================================
-           PED — FIX INSERT-RED-SHORT
-
-           Новый формат (psz >= 8):
-             [0]=button_enabled   [1]=request_mode
-             [2]=insert_timeout   [3]=min_recall_s
-             [4]=insert_lead_ms   [5]=return_to_hold
-             [6]=insert_red_ms    [7]=insert_count
-             [8..]=insert_sequence[]
-
-           Legacy (psz >= 7, без insert_red_ms):
-             [0..3] как выше, [4]=insert_lead_ms, [5]=return_to_hold,
-             [6]=insert_count, [7..]=insert_sequence[]
-           ============================================================ */
         const cJSON *ped = cJSON_GetObjectItemCaseSensitive(t, "ped");
         if (cJSON_IsArray(ped) && cJSON_GetArraySize(ped) >= 4) {
             tc->pedestrian.button_enabled    = cJSON_IsTrue(cJSON_GetArrayItem(ped, 0));
@@ -1490,7 +1503,6 @@ bool config_load_lora_json(const char *json, size_t len)
 
             int psz = cJSON_GetArraySize(ped);
             if (psz >= 8) {
-                /* Новый формат: insert_red_ms присутствует */
                 tc->pedestrian.insert_lead_ms = (uint32_t)cJSON_GetArrayItem(ped, 4)->valueint;
                 tc->pedestrian.return_to_hold = cJSON_IsTrue(cJSON_GetArrayItem(ped, 5));
                 tc->pedestrian.insert_red_ms  = (uint32_t)cJSON_GetArrayItem(ped, 6)->valueint;
@@ -1504,11 +1516,30 @@ bool config_load_lora_json(const char *json, size_t len)
                         tc->pedestrian.insert_sequence[tc->pedestrian.insert_count++] =
                             (uint8_t)it->valueint;
                 }
+
+                /* === FIX-SAFE-EXIT-CFG: safe_exit_count + safe_exit_sequence[] === */
+                tc->pedestrian.safe_exit_count = 0;
+                int safe_pos = 8 + tc->pedestrian.insert_count;
+                if (safe_pos < psz) {
+                    const cJSON *sc = cJSON_GetArrayItem(ped, safe_pos);
+                    if (cJSON_IsNumber(sc)) {
+                        int scnt = sc->valueint;
+                        if (scnt > MAX_INSERT_SEQ) scnt = MAX_INSERT_SEQ;
+                        if (scnt < 0) scnt = 0;
+                        for (int k = 0; k < scnt && (safe_pos + 1 + k) < psz; k++) {
+                            const cJSON *it = cJSON_GetArrayItem(ped, safe_pos + 1 + k);
+                            if (cJSON_IsNumber(it))
+                                tc->pedestrian.safe_exit_sequence[
+                                    tc->pedestrian.safe_exit_count++] =
+                                    (uint8_t)it->valueint;
+                        }
+                    }
+                }
+                /* === END FIX-SAFE-EXIT-CFG === */
             } else if (psz >= 7) {
-                /* Legacy без insert_red_ms */
                 tc->pedestrian.insert_lead_ms = (uint32_t)cJSON_GetArrayItem(ped, 4)->valueint;
                 tc->pedestrian.return_to_hold = cJSON_IsTrue(cJSON_GetArrayItem(ped, 5));
-                tc->pedestrian.insert_red_ms  = 0;  /* default */
+                tc->pedestrian.insert_red_ms  = 0;
                 int cnt = cJSON_GetArrayItem(ped, 6)->valueint;
                 if (cnt > MAX_INSERT_SEQ) cnt = MAX_INSERT_SEQ;
                 if (cnt < 0) cnt = 0;
@@ -1519,10 +1550,10 @@ bool config_load_lora_json(const char *json, size_t len)
                         tc->pedestrian.insert_sequence[tc->pedestrian.insert_count++] =
                             (uint8_t)it->valueint;
                 }
+                tc->pedestrian.safe_exit_count = 0;
                 ESP_LOGW(TAG, "lora_json: legacy 'ped' format (no insert_red_ms)");
             }
         }
-        /* === END FIX INSERT-RED-SHORT === */
 
         const cJSON *st = cJSON_GetObjectItemCaseSensitive(t, "st");
         if (cJSON_IsArray(st)) {
@@ -1608,7 +1639,6 @@ bool config_load_lora_json(const char *json, size_t len)
 
     cJSON_Delete(root);
 
-    /* === FIX: валидация перед коммитом === */
     if (tmp->traffic.enabled && tmp->traffic.stage_count == 0) {
         ESP_LOGE(TAG, "lora_json: traffic.enabled=true but no stages → reject");
         cfg_load_unlock();
@@ -1620,14 +1650,13 @@ bool config_load_lora_json(const char *json, size_t len)
             tmp->traffic.sequence[i] = tmp->traffic.stages[i].id;
         tmp->traffic.sequence_count = tmp->traffic.stage_count;
     }
-    /* === END FIX === */
 
     g_config = *tmp;
     config_save();
 
     ESP_LOGI(TAG, "lora_json loaded (version=%.2f, stages=%u seq=%u, "
                   "ped_mode=%u, hold=%d/%u, insert_seq=%u, insert_red_ms=%lu, "
-                  "%u bytes)",
+                  "safe_exit=%u, %u bytes)",
              g_config.version, g_config.traffic.stage_count,
              g_config.traffic.sequence_count,
              g_config.traffic.pedestrian.request_mode,
@@ -1635,6 +1664,7 @@ bool config_load_lora_json(const char *json, size_t len)
              g_config.traffic.hold.stage_count,
              g_config.traffic.pedestrian.insert_count,
              (unsigned long)g_config.traffic.pedestrian.insert_red_ms,
+             g_config.traffic.pedestrian.safe_exit_count,
              (unsigned)len);
 
     cfg_load_unlock();
