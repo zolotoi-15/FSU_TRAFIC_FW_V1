@@ -153,7 +153,7 @@
       "red_yellow": 2000,
       "green": 10000,
       "green_blink": 3000,
-      "yellow": 2000,
+      "yellow": 3000,
       "yellow_blink": 2000,
       "ped_green": 10000,
       "ped_blink": 4000,

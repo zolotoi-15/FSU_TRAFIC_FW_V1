@@ -63,10 +63,7 @@ static const char *ped_request_mode_to_str(uint8_t m);
 static const char *hold_on_ped_to_str(uint8_t m);
 
 /* ============================================================
-   set_defaults_to(cfg) — не трогает глобальный g_config.
-   ============================================================ */
-/* ============================================================
-   set_defaults_to — добавить инициализацию safe_exit_count.
+   set_defaults_to — не трогает глобальный g_config.
    ============================================================ */
 static void set_defaults_to(app_config_t *cfg)
 {
@@ -148,7 +145,9 @@ static void set_defaults_to(app_config_t *cfg)
     cfg->traffic.phases_ms.red_yellow   = 2000;
     cfg->traffic.phases_ms.green        = 10000;
     cfg->traffic.phases_ms.green_blink  = 3000;
-    cfg->traffic.phases_ms.yellow       = 2000;
+    /* === FIX GOST-YELLOW-DURATION: жёлтый = 3 с (ГОСТ Р 52289) === */
+    cfg->traffic.phases_ms.yellow       = 3000;
+    /* === END FIX GOST-YELLOW-DURATION === */
     cfg->traffic.phases_ms.yellow_blink = 2000;
     cfg->traffic.phases_ms.ped_green    = 10000;
     cfg->traffic.phases_ms.ped_blink    = 4000;
@@ -625,7 +624,9 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
         tc->phases_ms.red_yellow   = (uint32_t)json_get_int(ph, "red_yellow", 2000);
         tc->phases_ms.green        = (uint32_t)json_get_int(ph, "green", 10000);
         tc->phases_ms.green_blink  = (uint32_t)json_get_int(ph, "green_blink", 3000);
-        tc->phases_ms.yellow       = (uint32_t)json_get_int(ph, "yellow", 2000);
+        /* === FIX GOST-YELLOW-DURATION: default 3000 === */
+        tc->phases_ms.yellow       = (uint32_t)json_get_int(ph, "yellow", 3000);
+        /* === END FIX GOST-YELLOW-DURATION === */
         tc->phases_ms.yellow_blink = (uint32_t)json_get_int(ph, "yellow_blink", 2000);
         tc->phases_ms.ped_green    = (uint32_t)json_get_int(ph, "ped_green", 10000);
         tc->phases_ms.ped_blink    = (uint32_t)json_get_int(ph, "ped_blink", 4000);

@@ -13,6 +13,10 @@
        «маска не передана» от «передана 0x0000» (валидная пустая).
        Fallback — по s_mode (legacy / ROOT).
    === FIX 5: fault мигает даже без s_mask_received.
+   === FIX GOST-PED-YELLOW-BLINK:
+       set_fault(YELLOW_BLINK) блокируется, если активна
+       пешеходная фаза (ГОСТ Р 52289: жёлтое мигание не
+       должно заставать пешеходов в переходе).
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -462,8 +466,38 @@ void traffic_light_check_faults(const mux_data_t *data)
     if (fire && s_fault_notify) s_fault_notify(nf);
 }
 
+/* ============================================================
+   traffic_light_set_fault
+
+   === FIX GOST-PED-YELLOW-BLINK ===
+   ГОСТ Р 52289: в режиме жёлтого мигания запрещено оставлять
+   пешеходный переход в активной пешеходной фазе — пешеходы
+   должны быть уверены, что их сигнал управляется.
+   Блокируем переход в YELLOW_BLINK, если текущая фаза —
+   пешеходная. ALL_OFF (полный отказ) — разрешён всегда,
+   т.к. это безопасное состояние «всё выключено».
+   ============================================================ */
 void traffic_light_set_fault(traffic_fault_t fault)
 {
+    /* === FIX GOST-PED-YELLOW-BLINK === */
+    if (fault == TRAFFIC_FAULT_YELLOW_BLINK &&
+        s_state == TRAFFIC_STATE_RUNNING &&
+        g_config.traffic.sequence_count > 0 &&
+        s_phase < g_config.traffic.sequence_count &&
+        stage_is_pedestrian(s_phase)) {
+        static uint32_t s_last_block_warn_ms = 0;
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (s_last_block_warn_ms == 0 ||
+            (now - s_last_block_warn_ms) > 5000) {
+            s_last_block_warn_ms = now;
+            ESP_LOGW(TAG, "set_fault(YELLOW_BLINK) BLOCKED: "
+                          "pedestrian phase %u active (GOST Р 52289)",
+                     s_phase);
+        }
+        return;
+    }
+    /* === END FIX GOST-PED-YELLOW-BLINK === */
+
     bool fire = false;
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE) {
         ESP_LOGW(TAG, "set_fault: mutex timeout %d ms, fault=%d lost",

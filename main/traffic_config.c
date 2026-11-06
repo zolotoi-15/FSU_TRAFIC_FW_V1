@@ -15,6 +15,10 @@
        s_phase_change_cb. Для PED-фазы с мигающим зелёным
        (stage id=7) blink_mask = outputs_blink. ROOT должен
        blink-ать так же, как NODE.
+
+   === FIX GOST-RED-YELLOW-LIMIT ===
+       stage_duration_ms() жёстко ограничивает длительность
+       фазы «красный+жёлтый» 2000 мс (ГОСТ Р 52289).
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -74,24 +78,50 @@ uint8_t next_phase_smooth_ped(uint8_t cur_seq)
     return (cur_seq + 1) % g_config.traffic.sequence_count;
 }
 
+/* ============================================================
+   stage_duration_ms
+
+   === FIX GOST-RED-YELLOW-LIMIT ===
+   ГОСТ Р 52289: длительность сигнала «красный с жёлтым»
+   не должна превышать 2 с. Жёсткий потолок — даже если
+   в конфиге/CFG пришло больше. Логируем (не чаще 1 раза
+   в 5 с), чтобы было видно расхождение в логах.
+   ============================================================ */
 uint32_t stage_duration_ms(uint8_t seq_idx)
 {
     if (seq_idx >= g_config.traffic.sequence_count) return 1000;
     const traffic_stage_dd_t *st = find_stage(g_config.traffic.sequence[seq_idx]);
     if (!st) return 1000;
 
+    uint32_t dur;
     switch (st->duration_kind) {
-    case DD_DUR_RED:          return g_config.traffic.phases_ms.red;
-    case DD_DUR_RED_YELLOW:   return g_config.traffic.phases_ms.red_yellow;
-    case DD_DUR_GREEN:        return g_config.traffic.phases_ms.green;
-    case DD_DUR_GREEN_BLINK:  return g_config.traffic.phases_ms.green_blink;
-    case DD_DUR_YELLOW:       return g_config.traffic.phases_ms.yellow;
-    case DD_DUR_YELLOW_BLINK: return g_config.traffic.phases_ms.yellow_blink;
-    case DD_DUR_PED_GREEN:    return g_config.traffic.phases_ms.ped_green;
-    case DD_DUR_PED_BLINK:    return g_config.traffic.phases_ms.ped_blink;
+    case DD_DUR_RED:          dur = g_config.traffic.phases_ms.red;          break;
+    case DD_DUR_RED_YELLOW:   dur = g_config.traffic.phases_ms.red_yellow;   break;
+    case DD_DUR_GREEN:        dur = g_config.traffic.phases_ms.green;        break;
+    case DD_DUR_GREEN_BLINK:  dur = g_config.traffic.phases_ms.green_blink;  break;
+    case DD_DUR_YELLOW:       dur = g_config.traffic.phases_ms.yellow;       break;
+    case DD_DUR_YELLOW_BLINK: dur = g_config.traffic.phases_ms.yellow_blink; break;
+    case DD_DUR_PED_GREEN:    dur = g_config.traffic.phases_ms.ped_green;    break;
+    case DD_DUR_PED_BLINK:    dur = g_config.traffic.phases_ms.ped_blink;    break;
     case DD_DUR_EXPLICIT:
-    default:                  return st->duration_ms;
+    default:                  dur = st->duration_ms;                         break;
     }
+
+    /* === FIX GOST-RED-YELLOW-LIMIT: жёсткий потолок 2000 мс === */
+    if (st->duration_kind == DD_DUR_RED_YELLOW && dur > 2000) {
+        static uint32_t s_last_warn_ms = 0;
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (s_last_warn_ms == 0 || (now - s_last_warn_ms) > 5000) {
+            s_last_warn_ms = now;
+            ESP_LOGW(TAG, "red_yellow=%lu ms > 2000 ms → clamp to 2000 "
+                          "(GOST Р 52289)",
+                     (unsigned long)dur);
+        }
+        dur = 2000;
+    }
+    /* === END FIX GOST-RED-YELLOW-LIMIT === */
+
+    return dur;
 }
 
 uint32_t effective_stage_duration_ms(uint8_t seq_idx)
