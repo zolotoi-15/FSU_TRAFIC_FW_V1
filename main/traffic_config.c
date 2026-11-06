@@ -3,10 +3,11 @@
 
    === FIX NODE-BLINK-AND-ON ===
        apply_stage_dd() сначала выключает ВСЕ каналы (active
-       mask), потом включает outputs_on. Это гарантирует, что
-       каналы, которые были в blink, но не в on, выключатся
-       до включения on.
-   === END FIX NODE-BLINK-AND-ON ===
+       mask), потом включает outputs_on.
+   === FIX INSERT-NO-DOUBLE-SYNC ===
+       apply_stage_dd не дёргает s_phase_change_cb, если
+       s_in_force_phase == true (вызывающий сам отправит sync:).
+       Используется в traffic_light_force_phase и в insert-блоке.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -129,18 +130,6 @@ void set_all_off(void)
     for (int i = 0; i < 16; i++) sr_output_off(i);
 }
 
-/* ============================================================
-   apply_stage_dd
-
-   === FIX NODE-BLINK-AND-ON ===
-       Порядок:
-         1. Выключить ВСЕ каналы из active mask (все, что где-то
-            в sequence есть on или blink).
-         2. Включить outputs_on текущей фазы.
-         3. Установить s_blink_mask — ТОЛЬКО каналы из
-            outputs_blink, которых НЕТ в outputs_on.
-       Гарантирует, что канал не будет одновременно ON и BLINK.
-   ============================================================ */
 void apply_stage_dd(uint8_t seq_idx)
 {
     if (seq_idx >= g_config.traffic.sequence_count) return;
@@ -161,14 +150,12 @@ void apply_stage_dd(uint8_t seq_idx)
         sr_output_on(st->outputs_on[i]);
     }
 
-    /* === FIX NODE-BLINK-AND-ON: blink_mask &= ~on_mask === */
     uint16_t blink_mask = 0;
     for (int i = 0; i < st->blink_count; i++) {
         blink_mask |= (1u << st->outputs_blink[i]);
     }
-    blink_mask &= ~on_mask;   /* канал не может быть ON и BLINK */
+    blink_mask &= ~on_mask;
     s_blink_mask = blink_mask;
-    /* === END FIX NODE-BLINK-AND-ON === */
 
     s_blink_on = false;
     s_blink_last_phase = 0;
@@ -180,7 +167,10 @@ void apply_stage_dd(uint8_t seq_idx)
              (unsigned)on_mask, (unsigned)blink_mask,
              stage_is_pedestrian(seq_idx) ? " (PED)" : "");
 
-    if (!s_follow_root && s_phase_change_cb) {
+    /* === FIX INSERT-NO-DOUBLE-SYNC: не дёргаем cb, если вызывающий
+       сам отправит sync: (force_phase / insert). === */
+    if (!s_follow_root && s_phase_change_cb && !s_in_force_phase) {
         s_phase_change_cb(seq_idx, dur);
     }
+    /* === END FIX INSERT-NO-DOUBLE-SYNC === */
 }

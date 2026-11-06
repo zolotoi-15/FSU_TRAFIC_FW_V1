@@ -16,8 +16,13 @@
 static const char *TAG = "lora";
 static spi_device_handle_t s_spi_handle = nullptr;
 static std::unique_ptr<espp::Sx126x> s_radio;
-static lora_raw_rx_cb_t s_raw_cb = nullptr;   // C-совместимый
+static lora_raw_rx_cb_t s_raw_cb = nullptr;
 static SemaphoreHandle_t s_spi_mutex = NULL;
+
+/* === FIX TX-BUSY: флаг «радио сейчас в TX» — чтобы ack_tx_task
+   не пытался отправить ACK прямо во время TX. === */
+static volatile bool s_tx_active = false;
+/* === END FIX TX-BUSY === */
 
 #define LORA_FREQ_HZ        468525050
 #define LORA_TX_POWER_DBM   17
@@ -31,13 +36,14 @@ static SemaphoreHandle_t s_spi_mutex = NULL;
 #define LORA_CRC_ON         true
 #define LORA_RX_BOOST_GAIN  true
 
-/* === FIX #1: SPI mutex timeout 1000 → 3000 мс ===
-   Причина: lora_poll (service_interrupts) держит mutex до 200 мс,
-   плюс ack_tx + lora_send_packet одновременно стучатся.
-   1000 мс не хватает при плохом SNR (ToA 32B ~112 мс, retry) */
 #define LORA_SPI_TX_TIMEOUT_MS  3000
 #define LORA_SPI_POLL_TIMEOUT_MS 200
-/* === END FIX #1 === */
+
+/* === FIX TX-RX-GAP: короткая пауза после TX перед start_receive,
+   чтобы радио успело переключиться и не потерять ACK от пира,
+   приходящий в первые миллисекунды после окончания нашего TX. === */
+#define LORA_TX_RX_GAP_MS       5
+/* === END FIX TX-RX-GAP === */
 
 static bool spi_write(const uint8_t *data, size_t len) {
     spi_transaction_t t = {};
@@ -69,6 +75,11 @@ static bool is_busy() { return gpio_get_level(LORA_BUSY) != 0; }
 static void reset(bool level) { gpio_set_level(LORA_RST, level ? 1 : 0); }
 
 static void on_rx_packet(const espp::Sx126x::RxPacket &pkt) {
+    /* === FIX TX-BUSY: если пришёл RX, значит радио уже не в TX —
+       сбрасываем флаг. Это позволяет ack_tx_task отправлять ACK. === */
+    s_tx_active = false;
+    /* === END FIX TX-BUSY === */
+
     ESP_LOGI(TAG, "on_rx_packet: %d bytes, rssi=%.1f, snr=%.1f, sig_rssi=%.1f",
              (int)pkt.data.size(), pkt.status.rssi, pkt.status.snr,
              pkt.status.signal_rssi);
@@ -193,7 +204,6 @@ extern "C" void lora_receive(void) {
     if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
 }
 
-/* === FIX #1: timeout 1000 → 3000 мс === */
 extern "C" esp_err_t lora_send_packet(uint8_t *buf, uint8_t size) {
     if (!s_radio || !buf || size == 0) return ESP_ERR_INVALID_ARG;
     if (s_spi_mutex &&
@@ -204,22 +214,40 @@ extern "C" esp_err_t lora_send_packet(uint8_t *buf, uint8_t size) {
         return ESP_ERR_TIMEOUT;
     }
 
+    /* === FIX TX-BUSY: помечаем «в TX», чтобы ack_tx_task не дёргал
+       lora_send_packet параллельно. === */
+    s_tx_active = true;
+    /* === END FIX TX-BUSY === */
+
     std::error_code ec;
     bool ok = s_radio->transmit(std::span<const uint8_t>(buf, size),
                                 std::chrono::milliseconds(2000), ec);
     ESP_LOGI(TAG, "tx ok=%d size=%u ec=%s", (int)ok, (unsigned)size,
              ec.message().c_str());
 
+    /* === FIX TX-RX-GAP: даём радио паузу после TX, чтобы пир успел
+       прислать ACK, и мы не потеряли его, если он придёт в первые
+       миллисекунды после окончания нашего TX. === */
+    if (ok) {
+        vTaskDelay(pdMS_TO_TICKS(LORA_TX_RX_GAP_MS));
+    }
+    /* === END FIX TX-RX-GAP === */
+
     std::error_code ec2;
     s_radio->start_receive(ec2);
     if (ec2) ESP_LOGW(TAG, "start_receive after tx: %s", ec2.message().c_str());
+
+    /* === FIX TX-BUSY: сбрасываем флаг. Если за это время пришёл RX —
+       on_rx_packet уже сбросил его, но повторная установка в false
+       безопасна. === */
+    s_tx_active = false;
+    /* === END FIX TX-BUSY === */
 
     if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
 
     if (!ok) { ESP_LOGW(TAG, "tx failed: %s", ec.message().c_str()); return ESP_FAIL; }
     return ESP_OK;
 }
-/* === END FIX #1 === */
 
 extern "C" uint8_t lora_receive_packet(uint8_t *buf, uint8_t size) {
     (void)buf; (void)size;
@@ -229,7 +257,10 @@ extern "C" uint8_t lora_receive_packet(uint8_t *buf, uint8_t size) {
 extern "C" void lora_set_rx_callback(lora_raw_rx_cb_t cb) { s_raw_cb = cb; }
 extern "C" bool lora_is_ready(void) { return (bool)s_radio; }
 
-/* === FIX #2: lora_poll timeout 50 → 200 мс === */
+/* === FIX TX-BUSY: публичный геттер для ack_tx_task === */
+extern "C" bool lora_is_tx_active(void) { return s_tx_active; }
+/* === END FIX TX-BUSY === */
+
 extern "C" void lora_poll(void) {
     if (!s_radio) return;
     if (s_spi_mutex &&
@@ -248,4 +279,3 @@ extern "C" void lora_poll(void) {
 
     if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
 }
-/* === END FIX #2 === */

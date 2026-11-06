@@ -1,3 +1,22 @@
+/* ============================================================
+   connectivity.c — PPPoS retry + регистрация RS485/CAN.
+
+   === FIX CONNECT-ANY-ORDER ===
+       PPP стартует СРАЗУ, не ждёт s_cfg_applied_and_started.
+       Раньше ROOT ждал NODE 30 с, PPP не стартовал, MQTT не
+       подключался. Трафик всё равно в ALL_OFF до cfg:ok + RUNNING.
+       PPP/MQTT не влияют на LoRa-обмен CFG и трафик.
+   === END FIX CONNECT-ANY-ORDER ===
+
+   === FIX MQTT-NO-IP ===
+       wifi_mqtt_init() вызывается ТОЛЬКО при ESP_OK от
+       modem_ppp_start() (IP получен). ESP_ERR_INVALID_STATE
+       (no PPP IP yet) — не ошибка, просто defer.
+       Также при «PPP up but MQTT down» сначала проверяем
+       modem_ppp_is_connected() перед force_restart_modem().
+   === END FIX MQTT-NO-IP ===
+   ============================================================ */
+
 #include "connectivity.h"
 #include "app_shared.h"
 #include "wifi_mqtt.h"
@@ -30,14 +49,18 @@ extern volatile bool s_cfg_applied_and_started;
 
    === FIX CONNECT-ANY-ORDER ===
        PPP стартует СРАЗУ, не ждёт s_cfg_applied_and_started.
-       Раньше ROOT ждал NODE 30 с, PPP не стартовал, MQTT не
-       подключался. Трафик всё равно в ALL_OFF до cfg:ok + RUNNING.
-       PPP/MQTT не влияют на LoRa-обмен CFG и трафик.
    === END FIX CONNECT-ANY-ORDER ===
+
+   === FIX MQTT-NO-IP ===
+       wifi_mqtt_init() — только при mret == ESP_OK (IP получен).
+       ESP_ERR_INVALID_STATE от wifi_mqtt_init (no IP) не считается
+       ошибкой. force_restart_modem() — только если PPP реально up
+       (иначе modem_ppp_stop() убьёт живую PPP-сессию).
+   === END FIX MQTT-NO-IP ===
    ============================================================ */
 static void modem_retry_task(void *arg) {
     ESP_LOGI(TAG, "modem_retry_task started (PPP immediately, "
-                  "traffic waits for CFG)");
+                  "traffic waits for CFG; MQTT only after IP)");
 
     uint32_t ppp_down_since_ms = 0;
 
@@ -45,12 +68,18 @@ static void modem_retry_task(void *arg) {
         vTaskDelay(pdMS_TO_TICKS(MODEM_RETRY_PERIOD_MS));
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
 
+        /* ---------- PPP UP ---------- */
         if (modem_ppp_is_connected()) {
             s_ppp_fail_count = 0;
             ppp_down_since_ms = 0;
+
             if (g_config.role == DEVICE_ROLE_MASTER) {
                 uint32_t mqtt_down = wifi_mqtt_get_down_ms();
                 if (mqtt_down > PPP_RETRY_MAX_DOWN_MS) {
+                    /* === FIX MQTT-NO-IP: PPP up, но MQTT down долго.
+                       force_restart_modem() = modem_ppp_stop() — убьёт
+                       PPP-сессию. Это осознанно: если MQTT не встаёт
+                       5 мин при живом IP, что-то с сетью/DNS. === */
                     ESP_LOGE(TAG, "PPP up but MQTT down %lu ms → force restart",
                              (unsigned long)mqtt_down);
                     wifi_mqtt_force_restart_modem();
@@ -61,13 +90,15 @@ static void modem_retry_task(void *arg) {
             continue;
         }
 
+        /* ---------- PPP DOWN ---------- */
         if (ppp_down_since_ms == 0) {
             ppp_down_since_ms = now;
             ESP_LOGW(TAG, "PPPoS down, starting recovery timer");
         }
         uint32_t down_for = now - ppp_down_since_ms;
         if (down_for > PPP_RETRY_MAX_DOWN_MS) {
-            ESP_LOGE(TAG, "PPPoS down > %lu ms → hard reset modem", (unsigned long)down_for);
+            ESP_LOGE(TAG, "PPPoS down > %lu ms → hard reset modem",
+                     (unsigned long)down_for);
             modem_ppp_stop();
             vTaskDelay(pdMS_TO_TICKS(5000));
             ppp_down_since_ms = 0;
@@ -89,8 +120,20 @@ static void modem_retry_task(void *arg) {
                 esp_netif_set_default_netif(ppp_netif);
                 ESP_LOGI(TAG, "Default netif → PPPoS");
             }
-            if (g_config.role == DEVICE_ROLE_MASTER && !wifi_mqtt_is_connected())
-                wifi_mqtt_init();
+
+            /* === FIX MQTT-NO-IP: IP получен → можно стартовать MQTT.
+               wifi_mqtt_init() может вернуть ESP_ERR_INVALID_STATE,
+               если modem_ppp_is_connected() ещё false (race) — это
+               не ошибка, повторим на следующей итерации. === */
+            if (g_config.role == DEVICE_ROLE_MASTER && !wifi_mqtt_is_connected()) {
+                esp_err_t merr = wifi_mqtt_init();
+                if (merr != ESP_OK && merr != ESP_ERR_INVALID_STATE) {
+                    ESP_LOGW(TAG, "wifi_mqtt_init: %s", esp_err_to_name(merr));
+                } else if (merr == ESP_ERR_INVALID_STATE) {
+                    ESP_LOGI(TAG, "wifi_mqtt_init: deferred (no IP yet)");
+                }
+            }
+            /* === END FIX MQTT-NO-IP === */
         } else {
             s_ppp_fail_count++;
             ESP_LOGW(TAG, "PPPoS failed (%d), retry in %d ms",

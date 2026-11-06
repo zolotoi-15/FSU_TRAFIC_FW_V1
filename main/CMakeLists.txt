@@ -27,7 +27,7 @@ idf_component_register(
         "wifi_ap_stub.c"
     INCLUDE_DIRS "." "include"
     REQUIRES
-        driver esp_driver_gpio esp_driver_uart esp_driver_spi
+        driver esp_driver_gpio esp_driver_uart esp_driver_spi freertos
         esp_driver_i2c esp_driver_twai esp_eth esp_netif esp_timer
         esp_adc esp_wifi esp_event esp_http_server lwip nvs_flash
         espressif__esp_modem

@@ -109,14 +109,6 @@ static bool p7_read_raw(void) {
     return (in & (1 << BTN_EXPANDER_B_PIN)) == 0;
 }
 
-/* ============================================================
-   P7 — вызывная кнопка пешехода.
-   === FIX: оба устройства (ROOT и NODE) применяют локально +
-   оповещают друг друга. ROOT дополнительно шлёт sync: через
-   phase_change_cb (см. fault_handler.c / root_wd.c).
-   === FIX: NODE получив pedestrian:request от ROOT — применяет
-   локально (см. node_proto.c).
-   ============================================================ */
 static void button_p7_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(100));
     bool last_raw = false, stable = false;
@@ -139,17 +131,14 @@ static void button_p7_task(void *arg) {
                     } else if (g_config.role == DEVICE_ROLE_SLAVE && s_comm_lost) {
                         ESP_LOGW(TAG, "P7 ignored (NODE comm lost)");
                     } else {
-                        ESP_LOGI(TAG, "P7 pressed (role=%s, request_mode=%u)",
+                        ESP_LOGI(TAG, "P7 pressed (role=%s, request_mode=%u, hold=%d)",
                                  g_config.role == DEVICE_ROLE_MASTER
                                      ? "ROOT" : "NODE",
-                                 g_config.traffic.pedestrian.request_mode);
+                                 g_config.traffic.pedestrian.request_mode,
+                                 g_config.traffic.hold.enabled);
 
-                        /* 1. Локально — оба устройства */
                         traffic_light_request_pedestrian();
 
-                        /* 2. Оповестить партнёра.
-                           ROOT → CMD (NODE применит локально)
-                           NODE → EVT (ROOT применит локально) */
                         if (g_config.role == DEVICE_ROLE_MASTER) {
                             transport_send_cmd("pedestrian:request",
                                                strlen("pedestrian:request"));
@@ -157,10 +146,6 @@ static void button_p7_task(void *arg) {
                             transport_send_evt("pedestrian:request",
                                                strlen("pedestrian:request"));
                         }
-                        /* 3. Дальше — естественная смена фазы:
-                           ROOT: phase_change_cb → pending sync
-                                 → phase_sync_task → sync: на NODE
-                           NODE: ждёт sync: от ROOT */
                     }
                 }
             }

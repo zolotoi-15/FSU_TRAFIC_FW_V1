@@ -1,14 +1,3 @@
-/* ============================================================
-   traffic_light.c — публичный API и главный цикл traffic_task.
-
-   === FIX P0-1: s_mask_received (NODE) — не считать fault до
-       получения первой маски от ROOT.
-   === FIX P0-3: убран s_phase_start_ms = now в ветке
-       in_transport_green — теперь удерживаем только до max_green.
-   === FIX P1-14: s_in_force_phase — apply_stage_dd не дёргает
-       on_phase_change, если его вызвал force_phase.
-   ============================================================ */
-
 #include "traffic_internal.h"
 #include "traffic_light.h"
 #include "shift_register.h"
@@ -16,6 +5,8 @@
 #include "mux_data.h"
 #include "config_manager.h"
 #include "time_sync.h"
+#include "transport.h"
+#include "root_wd.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
@@ -65,14 +56,17 @@ volatile bool            s_mux_reading = false;
 volatile uint32_t        s_last_recovery_ok_ms = 0;
 volatile bool            s_fault_blink_state = false;
 
-/* === FIX P0-1: NODE — получена ли первая маска от ROOT === */
 volatile bool            s_mask_received = false;
-/* === END FIX P0-1 === */
-
-/* === FIX P1-14: apply_stage_dd не должен дёргать on_phase_change,
-   если его вызвал force_phase (иначе — бесконечный цикл sync). === */
 volatile bool            s_in_force_phase = false;
-/* === END FIX P1-14 === */
+
+/* === NEW: HOLD/INSERT: state === */
+volatile bool            s_hold_active       = false;
+volatile bool            s_insert_pending    = false;
+volatile uint8_t         s_insert_queue[MAX_INSERT_SEQ] = {0};
+volatile uint8_t         s_insert_count      = 0;
+volatile uint8_t         s_insert_idx        = 0;
+volatile uint32_t        s_insert_request_ms = 0;
+/* === END NEW: HOLD/INSERT === */
 
 traffic_fault_notify_cb_t s_fault_notify = NULL;
 traffic_phase_change_cb_t s_phase_change_cb = NULL;
@@ -93,17 +87,66 @@ void traffic_light_set_phase_change_cb(traffic_phase_change_cb_t cb) { s_phase_c
 void traffic_light_set_follow_root(bool en)
 {
     s_follow_root = en;
-    /* === FIX P0-1: при переходе в follow_root сбрасываем
-       s_mask_received — ждём первую маску от ROOT. === */
     if (en) s_mask_received = false;
-    /* === END FIX P0-1 === */
     ESP_LOGI(TAG, "follow_root=%d", en);
 }
 
+/* ============================================================
+   traffic_light_request_pedestrian
+
+   === FIX PED-INSERT-DEDUP ===
+   При s_hold_active + HOLD_PED_INSERT: если s_insert_pending уже
+   true — игнорируем второй P7.
+
+   === FIX NODE-FOLLOW-ROOT ===
+   На NODE с follow_root=true не играем insert локально — ROOT
+   сам проиграет insert и разошлёт sync: для каждой фазы. NODE
+   иначе получит двойной insert (свой + от ROOT через sync:).
+   ============================================================ */
 void traffic_light_request_pedestrian(void)
 {
     if (!g_config.traffic.pedestrian.button_enabled) {
         ESP_LOGW(TAG, "pedestrian request ignored: button disabled in config");
+        return;
+    }
+
+    /* === FIX NODE-FOLLOW-ROOT === */
+    if (s_follow_root) {
+        ESP_LOGI(TAG, "pedestrian request: follow_root → delegate to ROOT "
+                      "(wait sync: per phase)");
+        return;
+    }
+    /* === END FIX NODE-FOLLOW-ROOT === */
+
+    if (s_hold_active && g_config.traffic.hold.enabled) {
+        if (g_config.traffic.hold.on_ped_request == HOLD_PED_IGNORE) {
+            ESP_LOGW(TAG, "pedestrian request ignored: hold + on_ped_request=ignore");
+            return;
+        }
+        if (g_config.traffic.hold.on_ped_request == HOLD_PED_MIN_RECALL) {
+            s_ped_min_recall = true;
+            ESP_LOGW(TAG, "pedestrian request: hold + min_recall");
+            return;
+        }
+        /* HOLD_PED_INSERT */
+        if (s_insert_pending) {
+            ESP_LOGW(TAG, "pedestrian insert: already pending → ignore");
+            return;
+        }
+        if (g_config.traffic.pedestrian.insert_count == 0) {
+            ESP_LOGW(TAG, "pedestrian insert: insert_sequence empty → fallback min_recall");
+            s_ped_min_recall = true;
+            return;
+        }
+        s_insert_pending  = true;
+        s_insert_request_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        for (int i = 0; i < g_config.traffic.pedestrian.insert_count; i++)
+            s_insert_queue[i] = g_config.traffic.pedestrian.insert_sequence[i];
+        s_insert_count = g_config.traffic.pedestrian.insert_count;
+        s_insert_idx   = 0;
+        ESP_LOGW(TAG, "pedestrian request: INSERT pending (seq=%u, lead=%lu ms)",
+                 s_insert_count,
+                 (unsigned long)g_config.traffic.pedestrian.insert_lead_ms);
         return;
     }
 
@@ -144,19 +187,29 @@ static inline uint32_t phase_blink_period_ms(void)
     return (p >= BLINK_MIN_PERIOD_MS) ? p : 500;
 }
 
-/* === FIX P0-3: максимум удержания зелёного (адаптивно) ===
-   Раньше: in_transport_green && !ped_request → бесконечное удержание
-   (сбрасывали s_phase_start_ms = now). Теперь — не более max_green,
-   после чего фаза переключается штатно. Значение = 3× green,
-   но не менее phases_ms.green (для совместимости). */
-static inline uint32_t max_green_hold_ms(void)
+/* ============================================================
+   insert_duration_ms — длительность фазы insert.
+
+   === FIX INSERT-RED-SHORT ===
+   Для insert-фазы с duration_kind=red используем
+   pedestrian.insert_red_ms (если > 0), чтобы не ждать полный
+   phases_ms.red (например, 8000) — иначе insert очень длинный.
+   Для остальных kind — обычный effective_stage_duration_ms.
+   ============================================================ */
+static uint32_t insert_duration_ms(uint8_t seq_idx)
 {
-    uint32_t base = g_config.traffic.phases_ms.green;
-    uint32_t maxg = base * 3;
-    if (maxg < base) maxg = base;   /* защита от переполнения */
-    return maxg;
+    uint32_t dur = effective_stage_duration_ms(seq_idx);
+    if (g_config.traffic.pedestrian.insert_red_ms > 0 &&
+        seq_idx < g_config.traffic.sequence_count) {
+        const traffic_stage_dd_t *st =
+            find_stage(g_config.traffic.sequence[seq_idx]);
+        if (st && st->duration_kind == DD_DUR_RED) {
+            dur = g_config.traffic.pedestrian.insert_red_ms;
+        }
+    }
+    return dur;
 }
-/* === END FIX P0-3 === */
+/* === END FIX INSERT-RED-SHORT === */
 
 void traffic_task_loop(void *arg)
 {
@@ -167,6 +220,7 @@ void traffic_task_loop(void *arg)
     uint8_t  last_min_green_phase  = 0xFF;
     uint8_t  last_min_recall_phase = 0xFF;
     uint32_t last_phase_log_ms = 0;
+    uint32_t last_hold_log_ms  = 0;
 
     TickType_t last_wake = xTaskGetTickCount();
 
@@ -188,7 +242,8 @@ void traffic_task_loop(void *arg)
 
                 ESP_LOGI(TAG, "PHASE: role=%s seq=%u stage=%u %s%s "
                               "pm=%lu/%lu state=%s fault=%s "
-                              "utc=%lu.%03u delta=%ld mask_recv=%d",
+                              "utc=%lu.%03u delta=%ld mask_recv=%d mask_valid=%d "
+                              "hold=%d insert=%d",
                          g_config.role == DEVICE_ROLE_MASTER ? "ROOT" : "NODE",
                          s_phase,
                          g_config.traffic.sequence[s_phase],
@@ -201,7 +256,10 @@ void traffic_task_loop(void *arg)
                          utc_ok ? (unsigned long)utc_sec : 0u,
                          utc_ok ? utc_ms : 0,
                          (long)time_sync_get_delta_ms(),
-                         (int)s_mask_received);
+                         (int)s_mask_received,
+                         (int)s_fault_mask_valid,
+                         (int)s_hold_active,
+                         (int)s_insert_pending);
             } else {
                 ESP_LOGI(TAG, "PHASE: role=%s state=%s (seq=%u fault=%s)",
                          g_config.role == DEVICE_ROLE_MASTER ? "ROOT" : "NODE",
@@ -215,23 +273,28 @@ void traffic_task_loop(void *arg)
 
         /* NODE: только blink + fault */
         if (s_follow_root) {
-            /* === FIX P0-1: пока не пришла первая маска, не мигаем
-               и не считаем fault (каналы и так OFF). === */
-            if (!s_mask_received) {
+            if (!s_mask_received && s_fault == TRAFFIC_FAULT_NONE) {
                 continue;
             }
-            /* === END FIX P0-1 === */
 
-            uint16_t bm = s_blink_mask;
-            uint32_t per = phase_blink_period_ms();
-            if (bm && (now - s_blink_last_phase >= per)) {
-                s_blink_last_phase = now;
-                s_blink_on = !s_blink_on;
-                for (int ch = 0; ch < 16; ch++) {
-                    if (bm & (1u << ch)) {
-                        if (s_blink_on) sr_output_on(ch);
-                        else            sr_output_off(ch);
+            if (s_fault == TRAFFIC_FAULT_NONE) {
+                uint16_t bm = s_blink_mask;
+                uint32_t per = phase_blink_period_ms();
+                if (bm && (now - s_blink_last_phase >= per)) {
+                    s_blink_last_phase = now;
+                    s_blink_on = !s_blink_on;
+                    for (int ch = 0; ch < 16; ch++) {
+                        if (bm & (1u << ch)) {
+                            if (s_blink_on) sr_output_on(ch);
+                            else            sr_output_off(ch);
+                        }
                     }
+                }
+            } else {
+                if (s_blink_mask != 0) {
+                    s_blink_mask = 0;
+                    s_blink_on = false;
+                    s_blink_last_phase = 0;
                 }
             }
 
@@ -275,6 +338,163 @@ void traffic_task_loop(void *arg)
             continue;
         }
 
+        /* === HOLD: определяем, в hold ли текущая фаза === */
+        {
+            bool cur_hold = false;
+            if (g_config.traffic.hold.enabled) {
+                for (int i = 0; i < g_config.traffic.hold.stage_count; i++) {
+                    if (g_config.traffic.sequence[s_phase] ==
+                        g_config.traffic.hold.stage_ids[i]) {
+                        cur_hold = true;
+                        break;
+                    }
+                }
+            }
+            if (cur_hold != s_hold_active) {
+                ESP_LOGW(TAG, "hold: %s (phase %u seq=%u)",
+                         cur_hold ? "ENTER" : "EXIT",
+                         g_config.traffic.sequence[s_phase], s_phase);
+                s_hold_active = cur_hold;
+            }
+        }
+
+        /* === FIX HOLD-STABLE: не выходим из hold, если phase_sync_task
+           собирается применить force_phase (pending) — иначе s_phase
+           меняется извне и hold мерцает ENTER/EXIT. === */
+        if (s_hold_active && !s_insert_pending) {
+            if (s_pending_sync_phase != 0xFF) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+
+            if (g_config.traffic.hold.max_hold_ms > 0 &&
+                (now - s_phase_start_ms) >= g_config.traffic.hold.max_hold_ms) {
+                ESP_LOGW(TAG, "hold: max_hold_ms=%lu reached → force next",
+                         (unsigned long)g_config.traffic.hold.max_hold_ms);
+                /* пропускаем вниз — обычное переключение */
+            } else {
+                if (now - last_hold_log_ms >= 5000) {
+                    last_hold_log_ms = now;
+                    ESP_LOGI(TAG, "hold: phase %u (seq=%u) pm=%lu → waiting",
+                             g_config.traffic.sequence[s_phase], s_phase,
+                             (unsigned long)(now - s_phase_start_ms));
+                }
+                continue;
+            }
+        }
+        /* === END FIX HOLD-STABLE === */
+
+        /* ============================================================
+           INSERT: проигрывание insert_sequence
+
+           === FIX INSERT-DURATION ===
+           Каждая фаза insert проигрывается с её duration_ms
+           (из phases_ms), а не пролетает всю очередь за 80 ms.
+           insert_lead_ms применяется ТОЛЬКО к первой фазе
+           (s_insert_idx == 0).
+           === END FIX INSERT-DURATION ===
+           ============================================================ */
+        if (s_insert_pending) {
+            uint32_t since_req = now - s_insert_request_ms;
+
+            /* lead_ms — только перед ПЕРВОЙ insert-фазой */
+            if (s_insert_idx == 0 &&
+                since_req < g_config.traffic.pedestrian.insert_lead_ms) {
+                continue;
+            }
+
+            /* Ждём окончания dur ТЕКУЩЕЙ insert-фазы (со 2-й итерации).
+               s_insert_idx > 0 && s_insert_idx <= s_insert_count —
+               значит, уже применена хотя бы одна insert-фаза, и
+               s_phase указывает на неё. */
+            if (s_insert_idx > 0 && s_insert_idx <= s_insert_count) {
+                uint32_t dur_current = insert_duration_ms(s_phase);
+                uint32_t elapsed     = now - s_phase_start_ms;
+                if (elapsed < dur_current) {
+                    continue;  /* ещё рано переключать */
+                }
+            }
+
+            if (s_insert_idx < s_insert_count) {
+                uint8_t ins_id = s_insert_queue[s_insert_idx++];
+                uint8_t seq_idx = 0xFF;
+                for (int i = 0; i < g_config.traffic.sequence_count; i++) {
+                    if (g_config.traffic.sequence[i] == ins_id) {
+                        seq_idx = (uint8_t)i;
+                        break;
+                    }
+                }
+                if (seq_idx == 0xFF) {
+                    ESP_LOGW(TAG, "insert: stage_id=%u not in sequence, skip", ins_id);
+                    continue;
+                }
+                uint32_t dur_ins = insert_duration_ms(seq_idx);
+                ESP_LOGW(TAG, "insert: phase id=%u (seq=%u) dur=%lu",
+                         ins_id, seq_idx, (unsigned long)dur_ins);
+
+                if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
+                    s_phase = seq_idx;
+                    s_phase_start_ms = now;
+                    s_hold_active = false;
+                    xSemaphoreGive(s_mutex);
+                }
+
+                /* === FIX INSERT-NO-DOUBLE-SYNC ===
+                   apply_stage_dd под s_in_force_phase — не дёргает
+                   s_phase_change_cb. Потом гасим pending (на случай
+                   гонки с phase_sync_task). sync: шлём сами с force. */
+                s_in_force_phase = true;
+                apply_stage_dd(seq_idx);
+                s_in_force_phase = false;
+                phase_change_cancel_pending();
+
+                send_sync_to_node_async_ex(seq_idx, 0, dur_ins, true, NULL);
+                /* === END FIX INSERT-NO-DOUBLE-SYNC === */
+                continue;
+            }
+
+            /* конец очереди — return_to_hold */
+            if (g_config.traffic.pedestrian.return_to_hold &&
+                g_config.traffic.hold.stage_count > 0) {
+                /* Ждём окончания dur ПОСЛЕДНЕЙ insert-фазы */
+                uint32_t dur_last = insert_duration_ms(s_phase);
+                uint32_t elapsed  = now - s_phase_start_ms;
+                if (elapsed < dur_last) {
+                    continue;
+                }
+
+                uint8_t hold_id = g_config.traffic.hold.stage_ids[0];
+                uint8_t seq_idx = 0xFF;
+                for (int i = 0; i < g_config.traffic.sequence_count; i++) {
+                    if (g_config.traffic.sequence[i] == hold_id) {
+                        seq_idx = (uint8_t)i;
+                        break;
+                    }
+                }
+                if (seq_idx != 0xFF) {
+                    uint32_t dur_hold = effective_stage_duration_ms(seq_idx);
+                    ESP_LOGW(TAG, "insert: return to hold phase id=%u (seq=%u)",
+                             hold_id, seq_idx);
+                    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
+                        s_phase = seq_idx;
+                        s_phase_start_ms = now;
+                        xSemaphoreGive(s_mutex);
+                    }
+                    s_in_force_phase = true;
+                    apply_stage_dd(seq_idx);
+                    s_in_force_phase = false;
+                    phase_change_cancel_pending();
+                    send_sync_to_node_async_ex(seq_idx, 0, dur_hold, true, NULL);
+                }
+            }
+            s_insert_pending = false;
+            s_insert_idx = 0;
+            s_insert_count = 0;
+            continue;
+        }
+        /* === END INSERT === */
+
+        /* обычный blink_mask (не hold, не insert) */
         uint16_t bm = s_blink_mask;
         uint32_t per = phase_blink_period_ms();
         if (bm && (now - s_blink_last_phase >= per)) {
@@ -358,32 +578,6 @@ void traffic_task_loop(void *arg)
 
         if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE) continue;
 
-        /* === FIX P0-3: удержание зелёного до max_green_hold_ms,
-           НО без сброса s_phase_start_ms. После — переключаемся. === */
-        {
-            const traffic_stage_dd_t *cur_st = find_stage(g_config.traffic.sequence[s_phase]);
-            bool in_transport_green = false;
-            if (cur_st) {
-                for (int g = 0; g < cur_st->group_count; g++) {
-                    if (cur_st->groups[g] == 3) { in_transport_green = true; break; }
-                }
-            }
-            bool min_recall_hold = s_ped_min_recall && in_transport_green;
-            if (in_transport_green && !s_ped_request && !min_recall_hold) {
-                uint32_t maxg = max_green_hold_ms();
-                uint32_t elapsed = now - s_phase_start_ms;
-                if (elapsed < maxg) {
-                    /* ещё не время принудительно переключать — просто
-                       НЕ сбрасываем s_phase_start_ms. */
-                    xSemaphoreGive(s_mutex);
-                    continue;
-                }
-                ESP_LOGW(TAG, "green hold reached max_green=%lu ms → force next",
-                         (unsigned long)maxg);
-            }
-        }
-        /* === END FIX P0-3 === */
-
         uint8_t next_phase;
 
         if (s_ped_request &&
@@ -426,8 +620,6 @@ void traffic_task_loop(void *arg)
                  s_phase, g_config.traffic.sequence[s_phase],
                  (unsigned long)stage_duration_ms(s_phase),
                  stage_is_pedestrian(s_phase) ? " (PED)" : "");
-
-        /* on_phase_change вызывается из apply_stage_dd; здесь не дублируем */
     }
 }
 
@@ -440,9 +632,11 @@ esp_err_t traffic_light_init(void)
     set_all_off();
     xTaskCreate(traffic_task_loop, "traffic_task", 8192, NULL, 4, &s_task);
     ESP_LOGI(TAG, "Traffic initialized (DD, stages=%u seq=%u ped_button=%d, "
-                  "follow_root=%d)",
+                  "follow_root=%d, hold=%d/%u, insert_seq=%u)",
              g_config.traffic.stage_count, g_config.traffic.sequence_count,
-             g_config.traffic.pedestrian.button_enabled, s_follow_root);
+             g_config.traffic.pedestrian.button_enabled, s_follow_root,
+             g_config.traffic.hold.enabled, g_config.traffic.hold.stage_count,
+             g_config.traffic.pedestrian.insert_count);
     return ESP_OK;
 }
 
@@ -503,12 +697,18 @@ esp_err_t traffic_light_set_mode(traffic_mode_t mode)
     s_fault = TRAFFIC_FAULT_NONE;
     s_fault_count = 0;
     s_fault_yellow_mask = 0;
+    s_fault_yellow_mask_from_root = 0;
+    s_fault_mask_valid            = false;
     s_recovery_attempts = 0;
     s_ok_streak = 0;
     s_last_recovery_ok_ms = 0;
     s_fault_blink_state = false;
     s_ped_request = false;
     s_ped_min_recall = false;
+    s_hold_active = false;
+    s_insert_pending = false;
+    s_insert_count = 0;
+    s_insert_idx = 0;
     set_all_off();
     ESP_LOGI(TAG, "Mode set to %d", mode);
     return ESP_OK;
@@ -560,9 +760,10 @@ esp_err_t traffic_light_start(void)
         apply_fault_mode(f);
     }
 
-    ESP_LOGI(TAG, "START (mode=%d, seq=%u, fault=%s, follow_root=%d)",
+    ESP_LOGI(TAG, "START (mode=%d, seq=%u, fault=%s, follow_root=%d, hold=%d)",
              s_mode, g_config.traffic.sequence_count,
-             traffic_light_fault_str(), s_follow_root);
+             traffic_light_fault_str(), s_follow_root,
+             (int)s_hold_active);
     return ESP_OK;
 }
 
@@ -582,6 +783,8 @@ esp_err_t traffic_light_stop(void)
     s_fault = TRAFFIC_FAULT_NONE;
     s_fault_count = 0;
     s_fault_yellow_mask = 0;
+    s_fault_yellow_mask_from_root = 0;
+    s_fault_mask_valid            = false;
     s_recovery_attempts = 0;
     s_ok_streak = 0;
     s_last_recovery_ok_ms = 0;
@@ -594,9 +797,11 @@ esp_err_t traffic_light_stop(void)
     s_fault_blink_state = false;
     s_ped_request = false;
     s_ped_min_recall = false;
-    /* === FIX P0-1: сбрасываем флаг маски. === */
     s_mask_received = false;
-    /* === END FIX P0-1 === */
+    s_hold_active = false;
+    s_insert_pending = false;
+    s_insert_count = 0;
+    s_insert_idx = 0;
     xSemaphoreGive(s_mutex);
     set_all_off();
     ESP_LOGI(TAG, "STOP");
@@ -639,7 +844,7 @@ esp_err_t traffic_light_reset(void)
     if (!s_mutex) {
         s_state = TRAFFIC_STATE_STOPPED;
         s_phase = 0;
-        s_mask_received = false;   /* FIX P0-1 */
+        s_mask_received = false;
         set_all_off();
         ESP_LOGI(TAG, "RESET (no mutex yet)");
         return ESP_OK;
@@ -651,6 +856,8 @@ esp_err_t traffic_light_reset(void)
     s_fault = TRAFFIC_FAULT_NONE;
     s_fault_count = 0;
     s_fault_yellow_mask = 0;
+    s_fault_yellow_mask_from_root = 0;
+    s_fault_mask_valid            = false;
     s_recovery_attempts = 0;
     s_ok_streak = 0;
     s_last_recovery_ok_ms = 0;
@@ -663,7 +870,11 @@ esp_err_t traffic_light_reset(void)
     s_fault_blink_state = false;
     s_ped_request = false;
     s_ped_min_recall = false;
-    s_mask_received = false;   /* FIX P0-1 */
+    s_mask_received = false;
+    s_hold_active = false;
+    s_insert_pending = false;
+    s_insert_count = 0;
+    s_insert_idx = 0;
     xSemaphoreGive(s_mutex);
     set_all_off();
     ESP_LOGI(TAG, "RESET");
@@ -681,6 +892,8 @@ esp_err_t traffic_light_next_phase(void)
     }
     s_phase = (s_phase + 1) % g_config.traffic.sequence_count;
     s_phase_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    s_hold_active = false;
+    s_insert_pending = false;
     uint8_t ph = s_phase;
     xSemaphoreGive(s_mutex);
     apply_stage_dd(ph);
@@ -688,8 +901,6 @@ esp_err_t traffic_light_next_phase(void)
     return ESP_OK;
 }
 
-/* === FIX P1-14: force_phase — apply_stage_dd не дёргает
-   on_phase_change (см. traffic_config.c). === */
 esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
                                     uint32_t duration_ms)
 {
@@ -699,7 +910,7 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
         phase = phase % g_config.traffic.sequence_count;
 
     if (duration_ms > 0 && phase_ms >= duration_ms) {
-        ESP_LOGW(TAG, "force_phase: pm=%lu >= dur=%lu → clamp to 0",
+        ESP_LOGW(TAG, "force_phase: pm=%lu >= dur=%lu → set 0",
                  (unsigned long)phase_ms, (unsigned long)duration_ms);
         phase_ms = 0;
     }
@@ -748,11 +959,7 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
              in_fault ? "ACTIVE" : "NONE");
     return ESP_OK;
 }
-/* === END FIX P1-14 === */
 
-/* === FIX P0-1: apply_mask выставляет s_mask_received,
-   FIX P1-14: apply_mask не должен дёргать on_phase_change
-   (это делает ROOT; NODE только применяет). === */
 void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
                               uint8_t phase, uint32_t phase_ms,
                               uint32_t duration_ms)
@@ -773,9 +980,9 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
     if (duration_ms > 0 && phase_ms >= duration_ms) {
-        ESP_LOGW(TAG, "apply_mask: pm=%lu >= dur=%lu → clamp",
+        ESP_LOGW(TAG, "apply_mask: pm=%lu >= dur=%lu → set 0",
                  (unsigned long)phase_ms, (unsigned long)duration_ms);
-        phase_ms = duration_ms - 1;
+        phase_ms = 0;
     }
 
     s_phase            = phase;
@@ -784,13 +991,10 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
     s_blink_mask       = blink_mask;
     s_blink_on         = false;
     s_blink_last_phase = 0;
-    /* === FIX P0-1: первая маска получена — теперь fault-детектор
-       и мигание разрешены. === */
     if (!s_mask_received) {
         ESP_LOGI(TAG, "APPLY MASK: first mask from ROOT → fault detection enabled");
         s_mask_received = true;
     }
-    /* === END FIX P0-1 === */
     xSemaphoreGive(s_mutex);
 
     uint16_t active = traffic_light_active_sr_mask_internal();
@@ -807,7 +1011,6 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
              phase, (unsigned long)phase_ms, (unsigned long)duration_ms,
              (unsigned)on_mask, (unsigned)blink_mask);
 }
-/* === END FIX P0-1 / P1-14 === */
 
 esp_err_t traffic_light_force_phase_masked(uint8_t phase,
                                            uint32_t phase_ms,
@@ -815,11 +1018,6 @@ esp_err_t traffic_light_force_phase_masked(uint8_t phase,
 {
     esp_err_t err = traffic_light_force_phase(phase, phase_ms, duration_ms);
     if (err != ESP_OK) return err;
-
-    uint16_t on_mask    = traffic_light_get_phase_on_mask();
-    uint16_t blink_mask = traffic_light_get_phase_blink_mask();
-    ESP_LOGD(TAG, "force_phase_masked: ph=%u on=0x%04X blink=0x%04X",
-             phase, (unsigned)on_mask, (unsigned)blink_mask);
     return ESP_OK;
 }
 

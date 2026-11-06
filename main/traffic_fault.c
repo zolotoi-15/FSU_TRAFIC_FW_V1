@@ -3,8 +3,16 @@
    check_faults, set_fault, build_fault_report.
 
    === FIX P0-1: NODE не проверяет fault, пока не получена первая
-   маска (sync:) от ROOT. Иначе до первого sync: NODE видит
-   «каналы должны быть ON, но OFF» и выставляет ложный YELLOW_BLINK.
+       маска (sync:) от ROOT.
+   === FIX 1: apply_fault_mode сбрасывает s_blink_mask / s_blink_on /
+       s_blink_last_phase — иначе в follow_root одновременно мигают
+       старый s_blink_mask (зелёный) и fault_blink_yellow (жёлтый).
+   === FIX 4: для NODE в follow_root маска жёлтых берётся из
+       s_fault_yellow_mask_from_root (передаётся ROOT в
+       fault:yellow_blink:0xXXXX:...). s_fault_mask_valid отличает
+       «маска не передана» от «передана 0x0000» (валидная пустая).
+       Fallback — по s_mode (legacy / ROOT).
+   === FIX 5: fault мигает даже без s_mask_received.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -32,21 +40,54 @@ extern int       board_read_iload_raw(uint8_t channel,
 extern volatile bool s_mask_received;
 /* === END FIX P0-1 === */
 
+/* === FIX 4: маска жёлтых, переданная ROOT в fault:yellow_blink:...
+   s_fault_mask_valid отличает «не передана» от «передана 0x0000». */
+volatile uint16_t s_fault_yellow_mask_from_root = 0;
+volatile bool     s_fault_mask_valid            = false;
+/* === END FIX 4 === */
+
 static inline uint32_t fault_blink_period_ms(void)
 {
     uint32_t p = g_config.traffic.phases_ms.fault_blink_period;
     return (p >= BLINK_MIN_PERIOD_MS) ? p : 500;
 }
 
+/* ============================================================
+   apply_fault_mode
+
+   === FIX 1: сбрасываем s_blink_mask / s_blink_on / s_blink_last_phase.
+   === FIX 4: маска жёлтых:
+       - если s_follow_root && s_fault_mask_valid
+         → используем s_fault_yellow_mask_from_root (ROOT прислал);
+       - иначе — вычисляем по s_mode (ROOT или legacy NODE).
+   ============================================================ */
 void apply_fault_mode(traffic_fault_t fault)
 {
     set_all_off();
+
+    /* === FIX 1: гасим blink-состояние === */
+    s_blink_mask       = 0;
+    s_blink_on         = false;
+    s_blink_last_phase = 0;
+    /* === END FIX 1 === */
+
     s_fault_yellow_mask = 0;
 
     if (fault == TRAFFIC_FAULT_ALL_OFF) {
         ESP_LOGE(TAG, "FAULT → ALL_OFF");
         return;
     }
+
+    /* === FIX 4: приоритет — маска от ROOT (NODE в follow_root).
+       s_fault_mask_valid позволяет принять даже 0x0000 (валидная
+       пустая маска, ROOT без жёлтых в s_mode). === */
+    if (s_follow_root && s_fault_mask_valid) {
+        s_fault_yellow_mask = s_fault_yellow_mask_from_root;
+        ESP_LOGE(TAG, "FAULT → YELLOW_BLINK (mask=0x%04X from ROOT)",
+                 s_fault_yellow_mask);
+        return;
+    }
+    /* === END FIX 4 === */
 
     switch (s_mode) {
     case TRAFFIC_MODE_SINGLE:
@@ -64,7 +105,8 @@ void apply_fault_mode(traffic_fault_t fault)
                               (1u << g_config.traffic.pins.cross_ped.axis_a3.yellow);
         break;
     }
-    ESP_LOGE(TAG, "FAULT → YELLOW_BLINK (mask=0x%04X)", s_fault_yellow_mask);
+    ESP_LOGE(TAG, "FAULT → YELLOW_BLINK (mask=0x%04X by s_mode)",
+             s_fault_yellow_mask);
 }
 
 void fault_blink_yellow(bool on)
@@ -162,6 +204,8 @@ void try_recovery(uint32_t now_ms, uint32_t *blink_last)
                 s_fault = TRAFFIC_FAULT_NONE;
                 s_fault_count = 0;
                 s_fault_yellow_mask = 0;
+                s_fault_yellow_mask_from_root = 0;   /* FIX 4 */
+                s_fault_mask_valid            = false; /* FIX 4 */
                 s_last_fault_notify_ms = 0;
                 s_last_recovery_ok_ms = now_ms;
                 s_fault_blink_state = false;
@@ -269,12 +313,13 @@ void traffic_light_check_faults(const mux_data_t *data)
     if (!data || !data->valid) return;
     if (s_fault != TRAFFIC_FAULT_NONE) return;
 
-    /* === FIX P0-1: NODE в follow_root, но маска ещё не пришла
-       от ROOT — каналы заведомо OFF, проверять нечего. === */
-    if (s_follow_root && !s_mask_received) {
+    /* === FIX P0-1 / FIX 5: NODE в follow_root, но маска ещё не пришла
+       от ROOT — каналы заведомо OFF, проверять нечего. Но если уже
+       есть fault — не блокируемся (fault мигает независимо). === */
+    if (s_follow_root && !s_mask_received && s_fault == TRAFFIC_FAULT_NONE) {
         return;
     }
-    /* === END FIX P0-1 === */
+    /* === END FIX P0-1 / FIX 5 === */
 
     uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (now_ms - s_phase_start_ms < g_config.traffic.fault.phase_grace_ms) return;
@@ -437,6 +482,8 @@ void traffic_light_set_fault(traffic_fault_t fault)
         if (fire) s_last_fault_notify_ms = s_last_recovery_ms;
     } else {
         s_fault_yellow_mask = 0;
+        s_fault_yellow_mask_from_root = 0;   /* FIX 4 */
+        s_fault_mask_valid            = false; /* FIX 4 */
         s_fault_count = 0;
         s_last_fault_notify_ms = 0;
         s_fault_blink_state = false;
@@ -483,6 +530,17 @@ size_t traffic_light_build_fault_report(char *buf, size_t size)
     }
 
     int off = snprintf(buf, size, "fault:%s:", fault_mode_str(f));
+
+    /* === FIX 4: для yellow_blink добавляем маску жёлтых, чтобы NODE
+       мигал теми же каналами, что ROOT. Формат:
+         fault:yellow_blink:0x0092:<ch>,<ch>:<reason>,<reason>
+       ROOT (s_mode) вычисляет s_fault_yellow_mask в apply_fault_mode.
+       NODE (follow_root) использует её через s_fault_yellow_mask_from_root. */
+    if (f == TRAFFIC_FAULT_YELLOW_BLINK) {
+        off += snprintf(buf + off, size - off, "0x%04X:",
+                        (unsigned)s_fault_yellow_mask);
+    }
+    /* === END FIX 4 === */
 
     bool first = true;
     for (uint8_t i = 0; i < cnt; i++) {

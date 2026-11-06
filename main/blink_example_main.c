@@ -2,13 +2,31 @@
    blink_example_main.c — PRODUCTION app_main().
 
    === FIX: apply_pending_cfg_from_nvs НЕ стирает pending при
-   ошибке парсинга.
+       ошибке парсинга.
    === LINK LOSS: 5 пропущенных пакетов подряд → связь потеряна.
-   === FIX C: LINK_*_EXPECT_MS с запасом над реальными периодами
-       (NODE_STATUS_PERIOD_MS / HEARTBEAT_INTERVAL_MS = 10 с),
-       иначе ложные тревоги из-за границы периода.
-   === FIX time-log: периодический лог дельты времени NODE vs ROOT
-       (раз в 30 с).
+   === FIX C: LINK_*_EXPECT_MS с запасом над реальными периодами.
+   === FIX time-log: периодический лог дельты времени NODE vs ROOT.
+
+   === FIX MQTT-NO-IP: on_got_ip проверяет modem_ppp_is_connected()
+       перед стартом SNTP/MQTT.
+
+   === FIX STACK-OVERFLOW ===
+       Причина assert (pxQueue->uxItemSize == 0) в xQueueSemaphoreTake
+       из newlib _lock_acquire_recursive во время ESP_LOGE внутри
+       config_load_json:
+         - main_task stack = 3584 байт (default IDF),
+         - app_config_t tmp ≈ 7.7 КБ в config_load_json на стеке,
+         - stack overflow → порча newlib lock → assert.
+       Фикс:
+         - config_load_json / config_load_lora_json используют
+           static app_config_t tmp + mutex (правка в config_manager.c);
+         - load_embedded_config_if_needed / apply_pending_cfg_from_nvs
+           вынесены в отдельную задачу cfg_load со стеком 24 КБ
+           (чтобы даже с static tmp не рисковать main_task);
+         - nvs_app_cfg_exists больше не аллоцирует app_config_t
+           на стеке (static);
+         - sdkconfig: CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384.
+   === END FIX STACK-OVERFLOW ===
    ============================================================ */
 
 #include <stdio.h>
@@ -17,6 +35,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_event.h"
 #include "esp_system.h"
@@ -64,6 +83,10 @@ static const char *TAG = "board";
 #define LINK_ROOT_EXPECT_MS   15000
 #define LINK_NODE_EXPECT_MS   15000
 /* === END FIX C === */
+
+/* === FIX STACK-OVERFLOW: стек задачи cfg_load === */
+#define CFG_LOAD_TASK_STACK   24576
+/* === END FIX STACK-OVERFLOW === */
 
 ds1307_handle_t rtc_handle = NULL;
 
@@ -160,6 +183,12 @@ static void link_monitor_task(void *arg)
 }
 /* === END LINK LOSS === */
 
+/* ============================================================
+   on_got_ip
+
+   === FIX MQTT-NO-IP: проверяем modem_ppp_is_connected() перед
+       стартом SNTP/MQTT.
+   ============================================================ */
 static void on_got_ip(void *arg, esp_event_base_t base,
                       int32_t id, void *data)
 {
@@ -167,34 +196,58 @@ static void on_got_ip(void *arg, esp_event_base_t base,
     if (sntp_started) return;
     if (g_config.role != DEVICE_ROLE_MASTER) return;
 
+    /* === FIX MQTT-NO-IP === */
+    extern bool modem_ppp_is_connected(void);
+    if (!modem_ppp_is_connected()) {
+        ESP_LOGW(TAG, "on_got_ip: PPP not connected → skip");
+        return;
+    }
+    /* === END FIX MQTT-NO-IP === */
+
     ESP_LOGI(TAG, "GOT_IP → starting SNTP + MQTT");
     time_sync_start_sntp();
     sntp_started = true;
 
     if (!wifi_mqtt_is_connected()) {
-        wifi_mqtt_init();
+        esp_err_t err = wifi_mqtt_init();
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGW(TAG, "wifi_mqtt_init: %s", esp_err_to_name(err));
+        }
     }
 }
 
+/* ============================================================
+   nvs_app_cfg_exists
+
+   === FIX STACK-OVERFLOW: app_config_t в static, не на стеке.
+       Вызывается из main_task (3584 байт default) — 7.7 КБ tmp
+       на стеке = stack overflow. ===
+   ============================================================ */
 static bool nvs_app_cfg_exists(void)
 {
     nvs_handle_t nvs;
     if (nvs_open("app_cfg", NVS_READONLY, &nvs) != ESP_OK) return false;
 
-    size_t sz = sizeof(app_config_t);
-    app_config_t *tmp = malloc(sizeof(app_config_t));
+    /* === FIX STACK-OVERFLOW: static вместо стека === */
+    static app_config_t tmp;
+    /* === END FIX STACK-OVERFLOW === */
+
+    size_t sz = sizeof(tmp);
     bool ok = false;
-    if (tmp) {
-        if (nvs_get_blob(nvs, "cfg_blob", tmp, &sz) == ESP_OK &&
-            sz == sizeof(app_config_t)) {
-            ok = true;
-        }
-        free(tmp);
+    if (nvs_get_blob(nvs, "cfg_blob", &tmp, &sz) == ESP_OK &&
+        sz == sizeof(tmp)) {
+        ok = true;
     }
     nvs_close(nvs);
     return ok;
 }
 
+/* ============================================================
+   apply_pending_cfg_from_nvs
+
+   === FIX STACK-OVERFLOW: вызывается из cfg_load task (24 КБ),
+       не из main_task. config_load_json сам использует static tmp. ===
+   ============================================================ */
 static bool apply_pending_cfg_from_nvs(void)
 {
     nvs_handle_t nvs;
@@ -270,6 +323,11 @@ static bool apply_pending_cfg_from_nvs(void)
     return ok;
 }
 
+/* ============================================================
+   load_embedded_config_if_needed
+
+   === FIX STACK-OVERFLOW: вызывается из cfg_load task (24 КБ). ===
+   ============================================================ */
 static void load_embedded_config_if_needed(void)
 {
     size_t len = (size_t)(config_json_end - config_json_start);
@@ -284,6 +342,67 @@ static void load_embedded_config_if_needed(void)
              (unsigned)len);
     config_load_json((const char *)config_json_start, len);
 }
+
+/* ============================================================
+   cfg_load_task
+
+   === FIX STACK-OVERFLOW ===
+       app_config_t tmp (~7.7 КБ) + cJSON + set_defaults_to + NVS
+       не влезают в main_task stack (3584 байт default).
+       Выносим apply_pending_cfg_from_nvs + load_embedded_config_if_needed
+       в отдельную задачу со стеком 24 КБ.
+       main_task только ждёт завершения через бинарный семафор.
+   ============================================================ */
+typedef struct {
+    bool              pending_applied;
+    SemaphoreHandle_t done;
+} cfg_load_ctx_t;
+
+static void cfg_load_task(void *arg)
+{
+    cfg_load_ctx_t *ctx = (cfg_load_ctx_t *)arg;
+
+    ESP_LOGI(TAG, "cfg_load_task: stack=%u, heap free=%u, largest=%u",
+             (unsigned)CFG_LOAD_TASK_STACK,
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+
+    ctx->pending_applied = apply_pending_cfg_from_nvs();
+    if (ctx->pending_applied) {
+        ESP_LOGI(TAG, "cfg_load_task: pending_cfg applied");
+    } else {
+        load_embedded_config_if_needed();
+    }
+
+    xSemaphoreGive(ctx->done);
+    vTaskDelete(NULL);
+}
+
+/* Запускает cfg_load_task и ждёт завершения. Возвращает pending_applied. */
+static bool run_cfg_load(void)
+{
+    cfg_load_ctx_t ctx = { .pending_applied = false, .done = NULL };
+    ctx.done = xSemaphoreCreateBinary();
+    if (!ctx.done) {
+        ESP_LOGE(TAG, "run_cfg_load: sem alloc failed");
+        return false;
+    }
+
+    TaskHandle_t th = NULL;
+    BaseType_t rc = xTaskCreate(cfg_load_task, "cfg_load",
+                                CFG_LOAD_TASK_STACK, &ctx, 5, &th);
+    if (rc != pdPASS) {
+        ESP_LOGE(TAG, "run_cfg_load: xTaskCreate failed (stack=%u)",
+                 (unsigned)CFG_LOAD_TASK_STACK);
+        vSemaphoreDelete(ctx.done);
+        return false;
+    }
+
+    xSemaphoreTake(ctx.done, portMAX_DELAY);
+    vSemaphoreDelete(ctx.done);
+    return ctx.pending_applied;
+}
+/* === END FIX STACK-OVERFLOW === */
 
 static void log_heap(const char *stage)
 {
@@ -340,13 +459,16 @@ void app_main(void)
 
     log_heap("app_main start");
 
-    bool pending_applied = apply_pending_cfg_from_nvs();
+    /* === FIX STACK-OVERFLOW: config load в отдельной задаче (24 КБ) ===
+       main_task stack = 3584 байт, app_config_t tmp ≈ 7.7 КБ →
+       stack overflow → порча newlib lock → assert.
+       cfg_load_task делает всю тяжёлую работу, main_task ждёт. */
+    bool pending_applied = run_cfg_load();
     if (pending_applied) {
         log_heap("after pending_cfg applied");
     }
-    if (!pending_applied) {
-        load_embedded_config_if_needed();
-    }
+    /* === END FIX STACK-OVERFLOW === */
+
     config_init();
 
     bool is_root = (g_config.role == DEVICE_ROLE_MASTER);

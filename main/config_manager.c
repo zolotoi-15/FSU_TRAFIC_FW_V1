@@ -10,6 +10,8 @@
 #include <time.h>
 #include <stdio.h>
 #include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "CFG";
 #define NVS_NS       "app_cfg"
@@ -22,6 +24,28 @@ static const char *TAG = "CFG";
 #define CFG_MIN_HEAP_FOR_PARSE  (48 * 1024)
 
 app_config_t g_config;
+
+/* === FIX STACK-OVERFLOW ===
+   app_config_t ≈ 7.7 КБ. На стеке main_task (3584 байт default)
+   это вызывает stack overflow → порча newlib lock → assert
+   (pxQueue->uxItemSize == 0) в xQueueSemaphoreTake.
+   Выносим tmp в static + mutex (защита от параллельного вызова
+   из cfg_load_task и mqtt-task). */
+static app_config_t      s_cfg_load_tmp;
+static SemaphoreHandle_t s_cfg_load_mtx = NULL;
+
+static SemaphoreHandle_t cfg_load_lock(void)
+{
+    if (!s_cfg_load_mtx) s_cfg_load_mtx = xSemaphoreCreateMutex();
+    if (!s_cfg_load_mtx) return NULL;
+    if (xSemaphoreTake(s_cfg_load_mtx, portMAX_DELAY) != pdTRUE) return NULL;
+    return s_cfg_load_mtx;
+}
+static inline void cfg_load_unlock(void)
+{
+    if (s_cfg_load_mtx) xSemaphoreGive(s_cfg_load_mtx);
+}
+/* === END FIX STACK-OVERFLOW === */
 
 static char  *s_cfg_json_cache = NULL;
 static size_t s_cfg_json_len   = 0;
@@ -38,9 +62,10 @@ static void config_cache_invalidate(void)
 
 static const char *duration_kind_to_str(uint8_t kind);
 static const char *ped_request_mode_to_str(uint8_t m);
+static const char *hold_on_ped_to_str(uint8_t m);
 
 /* ============================================================
-   FIX: set_defaults_to(cfg) — не трогает глобальный g_config.
+   set_defaults_to(cfg) — не трогает глобальный g_config.
    ============================================================ */
 static void set_defaults_to(app_config_t *cfg)
 {
@@ -93,6 +118,17 @@ static void set_defaults_to(app_config_t *cfg)
     cfg->traffic.pedestrian.request_mode      = PED_REQUEST_MODE_STAGE;
     cfg->traffic.pedestrian.insert_timeout_ms = 30000;
     cfg->traffic.pedestrian.min_recall_s      = 5;
+
+    /* === NEW: hold/insert defaults === */
+    cfg->traffic.pedestrian.insert_count      = 0;
+    cfg->traffic.pedestrian.insert_lead_ms    = 300;
+    cfg->traffic.pedestrian.return_to_hold    = true;
+
+    cfg->traffic.hold.enabled        = false;
+    cfg->traffic.hold.stage_count    = 0;
+    cfg->traffic.hold.max_hold_ms    = 0;
+    cfg->traffic.hold.on_ped_request = HOLD_PED_INSERT;
+    /* === END NEW: hold/insert === */
 
     cfg->traffic.pins.single = (traffic_color_pins_t){0,1,2};
     cfg->traffic.pins.cross.a_north = (traffic_color_pins_t){0,1,2};
@@ -175,11 +211,13 @@ void config_load(void)
         config_save();
     } else {
         ESP_LOGI(TAG, "Config loaded (version=%.2f, SSID='%s', traffic.mode=%u, "
-                      "stages=%u, seq=%u, ped_mode=%u)",
+                      "stages=%u, seq=%u, ped_mode=%u, hold=%d/%u)",
                  g_config.version,
                  g_config.wifi_ssid, g_config.traffic.mode,
                  g_config.traffic.stage_count, g_config.traffic.sequence_count,
-                 g_config.traffic.pedestrian.request_mode);
+                 g_config.traffic.pedestrian.request_mode,
+                 g_config.traffic.hold.enabled,
+                 g_config.traffic.hold.stage_count);
     }
 }
 
@@ -196,9 +234,11 @@ void config_save(void)
     nvs_close(nvs);
     if (err == ESP_OK) {
         config_cache_invalidate();
-        ESP_LOGI(TAG, "Config saved to NVS (version=%.2f, %u bytes, ped_mode=%u)",
+        ESP_LOGI(TAG, "Config saved to NVS (version=%.2f, %u bytes, ped_mode=%u, "
+                      "hold=%d)",
                  g_config.version, (unsigned)sizeof(g_config),
-                 g_config.traffic.pedestrian.request_mode);
+                 g_config.traffic.pedestrian.request_mode,
+                 g_config.traffic.hold.enabled);
     } else {
         ESP_LOGE(TAG, "nvs_set_blob failed: %s", esp_err_to_name(err));
     }
@@ -235,12 +275,10 @@ esp_err_t config_save_role(device_role_t role)
     if (err == ESP_OK) err = nvs_set_u8(nvs, NVS_KEY_LOCK, 1);
     if (err == ESP_OK) err = nvs_commit(nvs);
     nvs_close(nvs);
-    /* === FIX: обновляем g_config.role + инвалидируем кэш === */
     if (err == ESP_OK) {
         g_config.role = role;
         config_cache_invalidate();
     }
-    /* === END FIX === */
     ESP_LOGI(TAG, "role saved: %s (locked)",
              role == DEVICE_ROLE_SLAVE ? "slave" : "master");
     return err;
@@ -432,6 +470,11 @@ static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
     tc->pedestrian.min_recall_s =
         (uint32_t)json_get_int(ped, "min_recall_s", 5);
 
+    tc->pedestrian.insert_lead_ms =
+        (uint32_t)json_get_int(ped, "insert_lead_ms", 300);
+    tc->pedestrian.return_to_hold =
+        json_get_bool(ped, "return_to_hold", true);
+
     const cJSON *rm = cJSON_GetObjectItemCaseSensitive(ped, "request_mode");
     if (cJSON_IsString(rm) && rm->valuestring) {
         if (strcmp(rm->valuestring, "stage") == 0)
@@ -445,14 +488,71 @@ static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
                      rm->valuestring);
     }
 
-    ESP_LOGI(TAG, "pedestrian: button=%d mode=%u insert=%lu min_recall=%lu",
+    const cJSON *is = cJSON_GetObjectItemCaseSensitive(ped, "insert_sequence");
+    if (cJSON_IsArray(is)) {
+        tc->pedestrian.insert_count = 0;
+        const cJSON *it = NULL;
+        cJSON_ArrayForEach(it, is) {
+            if (tc->pedestrian.insert_count < MAX_INSERT_SEQ &&
+                cJSON_IsNumber(it)) {
+                tc->pedestrian.insert_sequence[tc->pedestrian.insert_count++] =
+                    (uint8_t)it->valueint;
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "pedestrian: button=%d mode=%u insert=%lu min_recall=%lu "
+                  "insert_seq=%u lead=%lu return_hold=%d",
              tc->pedestrian.button_enabled,
              tc->pedestrian.request_mode,
              (unsigned long)tc->pedestrian.insert_timeout_ms,
-             (unsigned long)tc->pedestrian.min_recall_s);
+             (unsigned long)tc->pedestrian.min_recall_s,
+             tc->pedestrian.insert_count,
+             (unsigned long)tc->pedestrian.insert_lead_ms,
+             tc->pedestrian.return_to_hold);
 }
 
-/* === FIX: parse_traffic принимает tc, не пишет в g_config === */
+static void parse_hold(const cJSON *t, traffic_config_t *tc)
+{
+    const cJSON *h = cJSON_GetObjectItemCaseSensitive(t, "hold");
+    if (!cJSON_IsObject(h)) {
+        ESP_LOGI(TAG, "hold: section missing → disabled");
+        tc->hold.enabled = false;
+        return;
+    }
+
+    tc->hold.enabled     = json_get_bool(h, "enabled", false);
+    tc->hold.max_hold_ms = (uint32_t)json_get_int(h, "max_hold_ms", 0);
+
+    const cJSON *ids = cJSON_GetObjectItemCaseSensitive(h, "stage_ids");
+    if (cJSON_IsArray(ids)) {
+        tc->hold.stage_count = 0;
+        const cJSON *it = NULL;
+        cJSON_ArrayForEach(it, ids) {
+            if (tc->hold.stage_count < MAX_HOLD_STAGES && cJSON_IsNumber(it))
+                tc->hold.stage_ids[tc->hold.stage_count++] = (uint8_t)it->valueint;
+        }
+    }
+
+    const cJSON *opr = cJSON_GetObjectItemCaseSensitive(h, "on_ped_request");
+    if (cJSON_IsString(opr) && opr->valuestring) {
+        if (strcmp(opr->valuestring, "insert") == 0)
+            tc->hold.on_ped_request = HOLD_PED_INSERT;
+        else if (strcmp(opr->valuestring, "min_recall") == 0)
+            tc->hold.on_ped_request = HOLD_PED_MIN_RECALL;
+        else if (strcmp(opr->valuestring, "ignore") == 0)
+            tc->hold.on_ped_request = HOLD_PED_IGNORE;
+        else
+            ESP_LOGW(TAG, "Unknown hold.on_ped_request='%s', using 'insert'",
+                     opr->valuestring);
+    }
+
+    ESP_LOGI(TAG, "hold: enabled=%d stages=%u max_hold=%lu on_ped=%u",
+             tc->hold.enabled, tc->hold.stage_count,
+             (unsigned long)tc->hold.max_hold_ms,
+             tc->hold.on_ped_request);
+}
+
 static void parse_traffic(const cJSON *t, traffic_config_t *tc)
 {
     if (!cJSON_IsObject(t)) return;
@@ -462,6 +562,7 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
     tc->auto_start = json_get_bool(t, "auto_start", tc->auto_start);
 
     parse_pedestrian(t, tc);
+    parse_hold(t, tc);
 
     const cJSON *pins = cJSON_GetObjectItemCaseSensitive(t, "pins");
     if (cJSON_IsObject(pins)) {
@@ -542,8 +643,37 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
             }
         }
     }
+
+    if (tc->hold.enabled) {
+        if (tc->hold.stage_count == 0) {
+            ESP_LOGW(TAG, "hold.enabled=true but stage_ids empty → disable");
+            tc->hold.enabled = false;
+        } else {
+            for (int i = 0; i < tc->hold.stage_count; i++) {
+                bool found = false;
+                for (int j = 0; j < tc->stage_count; j++) {
+                    if (tc->stages[j].id == tc->hold.stage_ids[i]) { found = true; break; }
+                }
+                if (!found) {
+                    ESP_LOGW(TAG, "hold.stage_ids[%d]=%u not in stages_dd",
+                             i, tc->hold.stage_ids[i]);
+                }
+            }
+        }
+    }
+    if (tc->pedestrian.insert_count > 0) {
+        for (int i = 0; i < tc->pedestrian.insert_count; i++) {
+            bool found = false;
+            for (int j = 0; j < tc->stage_count; j++) {
+                if (tc->stages[j].id == tc->pedestrian.insert_sequence[i]) { found = true; break; }
+            }
+            if (!found) {
+                ESP_LOGW(TAG, "insert_sequence[%d]=%u not in stages_dd",
+                         i, tc->pedestrian.insert_sequence[i]);
+            }
+        }
+    }
 }
-/* === END FIX === */
 
 static void parse_signal_groups(const cJSON *sg) { (void)sg; }
 static void parse_igm(const cJSON *arr)            { (void)arr; }
@@ -555,8 +685,17 @@ static void parse_control_sources(const cJSON *arr) { (void)arr; }
 static void parse_modules(const cJSON *m)          { (void)m; }
 
 /* ============================================================
-   config_load_json — парсит во временную tmp, коммитит только
-   после полной валидации.
+   config_load_json
+
+   === FIX STACK-OVERFLOW ===
+       app_config_t tmp ≈ 7.7 КБ. На стеке main_task (3584 байт
+       default) → stack overflow → порча newlib lock → assert
+       (pxQueue->uxItemSize == 0) в xQueueSemaphoreTake во время
+       ESP_LOGE внутри config_load_json.
+       Фикс: static app_config_t s_cfg_load_tmp + mutex.
+       Mutex нужен, т.к. config_load_json может вызываться из
+       cfg_load_task (24 КБ) и из mqtt-task (~4 КБ) параллельно.
+   === END FIX STACK-OVERFLOW ===
    ============================================================ */
 bool config_load_json(const char *json, size_t len)
 {
@@ -591,23 +730,29 @@ bool config_load_json(const char *json, size_t len)
 
     ESP_LOGI(TAG, "Parsing JSON config (%u bytes)", (unsigned)len);
 
-    /* === FIX: парсим в tmp, g_config не трогаем === */
-    app_config_t tmp;
-    set_defaults_to(&tmp);
-    tmp.role = g_config.role;
+    /* === FIX STACK-OVERFLOW: static tmp + mutex === */
+    if (!cfg_load_lock()) {
+        ESP_LOGE(TAG, "config_load_json: mutex timeout");
+        cJSON_Delete(root);
+        return false;
+    }
+    app_config_t *tmp = &s_cfg_load_tmp;
+    set_defaults_to(tmp);
+    tmp->role = g_config.role;
+    /* === END FIX STACK-OVERFLOW === */
 
     const cJSON *meta = cJSON_GetObjectItemCaseSensitive(root, "meta");
     if (cJSON_IsObject(meta)) {
-        tmp.version = (float)json_get_double(meta, "version", 1.0);
-        tmp.id = (uint32_t)json_get_int(meta, "id", 0);
-        json_get_str(meta, "name", tmp.name, sizeof(tmp.name));
+        tmp->version = (float)json_get_double(meta, "version", 1.0);
+        tmp->id = (uint32_t)json_get_int(meta, "id", 0);
+        json_get_str(meta, "name", tmp->name, sizeof(tmp->name));
     }
 
     const cJSON *en = cJSON_GetObjectItemCaseSensitive(root, "espnow");
     if (cJSON_IsObject(en)) {
-        tmp.espnow.enabled = json_get_bool(en, "enabled", false);
-        tmp.espnow.channel = (uint8_t)json_get_int(en, "channel", 6);
-        tmp.espnow.status_period_ms =
+        tmp->espnow.enabled = json_get_bool(en, "enabled", false);
+        tmp->espnow.channel = (uint8_t)json_get_int(en, "channel", 6);
+        tmp->espnow.status_period_ms =
             (uint16_t)json_get_int(en, "status_period_ms", 1000);
         const cJSON *mac = cJSON_GetObjectItemCaseSensitive(en, "slave_mac");
         if (cJSON_IsString(mac) && mac->valuestring) {
@@ -615,29 +760,29 @@ bool config_load_json(const char *json, size_t len)
             if (sscanf(mac->valuestring, "%02x:%02x:%02x:%02x:%02x:%02x",
                        &b[0],&b[1],&b[2],&b[3],&b[4],&b[5]) == 6) {
                 for (int i = 0; i < 6; i++)
-                    tmp.espnow.slave_mac[i] = (uint8_t)b[i];
+                    tmp->espnow.slave_mac[i] = (uint8_t)b[i];
             }
         }
     }
 
     const cJSON *wifi = cJSON_GetObjectItemCaseSensitive(root, "wifi");
     if (cJSON_IsObject(wifi)) {
-        json_get_str(wifi, "ssid", tmp.wifi_ssid, sizeof(tmp.wifi_ssid));
-        json_get_str(wifi, "password", tmp.wifi_password, sizeof(tmp.wifi_password));
+        json_get_str(wifi, "ssid", tmp->wifi_ssid, sizeof(tmp->wifi_ssid));
+        json_get_str(wifi, "password", tmp->wifi_password, sizeof(tmp->wifi_password));
     }
-    json_get_str(root, "timezone", tmp.timezone, sizeof(tmp.timezone));
+    json_get_str(root, "timezone", tmp->timezone, sizeof(tmp->timezone));
 
     const cJSON *mqtt = cJSON_GetObjectItemCaseSensitive(root, "mqtt");
     if (cJSON_IsObject(mqtt)) {
-        tmp.mqtt_enabled = json_get_bool(mqtt, "enabled", true);
-        json_get_str(mqtt, "uri", tmp.mqtt_uri, sizeof(tmp.mqtt_uri));
-        tmp.mqtt_port = (uint16_t)json_get_int(mqtt, "port", 13257);
-        json_get_str(mqtt, "user", tmp.mqtt_user, sizeof(tmp.mqtt_user));
-        json_get_str(mqtt, "password", tmp.mqtt_password, sizeof(tmp.mqtt_password));
-        tmp.mqtt_timepause_min = (uint16_t)json_get_int(mqtt, "timepause_min", 5);
+        tmp->mqtt_enabled = json_get_bool(mqtt, "enabled", true);
+        json_get_str(mqtt, "uri", tmp->mqtt_uri, sizeof(tmp->mqtt_uri));
+        tmp->mqtt_port = (uint16_t)json_get_int(mqtt, "port", 13257);
+        json_get_str(mqtt, "user", tmp->mqtt_user, sizeof(tmp->mqtt_user));
+        json_get_str(mqtt, "password", tmp->mqtt_password, sizeof(tmp->mqtt_password));
+        tmp->mqtt_timepause_min = (uint16_t)json_get_int(mqtt, "timepause_min", 5);
     }
 
-    parse_traffic(cJSON_GetObjectItemCaseSensitive(root, "traffic"), &tmp.traffic);
+    parse_traffic(cJSON_GetObjectItemCaseSensitive(root, "traffic"), &tmp->traffic);
     parse_signal_groups(cJSON_GetObjectItemCaseSensitive(root, "signalGroups"));
     parse_igm(cJSON_GetObjectItemCaseSensitive(root, "IGM"));
     parse_stages_ref(cJSON_GetObjectItemCaseSensitive(root, "stages"));
@@ -647,21 +792,20 @@ bool config_load_json(const char *json, size_t len)
     parse_control_sources(cJSON_GetObjectItemCaseSensitive(root, "controlSources"));
     parse_modules(cJSON_GetObjectItemCaseSensitive(root, "modules"));
 
-    /* shift_register */
     const cJSON *sr = cJSON_GetObjectItemCaseSensitive(root, "shift_register");
     if (cJSON_IsObject(sr)) {
         const cJSON *outs = cJSON_GetObjectItemCaseSensitive(sr, "outputs");
         if (cJSON_IsArray(outs)) {
             for (int i = 0; i < MAX_OUTPUTS; i++)
-                tmp.sr.outputs[i].active = false;
+                tmp->sr.outputs[i].active = false;
             const cJSON *o = NULL;
             cJSON_ArrayForEach(o, outs) {
                 int ch = json_get_int(o, "ch", -1);
                 if (ch >= 0 && ch < MAX_OUTPUTS) {
-                    tmp.sr.outputs[ch].ch = (uint8_t)ch;
-                    json_get_str(o, "name", tmp.sr.outputs[ch].name,
-                                 sizeof(tmp.sr.outputs[ch].name));
-                    tmp.sr.outputs[ch].active = json_get_bool(o, "active", true);
+                    tmp->sr.outputs[ch].ch = (uint8_t)ch;
+                    json_get_str(o, "name", tmp->sr.outputs[ch].name,
+                                 sizeof(tmp->sr.outputs[ch].name));
+                    tmp->sr.outputs[ch].active = json_get_bool(o, "active", true);
                 }
             }
         }
@@ -670,29 +814,34 @@ bool config_load_json(const char *json, size_t len)
     cJSON_Delete(root);
 
     /* === FIX: валидация перед коммитом === */
-    if (tmp.traffic.enabled && tmp.traffic.stage_count == 0) {
+    if (tmp->traffic.enabled && tmp->traffic.stage_count == 0) {
         ESP_LOGE(TAG, "load_json: traffic.enabled=true but no stages_dd "
                       "→ reject (keep current config)");
+        cfg_load_unlock();
         return false;
     }
-    if (tmp.traffic.stage_count > 0 && tmp.traffic.sequence_count == 0) {
+    if (tmp->traffic.stage_count > 0 && tmp->traffic.sequence_count == 0) {
         ESP_LOGW(TAG, "load_json: stages_dd present but no sequence → auto-fill");
-        for (int i = 0; i < tmp.traffic.stage_count && i < MAX_SEQUENCE; i++)
-            tmp.traffic.sequence[i] = tmp.traffic.stages[i].id;
-        tmp.traffic.sequence_count = tmp.traffic.stage_count;
+        for (int i = 0; i < tmp->traffic.stage_count && i < MAX_SEQUENCE; i++)
+            tmp->traffic.sequence[i] = tmp->traffic.stages[i].id;
+        tmp->traffic.sequence_count = tmp->traffic.stage_count;
     }
     /* === END FIX === */
 
-    g_config = tmp;
+    g_config = *tmp;
     config_save();
 
     ESP_LOGI(TAG, "JSON loaded (version=%.2f, role=%s, traffic stages=%u seq=%u, "
-                  "ped_mode=%u)",
+                  "ped_mode=%u, hold=%d/%u)",
              g_config.version,
              g_config.role == DEVICE_ROLE_SLAVE ? "slave" : "master",
              g_config.traffic.stage_count,
              g_config.traffic.sequence_count,
-             g_config.traffic.pedestrian.request_mode);
+             g_config.traffic.pedestrian.request_mode,
+             g_config.traffic.hold.enabled,
+             g_config.traffic.hold.stage_count);
+
+    cfg_load_unlock();
     return true;
 }
 
@@ -721,9 +870,17 @@ static const char *ped_request_mode_to_str(uint8_t m)
     }
 }
 
+static const char *hold_on_ped_to_str(uint8_t m)
+{
+    switch (m) {
+        case HOLD_PED_MIN_RECALL: return "min_recall";
+        case HOLD_PED_IGNORE:     return "ignore";
+        default:                  return "insert";
+    }
+}
+
 /* ============================================================
-   config_export_json — без изменений по логике, но кэш
-   инвалидируется при ошибке cJSON_PrintUnformatted.
+   config_export_json — выгрузка g_config в JSON (кэш).
    ============================================================ */
 bool config_export_json(char *buf, size_t *len)
 {
@@ -784,6 +941,20 @@ bool config_export_json(char *buf, size_t *len)
         cJSON_AddBoolToObject(t, "enabled", g_config.traffic.enabled);
         cJSON_AddBoolToObject(t, "auto_start", g_config.traffic.auto_start);
 
+        cJSON *hold = cJSON_AddObjectToObject(t, "hold");
+        if (hold) {
+            cJSON_AddBoolToObject(hold, "enabled", g_config.traffic.hold.enabled);
+            cJSON_AddNumberToObject(hold, "max_hold_ms",
+                                    g_config.traffic.hold.max_hold_ms);
+            cJSON_AddStringToObject(hold, "on_ped_request",
+                                    hold_on_ped_to_str(
+                                        g_config.traffic.hold.on_ped_request));
+            cJSON *ids = cJSON_AddArrayToObject(hold, "stage_ids");
+            for (int i = 0; i < g_config.traffic.hold.stage_count; i++)
+                cJSON_AddItemToArray(ids,
+                    cJSON_CreateNumber(g_config.traffic.hold.stage_ids[i]));
+        }
+
         cJSON *ped = cJSON_AddObjectToObject(t, "pedestrian");
         if (ped) {
             cJSON_AddBoolToObject(ped, "button_enabled",
@@ -795,6 +966,15 @@ bool config_export_json(char *buf, size_t *len)
                                     g_config.traffic.pedestrian.insert_timeout_ms);
             cJSON_AddNumberToObject(ped, "min_recall_s",
                                     g_config.traffic.pedestrian.min_recall_s);
+            cJSON_AddNumberToObject(ped, "insert_lead_ms",
+                                    g_config.traffic.pedestrian.insert_lead_ms);
+            cJSON_AddBoolToObject(ped, "return_to_hold",
+                                  g_config.traffic.pedestrian.return_to_hold);
+            cJSON *iseq = cJSON_AddArrayToObject(ped, "insert_sequence");
+            for (int i = 0; i < g_config.traffic.pedestrian.insert_count; i++)
+                cJSON_AddItemToArray(iseq,
+                    cJSON_CreateNumber(
+                        g_config.traffic.pedestrian.insert_sequence[i]));
         }
 
         cJSON *pins = cJSON_AddObjectToObject(t, "pins");
@@ -948,7 +1128,6 @@ bool config_export_json(char *buf, size_t *len)
 
 /* ============================================================
    config_export_lora_json — короткий JSON для LoRa.
-   Без изменений по логике.
    ============================================================ */
 bool config_export_lora_json(char *buf, size_t *len)
 {
@@ -1029,12 +1208,30 @@ bool config_export_lora_json(char *buf, size_t *len)
             cJSON_AddItemToArray(f, cJSON_CreateNumber(g_config.traffic.fault.vin_off_confirmations));
         }
 
+        cJSON *hold = cJSON_AddObjectToObject(t, "hold");
+        if (hold) {
+            cJSON_AddBoolToObject(hold, "en", g_config.traffic.hold.enabled);
+            cJSON_AddNumberToObject(hold, "max_ms", g_config.traffic.hold.max_hold_ms);
+            cJSON_AddNumberToObject(hold, "on_ped",
+                                    g_config.traffic.hold.on_ped_request);
+            cJSON *ids = cJSON_AddArrayToObject(hold, "ids");
+            for (int i = 0; i < g_config.traffic.hold.stage_count; i++)
+                cJSON_AddItemToArray(ids,
+                    cJSON_CreateNumber(g_config.traffic.hold.stage_ids[i]));
+        }
+
         cJSON *ped = cJSON_AddArrayToObject(t, "ped");
         if (ped) {
             cJSON_AddItemToArray(ped, cJSON_CreateBool(g_config.traffic.pedestrian.button_enabled));
             cJSON_AddItemToArray(ped, cJSON_CreateNumber(g_config.traffic.pedestrian.request_mode));
             cJSON_AddItemToArray(ped, cJSON_CreateNumber(g_config.traffic.pedestrian.insert_timeout_ms));
             cJSON_AddItemToArray(ped, cJSON_CreateNumber(g_config.traffic.pedestrian.min_recall_s));
+            cJSON_AddItemToArray(ped, cJSON_CreateNumber(g_config.traffic.pedestrian.insert_lead_ms));
+            cJSON_AddItemToArray(ped, cJSON_CreateBool(g_config.traffic.pedestrian.return_to_hold));
+            cJSON_AddItemToArray(ped, cJSON_CreateNumber(g_config.traffic.pedestrian.insert_count));
+            for (int i = 0; i < g_config.traffic.pedestrian.insert_count; i++)
+                cJSON_AddItemToArray(ped,
+                    cJSON_CreateNumber(g_config.traffic.pedestrian.insert_sequence[i]));
         }
 
         cJSON *st = cJSON_AddArrayToObject(t, "st");
@@ -1113,7 +1310,9 @@ bool config_export_lora_json(char *buf, size_t *len)
 }
 
 /* ============================================================
-   config_load_lora_json — та же схема: tmp → валидация → commit.
+   config_load_lora_json
+
+   === FIX STACK-OVERFLOW: static tmp + mutex (как в config_load_json). ===
    ============================================================ */
 bool config_load_lora_json(const char *json, size_t len)
 {
@@ -1131,23 +1330,29 @@ bool config_load_lora_json(const char *json, size_t len)
         return false;
     }
 
-    /* === FIX: парсим в tmp === */
-    app_config_t tmp;
-    set_defaults_to(&tmp);
-    tmp.role = g_config.role;
+    /* === FIX STACK-OVERFLOW: static tmp + mutex === */
+    if (!cfg_load_lock()) {
+        ESP_LOGE(TAG, "config_load_lora_json: mutex timeout");
+        cJSON_Delete(root);
+        return false;
+    }
+    app_config_t *tmp = &s_cfg_load_tmp;
+    set_defaults_to(tmp);
+    tmp->role = g_config.role;
+    /* === END FIX STACK-OVERFLOW === */
 
     const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "v");
-    if (cJSON_IsNumber(v)) tmp.version = (float)v->valuedouble;
+    if (cJSON_IsNumber(v)) tmp->version = (float)v->valuedouble;
 
     const cJSON *tz = cJSON_GetObjectItemCaseSensitive(root, "tz");
     if (cJSON_IsString(tz) && tz->valuestring) {
-        strncpy(tmp.timezone, tz->valuestring, sizeof(tmp.timezone) - 1);
-        tmp.timezone[sizeof(tmp.timezone) - 1] = '\0';
+        strncpy(tmp->timezone, tz->valuestring, sizeof(tmp->timezone) - 1);
+        tmp->timezone[sizeof(tmp->timezone) - 1] = '\0';
     }
 
     const cJSON *t = cJSON_GetObjectItemCaseSensitive(root, "t");
     if (cJSON_IsObject(t)) {
-        traffic_config_t *tc = &tmp.traffic;
+        traffic_config_t *tc = &tmp->traffic;
 
         tc->mode       = (uint8_t)json_get_int(t, "mode", tc->mode);
         tc->enabled    = json_get_bool(t, "en", tc->enabled);
@@ -1220,12 +1425,51 @@ bool config_load_lora_json(const char *json, size_t len)
             tc->fault.vin_off_confirmations = (uint8_t)cJSON_GetArrayItem(f, 5)->valueint;
         }
 
+        const cJSON *hold = cJSON_GetObjectItemCaseSensitive(t, "hold");
+        if (cJSON_IsObject(hold)) {
+            tc->hold.enabled     = json_get_bool(hold, "en", false);
+            tc->hold.max_hold_ms = (uint32_t)json_get_int(hold, "max_ms", 0);
+            tc->hold.on_ped_request = (uint8_t)json_get_int(hold, "on_ped",
+                                                            HOLD_PED_INSERT);
+            if (tc->hold.on_ped_request > HOLD_PED_IGNORE)
+                tc->hold.on_ped_request = HOLD_PED_INSERT;
+            const cJSON *ids = cJSON_GetObjectItemCaseSensitive(hold, "ids");
+            if (cJSON_IsArray(ids)) {
+                tc->hold.stage_count = 0;
+                const cJSON *it = NULL;
+                cJSON_ArrayForEach(it, ids) {
+                    if (tc->hold.stage_count < MAX_HOLD_STAGES && cJSON_IsNumber(it))
+                        tc->hold.stage_ids[tc->hold.stage_count++] =
+                            (uint8_t)it->valueint;
+                }
+            }
+        }
+
         const cJSON *ped = cJSON_GetObjectItemCaseSensitive(t, "ped");
         if (cJSON_IsArray(ped) && cJSON_GetArraySize(ped) >= 4) {
             tc->pedestrian.button_enabled    = cJSON_IsTrue(cJSON_GetArrayItem(ped, 0));
             tc->pedestrian.request_mode      = (uint8_t)cJSON_GetArrayItem(ped, 1)->valueint;
             tc->pedestrian.insert_timeout_ms = (uint32_t)cJSON_GetArrayItem(ped, 2)->valueint;
             tc->pedestrian.min_recall_s      = (uint32_t)cJSON_GetArrayItem(ped, 3)->valueint;
+
+            int psz = cJSON_GetArraySize(ped);
+            if (psz >= 6) {
+                tc->pedestrian.insert_lead_ms =
+                    (uint32_t)cJSON_GetArrayItem(ped, 4)->valueint;
+                tc->pedestrian.return_to_hold =
+                    cJSON_IsTrue(cJSON_GetArrayItem(ped, 5));
+            }
+            if (psz >= 7) {
+                int cnt = cJSON_GetArrayItem(ped, 6)->valueint;
+                if (cnt > MAX_INSERT_SEQ) cnt = MAX_INSERT_SEQ;
+                tc->pedestrian.insert_count = 0;
+                for (int k = 0; k < cnt && (7 + k) < psz; k++) {
+                    cJSON *it = cJSON_GetArrayItem(ped, 7 + k);
+                    if (cJSON_IsNumber(it))
+                        tc->pedestrian.insert_sequence[tc->pedestrian.insert_count++] =
+                            (uint8_t)it->valueint;
+                }
+            }
         }
 
         const cJSON *st = cJSON_GetObjectItemCaseSensitive(t, "st");
@@ -1299,40 +1543,45 @@ bool config_load_lora_json(const char *json, size_t len)
 
     const cJSON *sr = cJSON_GetObjectItemCaseSensitive(root, "sr");
     if (cJSON_IsArray(sr)) {
-        for (int i = 0; i < tmp.sr.count; i++)
-            tmp.sr.outputs[i].active = false;
+        for (int i = 0; i < tmp->sr.count; i++)
+            tmp->sr.outputs[i].active = false;
         const cJSON *ch = NULL;
         cJSON_ArrayForEach(ch, sr) {
             if (!cJSON_IsNumber(ch)) continue;
             int c = ch->valueint;
-            if (c >= 0 && c < tmp.sr.count)
-                tmp.sr.outputs[c].active = true;
+            if (c >= 0 && c < tmp->sr.count)
+                tmp->sr.outputs[c].active = true;
         }
     }
 
     cJSON_Delete(root);
 
     /* === FIX: валидация перед коммитом === */
-    if (tmp.traffic.enabled && tmp.traffic.stage_count == 0) {
+    if (tmp->traffic.enabled && tmp->traffic.stage_count == 0) {
         ESP_LOGE(TAG, "lora_json: traffic.enabled=true but no stages → reject");
+        cfg_load_unlock();
         return false;
     }
-    if (tmp.traffic.stage_count > 0 && tmp.traffic.sequence_count == 0) {
+    if (tmp->traffic.stage_count > 0 && tmp->traffic.sequence_count == 0) {
         ESP_LOGW(TAG, "lora_json: stages present but no sequence → auto-fill");
-        for (int i = 0; i < tmp.traffic.stage_count && i < MAX_SEQUENCE; i++)
-            tmp.traffic.sequence[i] = tmp.traffic.stages[i].id;
-        tmp.traffic.sequence_count = tmp.traffic.stage_count;
+        for (int i = 0; i < tmp->traffic.stage_count && i < MAX_SEQUENCE; i++)
+            tmp->traffic.sequence[i] = tmp->traffic.stages[i].id;
+        tmp->traffic.sequence_count = tmp->traffic.stage_count;
     }
     /* === END FIX === */
 
-    g_config = tmp;
+    g_config = *tmp;
     config_save();
 
     ESP_LOGI(TAG, "lora_json loaded (version=%.2f, stages=%u seq=%u, "
-                  "ped_mode=%u, %u bytes)",
+                  "ped_mode=%u, hold=%d/%u, %u bytes)",
              g_config.version, g_config.traffic.stage_count,
              g_config.traffic.sequence_count,
              g_config.traffic.pedestrian.request_mode,
+             g_config.traffic.hold.enabled,
+             g_config.traffic.hold.stage_count,
              (unsigned)len);
+
+    cfg_load_unlock();
     return true;
 }

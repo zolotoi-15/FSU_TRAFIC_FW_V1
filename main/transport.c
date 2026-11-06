@@ -1,17 +1,10 @@
 /* ============================================================
    transport.c — LoRa-транспорт.
 
-   === FIX SYNC-NO-WAIT ===
-       lora_send_fragmented_noack() — без ACK на последнем фрагменте.
-
-   === FIX FAST-STATUS ===
-       transport_send_status_noack() — STATUS без ACK.
-
-   === FIX CONNECT-ANY-ORDER ===
-       transport_set_ack_cb() — callback при получении ACK.
-       ROOT подписывается в root_wd_start_tasks() и при ACK на
-       ping (NODE на связи) триггерит CFG-push, если s_cfg_ack == false.
-   === END FIX CONNECT-ANY-ORDER ===
+   === FIX SYNC-NO-WAIT / FIX FAST-STATUS / FIX CONNECT-ANY-ORDER ===
+   === FIX 2: ACK на T_STATUS. ===
+   === FIX 4: парсим маску из fault:yellow_blink:0xXXXX:... ===
+       и выставляем s_fault_mask_valid=true (даже если маска 0x0000).
    ============================================================ */
 
 #include "transport.h"
@@ -50,7 +43,6 @@ static const char *TAG = "transport";
 #define ACK_TIMEOUT_CMD   2000
 #define MAX_RETRIES       3
 #define MAX_RETRIES_CFG   3
-
 #define MAX_RETRIES_CMD   2
 
 #define CFG_NEW_BURST_MS          4000
@@ -94,10 +86,7 @@ static transport_rx_cb_t s_cmd_cb    = NULL;
 static transport_rx_cb_t s_cfg_cb    = NULL;
 static transport_rx_cb_t s_status_cb = NULL;
 static transport_rx_cb_t s_evt_cb    = NULL;
-
-/* === FIX CONNECT-ANY-ORDER === */
 static transport_ack_cb_t s_ack_cb   = NULL;
-/* === END FIX CONNECT-ANY-ORDER === */
 
 static char   s_accum_cmd[ACCUM_CMD_MAX];
 static char   s_accum_cfg[ACCUM_CFG_MAX];
@@ -112,6 +101,11 @@ static volatile size_t s_accum_evt_len    = 0;
 static volatile uint8_t s_next_frag_idx[6] = {0, 0, 0, 0, 0, 0};
 
 static uint32_t s_last_cfg_frag_ms = 0;
+
+/* === FIX 4: маска жёлтых из fault:yellow_blink:0xXXXX:... === */
+extern volatile uint16_t s_fault_yellow_mask_from_root;
+extern volatile bool     s_fault_mask_valid;
+/* === END FIX 4 === */
 
 void transport_reset_cfg_accum(void)
 {
@@ -181,12 +175,20 @@ static void log_hex_ascii(const char *prefix, const uint8_t *data, size_t len)
     }
 }
 
+/* === FIX TX-BUSY: ack_tx_task ждёт, пока радио не выйдет из TX.
+   Раньше ACK мог уйти параллельно с исходящим фрагментом — это
+   давало «LoRa ACK timeout ... retry=0/1/2» в логах. === */
 static void ack_tx_task(void *arg)
 {
-    ESP_LOGI(TAG, "ack_tx_task started");
+    ESP_LOGI(TAG, "ack_tx_task started (waits for TX idle)");
     uint8_t seq;
     while (1) {
         if (xQueueReceive(s_ack_queue, &seq, portMAX_DELAY) == pdTRUE) {
+            /* Ждём, пока радио не выйдет из TX (максимум 500 ms). */
+            for (int w = 0; w < 50; w++) {
+                if (!lora_is_tx_active()) break;
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
             uint8_t ack[4] = { PKT_MAGIC, T_ACK, seq, 0 };
             esp_err_t err = lora_send_packet(ack, 4);
             if (err != ESP_OK) {
@@ -196,6 +198,7 @@ static void ack_tx_task(void *arg)
         }
     }
 }
+/* === END FIX TX-BUSY === */
 
 static void cfg_handler_task(void *arg)
 {
@@ -317,7 +320,7 @@ static esp_err_t lora_send_fragmented(uint8_t type, const char *data, size_t len
 
 #if TRANSPORT_LOG_TX
     ESP_LOGI(TAG, "TX %s (fragmented): total %u bytes, %d fragments "
-                  "(frag_data=%d) — FIX I-fix: real type, ACK only on last",
+                  "(frag_data=%d)",
              pkt_type_str(type), (unsigned)len, frag_total, FRAG_DATA_MAX);
 #endif
 
@@ -417,6 +420,33 @@ static esp_err_t lora_send_fragmented_noack(uint8_t type,
     return ESP_OK;
 }
 
+/* === FIX 4: парсим маску из fault:yellow_blink:0xXXXX:...
+   Выставляем s_fault_mask_valid=true даже если маска 0x0000 —
+   это валидная «пустая» маска (ROOT без жёлтых в s_mode). === */
+static void parse_fault_yellow_mask(const char *buf, size_t len)
+{
+    if (!buf || len < 26) return;
+    if (strncmp(buf, "fault:yellow_blink:", 19) != 0) return;
+
+    const char *p = buf + 19;
+    if (p + 7 > buf + len) return;
+    if (p[0] != '0' || (p[1] != 'x' && p[1] != 'X')) return;
+    if (p[6] != ':') return;
+
+    char hex[5];
+    memcpy(hex, p + 2, 4);
+    hex[4] = '\0';
+    char *end = NULL;
+    unsigned long v = strtoul(hex, &end, 16);
+    if (end != hex + 4) return;
+
+    s_fault_yellow_mask_from_root = (uint16_t)v;
+    s_fault_mask_valid            = true;
+    ESP_LOGW(TAG, "parsed fault_yellow_mask=0x%04X from ROOT",
+             (unsigned)s_fault_yellow_mask_from_root);
+}
+/* === END FIX 4 === */
+
 static void lora_raw_handler(const uint8_t *data, size_t len)
 {
     if (len < 4 || data[0] != PKT_MAGIC) {
@@ -439,9 +469,7 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
 #endif
         s_last_ack_seq = seq;
         xSemaphoreGive(s_ack_sem);
-        /* === FIX CONNECT-ANY-ORDER: callback для ROOT === */
         if (s_ack_cb) s_ack_cb(seq, T_ACK);
-        /* === END FIX CONNECT-ANY-ORDER === */
         return;
     }
 
@@ -472,13 +500,16 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
     uint8_t frag_total = data[6];
     size_t  chunk      = plen - FRAG_HDR_SIZE;
 
-    if ((type == T_CMD || type == T_CFG || type == T_EVT) && flag == 0x00) {
+    /* === FIX 2: ACK на последний фрагмент T_STATUS тоже. === */
+    if ((type == T_CMD || type == T_CFG || type == T_EVT || type == T_STATUS)
+        && flag == 0x00) {
         if (s_ack_queue) {
             if (xQueueSend(s_ack_queue, &seq, 0) != pdTRUE) {
                 ESP_LOGW(TAG, "ack_queue FULL (seq=%u), ACK dropped", seq);
             }
         }
     }
+    /* === END FIX 2 === */
 
     if (chunk > FRAG_DATA_MAX || frag_total == 0 || frag_idx >= frag_total) {
 #if TRANSPORT_LOG_RX
@@ -580,6 +611,12 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
                     s_cfg_expected_ms = xTaskGetTickCount();
                     ESP_LOGI(TAG, "cfg:reset detected → cfg_expected=true");
                 }
+                /* === FIX 4: парсим маску из fault:yellow_blink:0xXXXX:... === */
+                if (*accum_len >= 26 &&
+                    strncmp(accum, "fault:yellow_blink:", 19) == 0) {
+                    parse_fault_yellow_mask(accum, *accum_len);
+                }
+                /* === END FIX 4 === */
                 if (s_cmd_cb) s_cmd_cb(accum, *accum_len);
                 break;
 
@@ -649,8 +686,8 @@ esp_err_t transport_init(void)
         xTaskCreate(cfg_handler_task, "cfg_handler", 24576, NULL, 4, NULL);
 
         ESP_LOGI(TAG, "Transport = LoRa only, PKT_MAX=%d "
-                      "(frag data=%d, hdr=%d) — FIX H/I-fix/L/M/N/3/"
-                      "SYNC-NO-WAIT/FAST-STATUS/CONNECT-ANY-ORDER",
+                      "(frag data=%d, hdr=%d) — FIX 2 (ACK on STATUS) / "
+                      "FIX 4 (fault mask from ROOT, s_fault_mask_valid)",
                  PKT_MAX, FRAG_DATA_MAX, FRAG_HDR_SIZE);
         return ESP_OK;
     }
@@ -733,10 +770,7 @@ void transport_set_cmd_cb(transport_rx_cb_t cb)    { s_cmd_cb = cb; }
 void transport_set_cfg_cb(transport_rx_cb_t cb)    { s_cfg_cb = cb; }
 void transport_set_status_cb(transport_rx_cb_t cb) { s_status_cb = cb; }
 void transport_set_evt_cb(transport_rx_cb_t cb)    { s_evt_cb = cb; }
-
-/* === FIX CONNECT-ANY-ORDER === */
 void transport_set_ack_cb(transport_ack_cb_t cb)   { s_ack_cb = cb; }
-/* === END FIX CONNECT-ANY-ORDER === */
 
 bool transport_is_tx_idle(void)
 {
