@@ -20,6 +20,9 @@ typedef enum {
     TRAFFIC_STATE_STOPPED = 0,
     TRAFFIC_STATE_RUNNING = 1,
     TRAFFIC_STATE_PAUSED  = 2,
+    /* === FIX GOST-NIGHT-MODE: штатный ночной режим (ГОСТ Р 52289 п.4.2.6) === */
+    TRAFFIC_STATE_NIGHT_YELLOW_BLINK = 3,
+    /* === END FIX GOST-NIGHT-MODE === */
 } traffic_state_t;
 
 typedef enum {
@@ -100,15 +103,9 @@ esp_err_t traffic_light_reset(void);
 
 esp_err_t traffic_light_next_phase(void);
 
-/* force_phase — pm_target на момент применения (pm=0 = начало фазы) */
 esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
                                     uint32_t duration_ms);
 
-/* === SYNC-MASK: ROOT и NODE применяют ОДНУ маску.
-   ROOT вычисляет маску из своего stage_dd, NODE получает
-   маску в sync: и применяет напрямую, не заглядывая в stage_dd.
-   Это делает ROOT единственным источником правды о том,
-   какие каналы включены в каждой фазе. === */
 esp_err_t traffic_light_force_phase_masked(uint8_t phase,
                                            uint32_t phase_ms,
                                            uint32_t duration_ms);
@@ -116,18 +113,12 @@ void      traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
                                    uint8_t phase, uint32_t phase_ms,
                                    uint32_t duration_ms);
 
-/* Маски ТЕКУЩЕЙ фазы (s_phase) — для логов, resync, force_phase_masked. */
 uint16_t  traffic_light_get_phase_on_mask(void);
 uint16_t  traffic_light_get_phase_blink_mask(void);
 
-/* === FIX SYNC-MASK: публичный геттер масок фазы по индексу sequence.
-   Используется root_wd.c для формирования sync: пакета.
-   НЕ требует include traffic_internal.h в вызывающем коде.
-   Возвращает 0 в out_on_mask/out_blink_mask, если фаза вне диапазона. === */
 void traffic_light_get_stage_masks(uint8_t phase,
                                    uint16_t *out_on_mask,
                                    uint16_t *out_blink_mask);
-/* === END FIX SYNC-MASK === */
 
 traffic_state_t traffic_light_get_state(void);
 traffic_mode_t  traffic_light_get_mode(void);
@@ -172,6 +163,35 @@ uint32_t traffic_light_last_recovery_ok_ms(void);
 
 bool traffic_light_get_fault_blink_state(void);
 void traffic_light_apply_fault_blink(bool on);
+
+/* === FIX GOST-NIGHT-MODE ===
+   Штатный ночной режим: жёлтое мигание без аварии.
+   - set_night_mode(true): переход в NIGHT_YELLOW_BLINK.
+   - set_night_mode(false): возврат в STOPPED (ждём traffic:start).
+   Отличается от TRAFFIC_FAULT_YELLOW_BLINK: fault= NONE, STATUS
+   пир получит как «state":"NIGHT_YELLOW_BLINK"», а не «FAULT». */
+esp_err_t traffic_light_set_night_mode(bool enable);
+bool      traffic_light_is_night_mode(void);
+/* === END FIX GOST-NIGHT-MODE === */
+
+/* === FIX GOST-MANUAL-CONTROL ===
+   Ручное управление от поста ДПС (ГОСТ Р 52289 п.5.1).
+   manual_override(seq_idx) — включить фазу seq_idx вручную,
+   traffic_task_loop не переключает фазы до manual_release(). */
+esp_err_t traffic_light_manual_override(uint8_t seq_idx);
+esp_err_t traffic_light_manual_release(void);
+bool      traffic_light_is_manual_override(void);
+/* === END FIX GOST-MANUAL-CONTROL === */
+
+/* === FIX GOST-PRIORITY-GREEN ===
+   Приоритет общественного транспорта / «зелёная улица».
+   priority_extend(ms) продлевает ТЕКУЩУЮ зелёную фазу на ms
+   (в пределах 60 с абсолютного максимума). Работает только
+   если текущая фаза — транспортный зелёный.
+   priority_shorten(ms) сокращает текущую зелёную фазу. */
+esp_err_t traffic_light_priority_extend(uint32_t ms);
+esp_err_t traffic_light_priority_shorten(uint32_t ms);
+/* === END FIX GOST-PRIORITY-GREEN === */
 
 #ifdef __cplusplus
 }

@@ -151,11 +151,11 @@
     "phases_ms": {
       "red": 8000,
       "red_yellow": 2000,
-      "green": 10000,
+      "green": 25000,
       "green_blink": 3000,
       "yellow": 3000,
       "yellow_blink": 2000,
-      "ped_green": 10000,
+      "ped_green": 15000,
       "ped_blink": 4000,
       "fault_blink_period": 500,
       "phase_blink_period": 500
@@ -249,6 +249,14 @@
     ],
 
     "sequence": [1, 2, 3, 4, 5, 6, 7],
+
+    "conflicting_channels": [
+      [2, 5], [2, 4], [1, 5],
+      [2, 8], [2, 7], [1, 8],
+      [5, 8], [5, 7], [4, 8],
+      [10, 2], [10, 5], [10, 8],
+      [10, 1], [10, 4], [10, 7]
+    ],
 
     "transitions": [
       { "clearing": 1, "entering": 2, "time": 6.00 },

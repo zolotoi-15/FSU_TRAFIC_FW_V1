@@ -114,7 +114,7 @@ static void set_defaults_to(app_config_t *cfg)
     cfg->traffic.pedestrian.button_enabled    = true;
     cfg->traffic.pedestrian.request_mode      = PED_REQUEST_MODE_STAGE;
     cfg->traffic.pedestrian.insert_timeout_ms = 30000;
-    cfg->traffic.pedestrian.min_recall_s      = 5;
+    cfg->traffic.pedestrian.min_recall_s      = 15;   /* GOST: ≥ 15 s */
 
     cfg->traffic.pedestrian.insert_count      = 0;
     cfg->traffic.pedestrian.insert_lead_ms    = 300;
@@ -143,13 +143,17 @@ static void set_defaults_to(app_config_t *cfg)
 
     cfg->traffic.phases_ms.red          = 8000;
     cfg->traffic.phases_ms.red_yellow   = 2000;
-    cfg->traffic.phases_ms.green        = 10000;
+    /* === FIX GOST-PHASE-VALIDATION: green ≥ 20 s === */
+    cfg->traffic.phases_ms.green        = 25000;
+    /* === END FIX GOST-PHASE-VALIDATION === */
     cfg->traffic.phases_ms.green_blink  = 3000;
     /* === FIX GOST-YELLOW-DURATION: жёлтый = 3 с (ГОСТ Р 52289) === */
     cfg->traffic.phases_ms.yellow       = 3000;
     /* === END FIX GOST-YELLOW-DURATION === */
     cfg->traffic.phases_ms.yellow_blink = 2000;
-    cfg->traffic.phases_ms.ped_green    = 10000;
+    /* === FIX GOST-PHASE-VALIDATION: ped_green ≥ 15 s === */
+    cfg->traffic.phases_ms.ped_green    = 15000;
+    /* === END FIX GOST-PHASE-VALIDATION === */
     cfg->traffic.phases_ms.ped_blink    = 4000;
     cfg->traffic.phases_ms.fault_blink_period = 500;
     cfg->traffic.phases_ms.phase_blink_period = 500;
@@ -166,7 +170,7 @@ static void set_defaults_to(app_config_t *cfg)
         .duration_kind=DD_DUR_EXPLICIT, .outputs_on={0}, .on_count=1 };
     st[1] = (traffic_stage_dd_t){ .id=2, .name="Фаза.2", .duration_ms=8000,
         .duration_kind=DD_DUR_EXPLICIT, .outputs_on={3}, .on_count=1 };
-    st[2] = (traffic_stage_dd_t){ .id=3, .name="Фаза.3", .duration_ms=10000,
+    st[2] = (traffic_stage_dd_t){ .id=3, .name="Фаза.3", .duration_ms=25000,
         .duration_kind=DD_DUR_EXPLICIT, .outputs_on={6,9}, .on_count=2 };
     st[3] = (traffic_stage_dd_t){ .id=4, .name="Фаза.4", .duration_ms=10000,
         .duration_kind=DD_DUR_EXPLICIT, .outputs_on={9}, .on_count=1,
@@ -178,6 +182,28 @@ static void set_defaults_to(app_config_t *cfg)
     cfg->traffic.sequence[2] = 3;
     cfg->traffic.sequence[3] = 4;
     cfg->traffic.sequence_count = 4;
+
+    /* === FIX GOST-CONFLICT-MATRIX: дефолтная таблица конфликтов. === */
+    {
+        const traffic_conflict_pair_t def_conflicts[] = {
+            /* напр.1 vs напр.2 */
+            {2, 5}, {2, 4}, {1, 5},
+            /* напр.1 vs дублёр */
+            {2, 8}, {2, 7}, {1, 8},
+            /* напр.2 vs дублёр */
+            {5, 8}, {5, 7}, {4, 8},
+            /* напр.4 (пешеходный) vs все транспортные зелёные */
+            {10, 2}, {10, 5}, {10, 8},
+            /* напр.4 зелёный vs транспортные жёлтые */
+            {10, 1}, {10, 4}, {10, 7},
+        };
+        int n = sizeof(def_conflicts) / sizeof(def_conflicts[0]);
+        if (n > MAX_CONFLICT_PAIRS) n = MAX_CONFLICT_PAIRS;
+        memcpy(cfg->traffic.conflicting_channels, def_conflicts,
+               n * sizeof(traffic_conflict_pair_t));
+        cfg->traffic.conflict_count = (uint8_t)n;
+    }
+    /* === END FIX GOST-CONFLICT-MATRIX === */
 
     for (int i = 0; i < MAX_OUTPUTS; i++) {
         cfg->sr.outputs[i].ch = (uint8_t)i;
@@ -213,14 +239,15 @@ void config_load(void)
     } else {
         ESP_LOGI(TAG, "Config loaded (version=%.2f, SSID='%s', traffic.mode=%u, "
                       "stages=%u, seq=%u, ped_mode=%u, hold=%d/%u, "
-                      "insert_red_ms=%lu)",
+                      "insert_red_ms=%lu, conflicts=%u)",
                  g_config.version,
                  g_config.wifi_ssid, g_config.traffic.mode,
                  g_config.traffic.stage_count, g_config.traffic.sequence_count,
                  g_config.traffic.pedestrian.request_mode,
                  g_config.traffic.hold.enabled,
                  g_config.traffic.hold.stage_count,
-                 (unsigned long)g_config.traffic.pedestrian.insert_red_ms);
+                 (unsigned long)g_config.traffic.pedestrian.insert_red_ms,
+                 g_config.traffic.conflict_count);
     }
 }
 
@@ -460,6 +487,93 @@ static void parse_transitions(const cJSON *arr, traffic_config_t *tc)
 }
 
 /* ============================================================
+   === FIX GOST-PHASE-VALIDATION ===
+   Валидация длительностей сигналов по ГОСТ Р 52282 / Р 52289.
+   Возвращает true, если все значения в норме. При выходе за
+   пределы — логирует и КОРРЕКТИРУЕТ значение (clamp), чтобы
+   даже ошибочный JSON не дал опасный сигнал.
+   ============================================================ */
+static bool validate_phase_timings(traffic_config_t *tc)
+{
+    bool ok = true;
+
+    /* --- Жёлтый: 3..5 с (ГОСТ Р 52282 п. 5.6.2) --- */
+    if (tc->phases_ms.yellow < 3000) {
+        ESP_LOGE(TAG, "GOST: yellow=%lu < 3000 ms → clamp to 3000",
+                 (unsigned long)tc->phases_ms.yellow);
+        tc->phases_ms.yellow = 3000; ok = false;
+    } else if (tc->phases_ms.yellow > 5000) {
+        ESP_LOGW(TAG, "GOST: yellow=%lu > 5000 ms → clamp to 5000",
+                 (unsigned long)tc->phases_ms.yellow);
+        tc->phases_ms.yellow = 5000; ok = false;
+    }
+
+    /* --- Красный+жёлтый: 1..2 с (ГОСТ Р 52282 п. 5.6.2) --- */
+    if (tc->phases_ms.red_yellow < 1000) {
+        ESP_LOGE(TAG, "GOST: red_yellow=%lu < 1000 ms → clamp to 1000",
+                 (unsigned long)tc->phases_ms.red_yellow);
+        tc->phases_ms.red_yellow = 1000; ok = false;
+    } else if (tc->phases_ms.red_yellow > 2000) {
+        ESP_LOGE(TAG, "GOST: red_yellow=%lu > 2000 ms → clamp to 2000",
+                 (unsigned long)tc->phases_ms.red_yellow);
+        tc->phases_ms.red_yellow = 2000; ok = false;
+    }
+
+    /* --- Зелёный мигающий: 3 с (ГОСТ Р 52282 п. 5.6.3) --- */
+    if (tc->phases_ms.green_blink < 2000) {
+        ESP_LOGW(TAG, "GOST: green_blink=%lu < 2000 ms → clamp to 3000",
+                 (unsigned long)tc->phases_ms.green_blink);
+        tc->phases_ms.green_blink = 3000; ok = false;
+    }
+
+    /* --- Частота мигания: 1 Гц ± 10% → период 450..550 мс --- */
+    if (tc->phases_ms.phase_blink_period < 450 ||
+        tc->phases_ms.phase_blink_period > 550) {
+        ESP_LOGW(TAG, "GOST: phase_blink_period=%lu ms → clamp to 500 ms "
+                      "(1 Hz ± 10%%, ГОСТ Р 52282 п. 5.6.3)",
+                 (unsigned long)tc->phases_ms.phase_blink_period);
+        tc->phases_ms.phase_blink_period = 500; ok = false;
+    }
+
+    /* --- Минимальный транспортный зелёный: ≥ 20 с (ГОСТ Р 52289 п. 4.4.4) --- */
+    if (tc->phases_ms.green < 20000) {
+        ESP_LOGE(TAG, "GOST: green=%lu < 20000 ms → clamp to 20000 "
+                      "(ГОСТ Р 52289 п. 4.4.4)",
+                 (unsigned long)tc->phases_ms.green);
+        tc->phases_ms.green = 20000; ok = false;
+    }
+
+    /* --- Минимальный пешеходный зелёный: ≥ 15 с (ГОСТ Р 52289 п. 4.4.5) --- */
+    if (tc->phases_ms.ped_green < 15000) {
+        ESP_LOGE(TAG, "GOST: ped_green=%lu < 15000 ms → clamp to 15000 "
+                      "(ГОСТ Р 52289 п. 4.4.5)",
+                 (unsigned long)tc->phases_ms.ped_green);
+        tc->phases_ms.ped_green = 15000; ok = false;
+    }
+
+    /* --- Пешеходный мигающий: 3..5 с (ГОСТ Р 52289 п. 4.4.5.2) --- */
+    if (tc->phases_ms.ped_blink < 3000) {
+        ESP_LOGW(TAG, "GOST: ped_blink=%lu < 3000 ms → clamp to 3000",
+                 (unsigned long)tc->phases_ms.ped_blink);
+        tc->phases_ms.ped_blink = 3000; ok = false;
+    } else if (tc->phases_ms.ped_blink > 5000) {
+        ESP_LOGW(TAG, "GOST: ped_blink=%lu > 5000 ms → clamp to 5000",
+                 (unsigned long)tc->phases_ms.ped_blink);
+        tc->phases_ms.ped_blink = 5000; ok = false;
+    }
+
+    /* --- min_recall_s для пешеходов: ≥ 15 с (ГОСТ Р 52289 п. 4.4.5) --- */
+    if (tc->pedestrian.min_recall_s < 15) {
+        ESP_LOGW(TAG, "GOST: ped min_recall_s=%lu < 15 s → clamp to 15",
+                 (unsigned long)tc->pedestrian.min_recall_s);
+        tc->pedestrian.min_recall_s = 15; ok = false;
+    }
+
+    return ok;
+}
+/* === END FIX GOST-PHASE-VALIDATION === */
+
+/* ============================================================
    parse_pedestrian — добавить парсинг safe_exit_sequence.
    ============================================================ */
 static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
@@ -475,7 +589,7 @@ static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
     tc->pedestrian.insert_timeout_ms =
         (uint32_t)json_get_int(ped, "insert_timeout_ms", 30000);
     tc->pedestrian.min_recall_s =
-        (uint32_t)json_get_int(ped, "min_recall_s", 5);
+        (uint32_t)json_get_int(ped, "min_recall_s", 15);
 
     tc->pedestrian.insert_lead_ms =
         (uint32_t)json_get_int(ped, "insert_lead_ms", 300);
@@ -622,13 +736,11 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
     if (cJSON_IsObject(ph)) {
         tc->phases_ms.red          = (uint32_t)json_get_int(ph, "red", 8000);
         tc->phases_ms.red_yellow   = (uint32_t)json_get_int(ph, "red_yellow", 2000);
-        tc->phases_ms.green        = (uint32_t)json_get_int(ph, "green", 10000);
+        tc->phases_ms.green        = (uint32_t)json_get_int(ph, "green", 25000);
         tc->phases_ms.green_blink  = (uint32_t)json_get_int(ph, "green_blink", 3000);
-        /* === FIX GOST-YELLOW-DURATION: default 3000 === */
         tc->phases_ms.yellow       = (uint32_t)json_get_int(ph, "yellow", 3000);
-        /* === END FIX GOST-YELLOW-DURATION === */
         tc->phases_ms.yellow_blink = (uint32_t)json_get_int(ph, "yellow_blink", 2000);
-        tc->phases_ms.ped_green    = (uint32_t)json_get_int(ph, "ped_green", 10000);
+        tc->phases_ms.ped_green    = (uint32_t)json_get_int(ph, "ped_green", 15000);
         tc->phases_ms.ped_blink    = (uint32_t)json_get_int(ph, "ped_blink", 4000);
         tc->phases_ms.fault_blink_period =
             (uint32_t)json_get_int(ph, "fault_blink_period", 500);
@@ -672,6 +784,65 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
         }
     }
 
+    /* === FIX GOST-ALL-RED: валидация sequence.
+       Между двумя транспортными зелёными должна быть all-red стадия. */
+    if (tc->sequence_count >= 2) {
+        int green_adjacent = 0;
+        for (int i = 0; i < tc->sequence_count; i++) {
+            int nxt = (i + 1) % tc->sequence_count;
+            const traffic_stage_dd_t *s1 = NULL, *s2 = NULL;
+            for (int j = 0; j < tc->stage_count; j++) {
+                if (tc->stages[j].id == tc->sequence[i])   s1 = &tc->stages[j];
+                if (tc->stages[j].id == tc->sequence[nxt]) s2 = &tc->stages[j];
+            }
+            if (!s1 || !s2) continue;
+            bool g1 = (s1->duration_kind == DD_DUR_GREEN ||
+                       s1->duration_kind == DD_DUR_GREEN_BLINK ||
+                       s1->duration_kind == DD_DUR_RED_YELLOW);
+            bool g2 = (s2->duration_kind == DD_DUR_GREEN ||
+                       s2->duration_kind == DD_DUR_GREEN_BLINK ||
+                       s2->duration_kind == DD_DUR_RED_YELLOW);
+            if (g1 && g2) {
+                ESP_LOGW(TAG, "sequence: green stage id=%u followed by "
+                              "green id=%u WITHOUT all-red — will insert "
+                              "virtual all-red in traffic_light.c "
+                              "(GOST Р 52289)",
+                         s1->id, s2->id);
+                green_adjacent++;
+            }
+        }
+        if (green_adjacent == 0) {
+            ESP_LOGI(TAG, "sequence: all-red between greens OK");
+        }
+    }
+    /* === END FIX GOST-ALL-RED === */
+
+    /* === FIX GOST-CONFLICT-MATRIX: парсинг "conflicting_channels": [[a,b], ...] === */
+    tc->conflict_count = 0;
+    const cJSON *conf = cJSON_GetObjectItemCaseSensitive(t, "conflicting_channels");
+    if (cJSON_IsArray(conf)) {
+        const cJSON *pair = NULL;
+        cJSON_ArrayForEach(pair, conf) {
+            if (tc->conflict_count >= MAX_CONFLICT_PAIRS) break;
+            if (!cJSON_IsArray(pair) || cJSON_GetArraySize(pair) < 2) continue;
+            const cJSON *ca = cJSON_GetArrayItem(pair, 0);
+            const cJSON *cb = cJSON_GetArrayItem(pair, 1);
+            if (!cJSON_IsNumber(ca) || !cJSON_IsNumber(cb)) continue;
+            int a = ca->valueint, b = cb->valueint;
+            if (a < 0 || a >= 16 || b < 0 || b >= 16 || a == b) {
+                ESP_LOGW(TAG, "conflict pair (%d,%d) invalid → skip", a, b);
+                continue;
+            }
+            tc->conflicting_channels[tc->conflict_count].a = (uint8_t)a;
+            tc->conflicting_channels[tc->conflict_count].b = (uint8_t)b;
+            tc->conflict_count++;
+        }
+        ESP_LOGI(TAG, "conflicts parsed: %u pairs", tc->conflict_count);
+    } else {
+        ESP_LOGI(TAG, "conflicting_channels missing → no software protection");
+    }
+    /* === END FIX GOST-CONFLICT-MATRIX === */
+
     if (tc->hold.enabled) {
         if (tc->hold.stage_count == 0) {
             ESP_LOGW(TAG, "hold.enabled=true but stage_ids empty → disable");
@@ -703,6 +874,10 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
             }
         }
     }
+
+    /* === FIX GOST-PHASE-VALIDATION: clamp длительностей === */
+    validate_phase_timings(tc);
+    /* === END FIX GOST-PHASE-VALIDATION === */
 }
 
 static void parse_signal_groups(const cJSON *sg) { (void)sg; }
@@ -751,7 +926,6 @@ bool config_load_json(const char *json, size_t len)
 
     ESP_LOGI(TAG, "Parsing JSON config (%u bytes)", (unsigned)len);
 
-    /* === FIX STACK-OVERFLOW: static tmp + mutex === */
     if (!cfg_load_lock()) {
         ESP_LOGE(TAG, "config_load_json: mutex timeout");
         cJSON_Delete(root);
@@ -760,7 +934,6 @@ bool config_load_json(const char *json, size_t len)
     app_config_t *tmp = &s_cfg_load_tmp;
     set_defaults_to(tmp);
     tmp->role = g_config.role;
-    /* === END FIX STACK-OVERFLOW === */
 
     const cJSON *meta = cJSON_GetObjectItemCaseSensitive(root, "meta");
     if (cJSON_IsObject(meta)) {
@@ -834,7 +1007,6 @@ bool config_load_json(const char *json, size_t len)
 
     cJSON_Delete(root);
 
-    /* === FIX: валидация перед коммитом === */
     if (tmp->traffic.enabled && tmp->traffic.stage_count == 0) {
         ESP_LOGE(TAG, "load_json: traffic.enabled=true but no stages_dd "
                       "→ reject (keep current config)");
@@ -847,13 +1019,13 @@ bool config_load_json(const char *json, size_t len)
             tmp->traffic.sequence[i] = tmp->traffic.stages[i].id;
         tmp->traffic.sequence_count = tmp->traffic.stage_count;
     }
-    /* === END FIX === */
 
     g_config = *tmp;
     config_save();
 
     ESP_LOGI(TAG, "JSON loaded (version=%.2f, role=%s, traffic stages=%u seq=%u, "
-                  "ped_mode=%u, hold=%d/%u, insert_seq=%u, insert_red_ms=%lu)",
+                  "ped_mode=%u, hold=%d/%u, insert_seq=%u, insert_red_ms=%lu, "
+                  "conflicts=%u)",
              g_config.version,
              g_config.role == DEVICE_ROLE_SLAVE ? "slave" : "master",
              g_config.traffic.stage_count,
@@ -862,7 +1034,8 @@ bool config_load_json(const char *json, size_t len)
              g_config.traffic.hold.enabled,
              g_config.traffic.hold.stage_count,
              g_config.traffic.pedestrian.insert_count,
-             (unsigned long)g_config.traffic.pedestrian.insert_red_ms);
+             (unsigned long)g_config.traffic.pedestrian.insert_red_ms,
+             g_config.traffic.conflict_count);
 
     cfg_load_unlock();
     return true;
@@ -903,7 +1076,8 @@ static const char *hold_on_ped_to_str(uint8_t m)
 }
 
 /* ============================================================
-   config_export_json — сериализовать safe_exit_sequence.
+   config_export_json — сериализовать safe_exit_sequence
+   + conflicting_channels (FIX GOST-CONFLICT-MATRIX).
    ============================================================ */
 bool config_export_json(char *buf, size_t *len)
 {
@@ -1001,13 +1175,11 @@ bool config_export_json(char *buf, size_t *len)
                     cJSON_CreateNumber(
                         g_config.traffic.pedestrian.insert_sequence[i]));
 
-            /* === FIX-SAFE-EXIT-CFG: safe_exit_sequence === */
             cJSON *sex = cJSON_AddArrayToObject(ped, "safe_exit_sequence");
             for (int i = 0; i < g_config.traffic.pedestrian.safe_exit_count; i++)
                 cJSON_AddItemToArray(sex,
                     cJSON_CreateNumber(
                         g_config.traffic.pedestrian.safe_exit_sequence[i]));
-            /* === END FIX-SAFE-EXIT-CFG === */
         }
 
         cJSON *pins = cJSON_AddObjectToObject(t, "pins");
@@ -1112,6 +1284,20 @@ bool config_export_json(char *buf, size_t *len)
                 cJSON_AddItemToArray(seq, cJSON_CreateNumber(g_config.traffic.sequence[i]));
         }
 
+        /* === FIX GOST-CONFLICT-MATRIX === */
+        cJSON *conf = cJSON_AddArrayToObject(t, "conflicting_channels");
+        if (conf) {
+            for (int i = 0; i < g_config.traffic.conflict_count; i++) {
+                cJSON *pair = cJSON_CreateArray();
+                cJSON_AddItemToArray(pair,
+                    cJSON_CreateNumber(g_config.traffic.conflicting_channels[i].a));
+                cJSON_AddItemToArray(pair,
+                    cJSON_CreateNumber(g_config.traffic.conflicting_channels[i].b));
+                cJSON_AddItemToArray(conf, pair);
+            }
+        }
+        /* === END FIX GOST-CONFLICT-MATRIX === */
+
         cJSON *tr = cJSON_AddArrayToObject(t, "transitions");
         if (tr) {
             for (int i = 0; i < g_config.traffic.transition_count; i++) {
@@ -1160,9 +1346,8 @@ bool config_export_json(char *buf, size_t *len)
 }
 
 /* ============================================================
-   config_export_lora_json — расширенный формат "ped".
-   === FIX-SAFE-EXIT-CFG: safe_exit_count + safe_exit_sequence[]
-       в конце массива ped. ===
+   config_export_lora_json — расширенный формат "ped"
+   + "cf" (conflict pairs flat).
    ============================================================ */
 bool config_export_lora_json(char *buf, size_t *len)
 {
@@ -1255,14 +1440,6 @@ bool config_export_lora_json(char *buf, size_t *len)
                     cJSON_CreateNumber(g_config.traffic.hold.stage_ids[i]));
         }
 
-        /* Формат "ped":
-           [0]=button_enabled   [1]=request_mode
-           [2]=insert_timeout   [3]=min_recall_s
-           [4]=insert_lead_ms   [5]=return_to_hold
-           [6]=insert_red_ms    [7]=insert_count
-           [8..8+insert_count-1]=insert_sequence[]
-           [8+insert_count]=safe_exit_count
-           [9+insert_count ..]=safe_exit_sequence[] */
         cJSON *ped = cJSON_AddArrayToObject(t, "ped");
         if (ped) {
             cJSON_AddItemToArray(ped, cJSON_CreateBool(g_config.traffic.pedestrian.button_enabled));
@@ -1277,14 +1454,12 @@ bool config_export_lora_json(char *buf, size_t *len)
                 cJSON_AddItemToArray(ped,
                     cJSON_CreateNumber(g_config.traffic.pedestrian.insert_sequence[i]));
 
-            /* === FIX-SAFE-EXIT-CFG === */
             cJSON_AddItemToArray(ped,
                 cJSON_CreateNumber(g_config.traffic.pedestrian.safe_exit_count));
             for (int i = 0; i < g_config.traffic.pedestrian.safe_exit_count; i++)
                 cJSON_AddItemToArray(ped,
                     cJSON_CreateNumber(
                         g_config.traffic.pedestrian.safe_exit_sequence[i]));
-            /* === END FIX-SAFE-EXIT-CFG === */
         }
 
         cJSON *st = cJSON_AddArrayToObject(t, "st");
@@ -1317,6 +1492,18 @@ bool config_export_lora_json(char *buf, size_t *len)
             for (int i = 0; i < g_config.traffic.sequence_count; i++)
                 cJSON_AddItemToArray(seq, cJSON_CreateNumber(g_config.traffic.sequence[i]));
         }
+
+        /* === FIX GOST-CONFLICT-MATRIX: flat array [a1,b1,a2,b2,...] === */
+        cJSON *cf = cJSON_AddArrayToObject(t, "cf");
+        if (cf) {
+            for (int i = 0; i < g_config.traffic.conflict_count; i++) {
+                cJSON_AddItemToArray(cf,
+                    cJSON_CreateNumber(g_config.traffic.conflicting_channels[i].a));
+                cJSON_AddItemToArray(cf,
+                    cJSON_CreateNumber(g_config.traffic.conflicting_channels[i].b));
+            }
+        }
+        /* === END FIX GOST-CONFLICT-MATRIX === */
 
         cJSON *tr = cJSON_AddArrayToObject(t, "tr");
         if (tr) {
@@ -1363,8 +1550,8 @@ bool config_export_lora_json(char *buf, size_t *len)
 }
 
 /* ============================================================
-   config_load_lora_json — парсинг "ped" с safe_exit_sequence
-   (FIX-SAFE-EXIT-CFG).
+   config_load_lora_json — парсинг "ped" + "cf"
+   + GOST-PHASE-VALIDATION.
    ============================================================ */
 bool config_load_lora_json(const char *json, size_t len)
 {
@@ -1518,7 +1705,6 @@ bool config_load_lora_json(const char *json, size_t len)
                             (uint8_t)it->valueint;
                 }
 
-                /* === FIX-SAFE-EXIT-CFG: safe_exit_count + safe_exit_sequence[] === */
                 tc->pedestrian.safe_exit_count = 0;
                 int safe_pos = 8 + tc->pedestrian.insert_count;
                 if (safe_pos < psz) {
@@ -1536,7 +1722,6 @@ bool config_load_lora_json(const char *json, size_t len)
                         }
                     }
                 }
-                /* === END FIX-SAFE-EXIT-CFG === */
             } else if (psz >= 7) {
                 tc->pedestrian.insert_lead_ms = (uint32_t)cJSON_GetArrayItem(ped, 4)->valueint;
                 tc->pedestrian.return_to_hold = cJSON_IsTrue(cJSON_GetArrayItem(ped, 5));
@@ -1609,6 +1794,26 @@ bool config_load_lora_json(const char *json, size_t len)
             }
         }
 
+        /* === FIX GOST-CONFLICT-MATRIX === */
+        const cJSON *cf = cJSON_GetObjectItemCaseSensitive(t, "cf");
+        if (cJSON_IsArray(cf)) {
+            int n = cJSON_GetArraySize(cf);
+            int pairs = n / 2;
+            if (pairs > MAX_CONFLICT_PAIRS) pairs = MAX_CONFLICT_PAIRS;
+            tc->conflict_count = 0;
+            for (int i = 0; i < pairs; i++) {
+                const cJSON *ca = cJSON_GetArrayItem(cf, i * 2);
+                const cJSON *cb = cJSON_GetArrayItem(cf, i * 2 + 1);
+                if (!cJSON_IsNumber(ca) || !cJSON_IsNumber(cb)) continue;
+                int a = ca->valueint, b = cb->valueint;
+                if (a < 0 || a >= 16 || b < 0 || b >= 16 || a == b) continue;
+                tc->conflicting_channels[tc->conflict_count].a = (uint8_t)a;
+                tc->conflicting_channels[tc->conflict_count].b = (uint8_t)b;
+                tc->conflict_count++;
+            }
+        }
+        /* === END FIX GOST-CONFLICT-MATRIX === */
+
         const cJSON *tr = cJSON_GetObjectItemCaseSensitive(t, "tr");
         if (cJSON_IsArray(tr)) {
             tc->transition_count = 0;
@@ -1652,12 +1857,16 @@ bool config_load_lora_json(const char *json, size_t len)
         tmp->traffic.sequence_count = tmp->traffic.stage_count;
     }
 
+    /* === FIX GOST-PHASE-VALIDATION: NODE тоже валидирует CFG от ROOT === */
+    validate_phase_timings(&tmp->traffic);
+    /* === END FIX GOST-PHASE-VALIDATION === */
+
     g_config = *tmp;
     config_save();
 
     ESP_LOGI(TAG, "lora_json loaded (version=%.2f, stages=%u seq=%u, "
                   "ped_mode=%u, hold=%d/%u, insert_seq=%u, insert_red_ms=%lu, "
-                  "safe_exit=%u, %u bytes)",
+                  "safe_exit=%u, conflicts=%u, %u bytes)",
              g_config.version, g_config.traffic.stage_count,
              g_config.traffic.sequence_count,
              g_config.traffic.pedestrian.request_mode,
@@ -1666,6 +1875,7 @@ bool config_load_lora_json(const char *json, size_t len)
              g_config.traffic.pedestrian.insert_count,
              (unsigned long)g_config.traffic.pedestrian.insert_red_ms,
              g_config.traffic.pedestrian.safe_exit_count,
+             g_config.traffic.conflict_count,
              (unsigned)len);
 
     cfg_load_unlock();

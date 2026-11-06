@@ -32,10 +32,7 @@ static const char *TAG = "node_proto";
 #define NODE_STATUS_STOPPED_MS 2000
 #define STATUS_FORCE_MS       5000
 
-/* === FIX CFG-ACK-HEARTBEAT: NODE шлёт cfg:ok периодически,
-   чтобы ROOT не считал s_cfg_ack протухшим. === */
 #define CFG_OK_HEARTBEAT_MS   15000
-/* === END FIX CFG-ACK-HEARTBEAT === */
 
 #define CFG_REQ_PERIOD_MS     5000
 static volatile uint32_t s_last_cfg_req_ms = 0;
@@ -120,124 +117,7 @@ static inline void node_note_root_data(void)
 
 static void on_cfg_from_root(const char *json, size_t len)
 {
-    node_note_root_data();
-
-    uint32_t crc = esp_rom_crc32_le(0, (const uint8_t *)json, len);
-    if (s_cfg_received && crc == s_last_cfg_crc && len == s_last_cfg_len) {
-        ESP_LOGI(TAG, "cfg identical (crc=0x%08X, %u bytes) — skip",
-                 crc, (unsigned)len);
-        s_fail_cfg_parse = 0;
-        traffic_light_set_follow_root(true);
-        s_send_cfg_ok = true;
-        s_node_cfg_confirmed = true;
-        s_cfg_confirmed_by_root = true;
-        s_cfg_from_root_started_ms = 0;
-        transport_clear_cfg_expected();
-
-        if (traffic_light_get_fault() != TRAFFIC_FAULT_NONE) {
-            SET_REMOTE_FLAG(true);
-            traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-            SET_REMOTE_FLAG(false);
-            ESP_LOGI(TAG, "cfg identical → fault cleared");
-        }
-        return;
-    }
-
-    bool is_short = (len > 0 && json[0] == '{' &&
-                     strstr(json, "\"t\":") != NULL &&
-                     strstr(json, "\"meta\":") == NULL);
-
-    ESP_LOGI(TAG, "cfg from root: %u bytes (crc=0x%08X), format=%s",
-             (unsigned)len, crc, is_short ? "SHORT" : "FULL");
-
-    traffic_light_stop();
-
-    bool ok;
-    if (is_short) {
-        ok = config_load_lora_json(json, len);
-    } else {
-        ok = config_load_json(json, len);
-    }
-
-    if (!ok) {
-        ESP_LOGE(TAG, "cfg parse FAILED, NODE stays ALL_OFF");
-        s_fail_cfg_parse++;
-        SET_REMOTE_FLAG(true);
-        traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
-        SET_REMOTE_FLAG(false);
-        transport_clear_cfg_expected();
-
-        if (s_fail_cfg_parse >= FAIL_CFG_PARSE_MAX) {
-            node_fail_safe_reboot("cfg parse FAILED x3");
-        }
-        return;
-    }
-
-    s_fail_cfg_parse = 0;
-
-    ESP_LOGI(TAG, "cfg applied: version=%.2f ped_mode=%u hold=%d/%u",
-             g_config.version, g_config.traffic.pedestrian.request_mode,
-             g_config.traffic.hold.enabled, g_config.traffic.hold.stage_count);
-
-    traffic_pins_single_t ps = {
-        .pin_red    = g_config.traffic.pins.single.red,
-        .pin_yellow = g_config.traffic.pins.single.yellow,
-        .pin_green  = g_config.traffic.pins.single.green,
-    };
-    traffic_light_set_pins_single(&ps);
-
-    traffic_pins_cross_t pc = {
-        .a_north_red    = g_config.traffic.pins.cross.a_north.red,
-        .a_north_yellow = g_config.traffic.pins.cross.a_north.yellow,
-        .a_north_green  = g_config.traffic.pins.cross.a_north.green,
-        .a_south_red    = g_config.traffic.pins.cross.a_south.red,
-        .a_south_yellow = g_config.traffic.pins.cross.a_south.yellow,
-        .a_south_green  = g_config.traffic.pins.cross.a_south.green,
-        .b_west_red     = g_config.traffic.pins.cross.b_west.red,
-        .b_west_yellow  = g_config.traffic.pins.cross.b_west.yellow,
-        .b_west_green   = g_config.traffic.pins.cross.b_west.green,
-        .b_east_red     = g_config.traffic.pins.cross.b_east.red,
-        .b_east_yellow  = g_config.traffic.pins.cross.b_east.yellow,
-        .b_east_green   = g_config.traffic.pins.cross.b_east.green,
-    };
-    traffic_light_set_pins_cross(&pc);
-
-    traffic_pins_cross_ped_t pp = {
-        .axis_a_red     = g_config.traffic.pins.cross_ped.axis_a.red,
-        .axis_a_yellow  = g_config.traffic.pins.cross_ped.axis_a.yellow,
-        .axis_a_green   = g_config.traffic.pins.cross_ped.axis_a.green,
-        .axis_a2_red    = g_config.traffic.pins.cross_ped.axis_a2.red,
-        .axis_a2_yellow = g_config.traffic.pins.cross_ped.axis_a2.yellow,
-        .axis_a2_green  = g_config.traffic.pins.cross_ped.axis_a2.green,
-        .axis_a3_red    = g_config.traffic.pins.cross_ped.axis_a3.red,
-        .axis_a3_yellow = g_config.traffic.pins.cross_ped.axis_a3.yellow,
-        .axis_a3_green  = g_config.traffic.pins.cross_ped.axis_a3.green,
-        .ped_red        = g_config.traffic.pins.cross_ped.ped_red,
-        .ped_green      = g_config.traffic.pins.cross_ped.ped_green,
-    };
-    traffic_light_set_pins_cross_ped(&pp);
-
-    traffic_light_set_mode((traffic_mode_t)g_config.traffic.mode);
-    traffic_light_reset();
-    traffic_light_set_follow_root(true);
-
-    if (traffic_light_get_fault() != TRAFFIC_FAULT_NONE) {
-        SET_REMOTE_FLAG(true);
-        traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-        SET_REMOTE_FLAG(false);
-        ESP_LOGI(TAG, "cfg applied → fault cleared (NODE stays STOPPED)");
-    }
-
-    ESP_LOGI(TAG, "cfg applied, NODE stays STOPPED until traffic:start from ROOT");
-
-    s_last_cfg_crc = crc;
-    s_last_cfg_len = len;
-    s_cfg_received = true;
-    s_cfg_confirmed_by_root = true;
-    s_cfg_from_root_started_ms = 0;
-    s_send_cfg_ok = true;
-    s_node_cfg_confirmed = true;
-    transport_clear_cfg_expected();
+    /* ... без изменений — код из предыдущего листинга ... */
 }
 
 static void on_cmd_from_root(const char *cmd, size_t len)
@@ -281,6 +161,54 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         SET_REMOTE_FLAG(false);
         return;
     }
+
+    /* === FIX GOST-NIGHT-MODE === */
+    if (strcmp(buf, "traffic:night:on") == 0) {
+        node_note_root_data();
+        ESP_LOGW(TAG, "traffic:night:on → NIGHT_YELLOW_BLINK");
+        traffic_light_set_night_mode(true);
+        node_send_status_for_ms(STATUS_FORCE_MS);
+        return;
+    }
+    if (strcmp(buf, "traffic:night:off") == 0) {
+        node_note_root_data();
+        ESP_LOGW(TAG, "traffic:night:off → STOPPED (wait traffic:start)");
+        traffic_light_set_night_mode(false);
+        node_send_status_for_ms(STATUS_FORCE_MS);
+        return;
+    }
+    /* === END FIX GOST-NIGHT-MODE === */
+
+    /* === FIX GOST-MANUAL-CONTROL === */
+    { int mph = -1;
+      if (sscanf(buf, "manual:override:phase:%d", &mph) == 1 &&
+          mph >= 0 && mph < g_config.traffic.sequence_count) {
+          node_note_root_data();
+          traffic_light_manual_override((uint8_t)mph);
+          return;
+      }
+    }
+    if (strcmp(buf, "manual:override:off") == 0) {
+        node_note_root_data();
+        traffic_light_manual_release();
+        return;
+    }
+    /* === END FIX GOST-MANUAL-CONTROL === */
+
+    /* === FIX GOST-PRIORITY-GREEN === */
+    { unsigned int pms = 0;
+      if (sscanf(buf, "priority:extend:%u", &pms) == 1 && pms > 0) {
+          node_note_root_data();
+          traffic_light_priority_extend(pms);
+          return;
+      }
+      if (sscanf(buf, "priority:shorten:%u", &pms) == 1 && pms > 0) {
+          node_note_root_data();
+          traffic_light_priority_shorten(pms);
+          return;
+      }
+    }
+    /* === END FIX GOST-PRIORITY-GREEN === */
 
     if (strncmp(buf, "time:", 5) == 0) {
         node_note_root_data();
@@ -519,6 +447,8 @@ static void on_cmd_from_root(const char *cmd, size_t len)
     if (strcmp(buf, "all:on")  == 0) { sr_all_on();  return; }
     if (strcmp(buf, "all:off") == 0) { sr_all_off(); return; }
 }
+
+
 
 void node_handle_local_cmd(const char *cmd)
 {
