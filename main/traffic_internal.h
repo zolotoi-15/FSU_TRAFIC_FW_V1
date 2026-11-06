@@ -104,6 +104,25 @@ uint16_t traffic_light_expected_sr_mask_internal(void);
 void     apply_stage_dd(uint8_t seq_idx);
 void     set_all_off(void);
 
+/* === FIX GOST-CONFLICT-MATRIX ===
+   Проверяет маску on_mask по таблице conflicting_channels.
+   Возвращает true, если есть ХОТЯ БЫ ОДНА конфликтующая пара,
+   у которой ОБА канала включены. */
+bool traffic_mask_has_conflict(uint16_t on_mask);
+/* === END FIX GOST-CONFLICT-MATRIX === */
+
+/* === FIX GOST-ALL-RED ===
+   Минимальная длительность всепрощающей (all-red) фазы.
+   ГОСТ Р 52289 п.7.4.2: не менее 1 с. Берём 2 с с запасом на
+   LoRa-задержку sync: и человеческий фактор. */
+#define ALL_RED_MIN_MS   2000
+
+/* Возвращает true, если переход from_seq → to_seq требует
+   вставки виртуальной all-red фазы (оба зелёные и между ними
+   нет стадии duration_kind == DD_DUR_RED). */
+bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq);
+/* === END FIX GOST-ALL-RED === */
+
 /* ============================================================
    traffic_fault.c
    ============================================================ */

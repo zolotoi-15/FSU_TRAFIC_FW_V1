@@ -19,6 +19,17 @@
    === FIX GOST-RED-YELLOW-LIMIT ===
        stage_duration_ms() жёстко ограничивает длительность
        фазы «красный+жёлтый» 2000 мс (ГОСТ Р 52289).
+
+   === FIX GOST-CONFLICT-MATRIX ===
+       traffic_mask_has_conflict() — проверка маски фазы по
+       таблице conflicting_channels. apply_stage_dd() гасит
+       все каналы и не включает конфликтующую пару, если
+       конфиг ошибочный.
+
+   === FIX GOST-ALL-RED ===
+       need_virtual_all_red() — определяет необходимость
+       вставки виртуальной all-red фазы при переходе между
+       двумя транспортными зелёными без промежуточного red.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -168,6 +179,90 @@ void set_all_off(void)
 }
 
 /* ============================================================
+   traffic_mask_has_conflict
+
+   === FIX GOST-CONFLICT-MATRIX ===
+   Проверяет маску on_mask по таблице conflicting_channels.
+   Возвращает true, если есть ХОТЯ БЫ ОДНА конфликтующая пара,
+   у которой ОБА канала включены.
+
+   Используется в apply_stage_dd() ДО подачи сигналов: если
+   конфиг ошибочный (например, зелёные двух конфликтующих
+   направлений в одной фазе), каналы не включаются вообще —
+   лучше тёмный светофор, чем конфликтующий зелёный.
+   ============================================================ */
+bool traffic_mask_has_conflict(uint16_t on_mask)
+{
+    if (g_config.traffic.conflict_count == 0) return false;
+    bool conflict = false;
+    for (int i = 0; i < g_config.traffic.conflict_count; i++) {
+        uint8_t a = g_config.traffic.conflicting_channels[i].a;
+        uint8_t b = g_config.traffic.conflicting_channels[i].b;
+        if ((on_mask & (1u << a)) && (on_mask & (1u << b))) {
+            ESP_LOGE(TAG, "CONFLICT: ch%02d + ch%02d both ON "
+                          "(GOST Р 52289 п.7.4.1)", a, b);
+            conflict = true;
+        }
+    }
+    return conflict;
+}
+/* === END FIX GOST-CONFLICT-MATRIX === */
+
+/* ============================================================
+   need_virtual_all_red
+
+   === FIX GOST-ALL-RED ===
+   Возвращает true, если переход from_seq → to_seq требует
+   вставки виртуальной all-red фазы:
+     - from_seq — транспортный зелёный (DD_DUR_GREEN или
+       DD_DUR_GREEN_BLINK), И
+     - to_seq   — транспортный зелёный (то же), И
+     - в sequence между ними НЕТ стадии с duration_kind ==
+       DD_DUR_RED (all-red).
+
+   Если между двумя зелёными нет red-фазы, traffic_light.c
+   вставит «виртуальную» all-red длительностью ALL_RED_MIN_MS
+   перед включением to_seq.
+   ============================================================ */
+bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq)
+{
+    if (from_seq == to_seq) return false;
+    if (from_seq >= g_config.traffic.sequence_count) return false;
+    if (to_seq   >= g_config.traffic.sequence_count) return false;
+
+    const traffic_stage_dd_t *s1 = find_stage(g_config.traffic.sequence[from_seq]);
+    const traffic_stage_dd_t *s2 = find_stage(g_config.traffic.sequence[to_seq]);
+    if (!s1 || !s2) return false;
+
+    bool g1 = (s1->duration_kind == DD_DUR_GREEN ||
+               s1->duration_kind == DD_DUR_GREEN_BLINK);
+    bool g2 = (s2->duration_kind == DD_DUR_GREEN ||
+               s2->duration_kind == DD_DUR_GREEN_BLINK);
+    if (!g1 || !g2) return false;
+
+    /* Идём по sequence от from_seq+1 до to_seq-1 (в циклическом
+       порядке) и ищем стадию DD_DUR_RED. */
+    int steps = (to_seq > from_seq)
+                    ? (to_seq - from_seq)
+                    : (to_seq + g_config.traffic.sequence_count - from_seq);
+    for (int i = 1; i < steps; i++) {
+        uint8_t idx = (from_seq + i) % g_config.traffic.sequence_count;
+        const traffic_stage_dd_t *st = find_stage(g_config.traffic.sequence[idx]);
+        if (!st) continue;
+        if (st->duration_kind == DD_DUR_RED) {
+            /* Нашли all-red между зелёными → вставка не нужна. */
+            return false;
+        }
+    }
+
+    ESP_LOGW(TAG, "need_virtual_all_red: seq %u → %u (both green, "
+                  "no all-red between) → insert virtual all-red "
+                  "(GOST Р 52289)", from_seq, to_seq);
+    return true;
+}
+/* === END FIX GOST-ALL-RED === */
+
+/* ============================================================
    apply_stage_dd
 
    === FIX PED-BLINK-MASK ===
@@ -182,6 +277,12 @@ void set_all_off(void)
 
    === FIX INSERT-NO-DOUBLE-SYNC ===
    не дёргаем cb, если вызывающий сам отправит sync:.
+
+   === FIX GOST-CONFLICT-MATRIX ===
+   Если маска фазы содержит конфликтующую пару (оба канала
+   из conflicting_channels включены), НЕ включаем ничего —
+   set_all_off() и return. Лучше тёмный светофор, чем
+   конфликтующий зелёный.
    ============================================================ */
 void apply_stage_dd(uint8_t seq_idx)
 {
@@ -191,6 +292,24 @@ void apply_stage_dd(uint8_t seq_idx)
         ESP_LOGE(TAG, "Stage id=%u not found", g_config.traffic.sequence[seq_idx]);
         return;
     }
+
+    /* === FIX GOST-CONFLICT-MATRIX: проверяем маску фазы ДО подачи
+       сигналов. Если конфиг ошибочный — не включаем НИЧЕГО. === */
+    uint16_t will_be_on = 0;
+    for (int i = 0; i < st->on_count; i++)
+        will_be_on |= (1u << st->outputs_on[i]);
+
+    if (traffic_mask_has_conflict(will_be_on)) {
+        ESP_LOGE(TAG, "Stage id=%u (seq=%u) has conflicting mask 0x%04X "
+                      "→ forcing ALL_OFF (GOST Р 52289)",
+                 st->id, seq_idx, (unsigned)will_be_on);
+        set_all_off();
+        s_blink_mask = 0;
+        s_blink_on = false;
+        s_blink_last_phase = 0;
+        return;
+    }
+    /* === END FIX GOST-CONFLICT-MATRIX === */
 
     uint16_t active = traffic_light_active_sr_mask_internal();
     for (int ch = 0; ch < 16; ch++) {

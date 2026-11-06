@@ -309,6 +309,18 @@ typedef struct {
     uint8_t  on_ped_request;
 } traffic_hold_config_t;
 
+/* === FIX GOST-CONFLICT-MATRIX ===
+   Таблица конфликтов каналов: пары (a, b), которые НЕ МОГУТ
+   гореть одновременно (ГОСТ Р 52289 п.7.4.1 — конфликтующие
+   направления). Максимум пар — 64. */
+#define MAX_CONFLICT_PAIRS  64
+
+typedef struct {
+    uint8_t a;
+    uint8_t b;
+} traffic_conflict_pair_t;
+/* === END FIX GOST-CONFLICT-MATRIX === */
+
 typedef struct {
     uint8_t  mode;
     bool     enabled;
@@ -329,6 +341,11 @@ typedef struct {
 
     uint8_t                 sequence[MAX_SEQUENCE];
     uint8_t                 sequence_count;
+
+    /* === FIX GOST-CONFLICT-MATRIX === */
+    traffic_conflict_pair_t conflicting_channels[MAX_CONFLICT_PAIRS];
+    uint8_t                 conflict_count;
+    /* === END FIX GOST-CONFLICT-MATRIX === */
 } traffic_config_t;
 
 typedef struct {
