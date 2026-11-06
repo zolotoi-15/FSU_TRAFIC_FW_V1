@@ -26,6 +26,10 @@ static const char *TAG = "mqtt_cmd";
 #define NVS_KEY_CHUNK    "chunk_%d"
 #define PENDING_CHUNK_SZ 4096
 
+/* === FIX MQTT-CFG-LIVE-UPDATE: внешняя функция обновления === */
+extern void root_apply_new_config_from_mqtt(const char *json, int len);
+/* === END FIX MQTT-CFG-LIVE-UPDATE === */
+
 static char *s_json_accum        = NULL;
 static int   s_json_accum_len    = 0;
 static int   s_json_accum_total  = 0;
@@ -90,6 +94,13 @@ static esp_err_t save_pending_cfg_to_nvs(const char *data, int data_len) {
     return err;
 }
 
+/* ============================================================
+   mqtt_json_accum_process
+
+   === FIX MQTT-CFG-LIVE-UPDATE ===
+   Не перезагружаемся. Запускаем процедуру обновления:
+   YELLOW_BLINK на ROOT+NODE → CFG на NODE → cfg:ok → START.
+   ============================================================ */
 void mqtt_json_accum_process(void) {
     if (!s_json_accum || s_json_accum_total <= 0) {
         mqtt_json_accum_reset();
@@ -101,21 +112,38 @@ void mqtt_json_accum_process(void) {
         return;
     }
     esp_err_t err = save_pending_cfg_to_nvs(s_json_accum, s_json_accum_total);
-    mqtt_json_accum_reset();
     if (err != ESP_OK) {
+        mqtt_json_accum_reset();
         if (s_mqtt_connected && g_mqtt_client)
             esp_mqtt_client_publish(g_mqtt_client, s_topic, "{\"error\":\"nvs_save\"}", 0, 1, 0);
         return;
     }
+
+    /* === FIX MQTT-CFG-LIVE-UPDATE: применить без перезагрузки === */
+    int len = s_json_accum_total;
+    char *copy = malloc(len + 1);
+    if (copy) {
+        memcpy(copy, s_json_accum, len);
+        copy[len] = '\0';
+        root_apply_new_config_from_mqtt(copy, len);
+        free(copy);
+    } else {
+        ESP_LOGE(TAG, "accum_process: malloc(%d) failed", len);
+    }
+
     if (s_mqtt_connected && g_mqtt_client) {
         esp_mqtt_client_publish(g_mqtt_client, s_topic,
-            "{\"config\":\"pending\",\"reboot\":true}", 0, 1, 0);
-        vTaskDelay(pdMS_TO_TICKS(500));
+            "{\"config\":\"updating\",\"yellow_blink\":true}", 0, 1, 0);
     }
-    ESP_LOGW(TAG, "rebooting to apply config");
-    esp_restart();
+    mqtt_json_accum_reset();
+    /* === END FIX MQTT-CFG-LIVE-UPDATE === */
 }
 
+/* ============================================================
+   mqtt_handle_json_config
+
+   === FIX MQTT-CFG-LIVE-UPDATE: без esp_restart() ===
+   ============================================================ */
 void mqtt_handle_json_config(const char *data, int data_len) {
     if (data_len <= 0 || data_len > MQTT_JSON_INPUT_SIZE) return;
     if (!looks_like_config(data, data_len)) {
@@ -137,13 +165,24 @@ void mqtt_handle_json_config(const char *data, int data_len) {
             esp_mqtt_client_publish(g_mqtt_client, s_topic, "{\"error\":\"nvs_save\"}", 0, 1, 0);
         return;
     }
+
+    /* === FIX MQTT-CFG-LIVE-UPDATE: применить без перезагрузки === */
+    char *copy = malloc(data_len + 1);
+    if (copy) {
+        memcpy(copy, data, data_len);
+        copy[data_len] = '\0';
+        root_apply_new_config_from_mqtt(copy, data_len);
+        free(copy);
+    } else {
+        ESP_LOGE(TAG, "/SetJson: malloc(%d) failed", data_len);
+    }
+
     if (s_mqtt_connected && g_mqtt_client) {
         esp_mqtt_client_publish(g_mqtt_client, s_topic,
-            "{\"config\":\"pending\",\"reboot\":true}", 0, 1, 0);
-        vTaskDelay(pdMS_TO_TICKS(500));
+            "{\"config\":\"updating\",\"yellow_blink\":true}", 0, 1, 0);
     }
-    ESP_LOGW(TAG, "/SetJson: rebooting to apply config");
-    esp_restart();
+    ESP_LOGW(TAG, "/SetJson: config update queued");
+    /* === END FIX MQTT-CFG-LIVE-UPDATE === */
 }
 
 static int hex_nibble(char c) {
@@ -166,6 +205,7 @@ static bool parse_hex(const char *p, uint8_t *buf, size_t max, size_t *out_n) {
     return true;
 }
 
+/* mqtt_handle_command — без изменений (оставлен как был) */
 void mqtt_handle_command(const char *data, int data_len) {
     char cmd[256];
     int len = data_len < (int)sizeof(cmd) - 1 ? data_len : (int)sizeof(cmd) - 1;
@@ -186,7 +226,6 @@ void mqtt_handle_command(const char *data, int data_len) {
 
     if (strncmp(cmd, "key_pressed:", 12) == 0) { changed = true; goto publish; }
 
-    /* === FIX: без esp_wifi_* (Wi-Fi не инициализирован) === */
     if (strcmp(cmd, "net:info") == 0) {
         ESP_LOGI(TAG, "NET: ppp=%d ip=%s transport=%s",
                  modem_ppp_is_connected() ? 1 : 0,
@@ -194,7 +233,6 @@ void mqtt_handle_command(const char *data, int data_len) {
                  transport_is_lora() ? "LoRa" : "TCP");
         changed = true; goto publish;
     }
-    /* === END FIX === */
 
     if (strcmp(cmd, "transport:lora") == 0) { transport_force_lora(); changed = true; goto publish; }
     if (strcmp(cmd, "transport:tcp")  == 0) { transport_force_tcp();  changed = true; goto publish; }
@@ -237,7 +275,6 @@ void mqtt_handle_command(const char *data, int data_len) {
               if (traffic_light_set_mode((traffic_mode_t)mode) == ESP_OK) {
                   changed = true;
               } else {
-                  /* === FIX: сообщаем об ошибке === */
                   if (s_mqtt_connected && g_mqtt_client)
                       esp_mqtt_client_publish(g_mqtt_client, s_topic,
                           "{\"error\":\"mode_while_running\"}", 0, 1, 0);
@@ -335,7 +372,6 @@ void mqtt_handle_command(const char *data, int data_len) {
                 "{\"nvs\":\"erasing\"}", 0, 1, 0);
             vTaskDelay(pdMS_TO_TICKS(500));
         }
-        /* === FIX: nvs_flash_erase может блокировать 1-2 с — WDT reset === */
         esp_task_wdt_reset();
         nvs_flash_erase();
         esp_restart();

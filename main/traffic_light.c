@@ -4,7 +4,7 @@
    === FIX SYNC-PM ===
        force_phase принимает pm_target НА МОМЕНТ применения.
        pm_target=0 → начало фазы (phase_change).
-       pm_target>0 → resync (fallback 30s, повторный sync).
+       pm_target>0 → resync.
        ROOT (follow_root=false): та же фаза + pm=0 → игнор,
                                  pm>0 → resync.
        NODE (follow_root=true): применяем pm_target ВСЕГДА.
@@ -16,9 +16,18 @@
        stage_dd. ROOT — единственный источник правды.
 
        traffic_light_get_stage_masks(phase, &on, &blink) —
-       ПУБЛИЧНЫЙ геттер масок по индексу sequence. Используется
-       root_wd.c для формирования sync: пакета. НЕ требует
-       include traffic_internal.h в вызывающем коде.
+       ПУБЛИЧНЫЙ геттер масок по индексу sequence.
+
+   === FIX NODE-NO-APPLY-UNTIL-SYNC ===
+       traffic_light_start() НЕ применяет stage_dd(0), если
+       s_follow_root == true (NODE). NODE переходит в STANDBY
+       и ждёт sync: с маской от ROOT. Иначе NODE включает
+       каналы фазы 0 до sync:, и фазы не совпадают с ROOT
+       (в логах pm=640/8000 до первого sync:).
+
+       ROOT (follow_root=false) применяет stage_dd(0) как
+       обычно — ROOT источник правды.
+   === END FIX NODE-NO-APPLY-UNTIL-SYNC ===
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -160,7 +169,6 @@ void traffic_task_loop(void *arg)
 
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        /* === FIX P7-log: периодический вывод фазы (5 с) + UTC-lag === */
         if (now - last_phase_log_ms >= 5000) {
             last_phase_log_ms = now;
             if (s_state == TRAFFIC_STATE_RUNNING) {
@@ -195,7 +203,6 @@ void traffic_task_loop(void *arg)
                          s_fault == TRAFFIC_FAULT_ALL_OFF ? "ALL_OFF" : "YELLOW_BLINK");
             }
         }
-        /* === END FIX P7-log === */
 
         if (s_state != TRAFFIC_STATE_RUNNING) continue;
 
@@ -267,7 +274,6 @@ void traffic_task_loop(void *arg)
             }
         }
 
-        /* stuck-check (только ROOT) */
         bool need_fault = false;
         {
             bool in_running = false;
@@ -486,6 +492,14 @@ esp_err_t traffic_light_set_mode(traffic_mode_t mode)
     return ESP_OK;
 }
 
+/* ============================================================
+   === FIX NODE-NO-APPLY-UNTIL-SYNC ===
+   traffic_light_start():
+     - ROOT (follow_root=false): apply_stage_dd(0) как обычно.
+     - NODE (follow_root=true):  НЕ применяет stage_dd, ждёт
+       sync: с маской от ROOT. Каналы остаются выключены до
+       traffic_light_apply_mask().
+   ============================================================ */
 esp_err_t traffic_light_start(void)
 {
     if (g_config.traffic.sequence_count == 0) {
@@ -522,11 +536,20 @@ esp_err_t traffic_light_start(void)
     }
     xSemaphoreGive(s_mutex);
 
-    if (f == TRAFFIC_FAULT_NONE) {
+    /* === FIX NODE-NO-APPLY-UNTIL-SYNC ===
+       NODE в follow_root режиме НЕ применяет stage_dd —
+       ждёт sync: с маской от ROOT. Иначе NODE включает каналы
+       фазы 0 до sync:, фазы не совпадают с ROOT. */
+    if (s_follow_root) {
+        ESP_LOGI(TAG, "START (follow_root=true) — STANDBY, "
+                      "waiting sync: from ROOT (channels OFF)");
+        set_all_off();
+    } else if (f == TRAFFIC_FAULT_NONE) {
         apply_stage_dd(0);
     } else {
         apply_fault_mode(f);
     }
+    /* === END FIX NODE-NO-APPLY-UNTIL-SYNC === */
 
     ESP_LOGI(TAG, "START (mode=%d, seq=%u, fault=%s, follow_root=%d)",
              s_mode, g_config.traffic.sequence_count,
@@ -651,13 +674,6 @@ esp_err_t traffic_light_next_phase(void)
     return ESP_OK;
 }
 
-/* ============================================================
-   traffic_light_force_phase
-   === FIX SYNC-PM ===
-       phase_ms — это pm_target НА МОМЕНТ применения (apply_ms).
-       pm_target=0 → фаза начинается с нуля (phase_change).
-       pm_target>0 → resync в середину фазы.
-   ============================================================ */
 esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
                                     uint32_t duration_ms)
 {
@@ -680,8 +696,6 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
     bool in_fault = (s_fault != TRAFFIC_FAULT_NONE);
 
-    /* Та же фаза — ROOT: pm_target=0 → игнор, pm_target>0 → resync.
-                     NODE: применяем pm_target всегда. */
     if (s_phase == phase && s_state == TRAFFIC_STATE_RUNNING) {
         if (!s_follow_root) {
             if (phase_ms > 0) {
@@ -717,11 +731,6 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
     return ESP_OK;
 }
 
-/* ============================================================
-   traffic_light_apply_mask — NODE применяет маску напрямую.
-   НЕ обращается к stage_dd. ROOT — единственный источник
-   правды о том, какие каналы включены.
-   ============================================================ */
 void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
                               uint8_t phase, uint32_t phase_ms,
                               uint32_t duration_ms)
@@ -755,11 +764,6 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
              (unsigned)on_mask, (unsigned)blink_mask);
 }
 
-/* ============================================================
-   traffic_light_force_phase_masked — force_phase + прямое
-   применение маски. На ROOT маска совпадает с его stage_dd
-   (проверка), на NODE — нет (если конфиги разошлись).
-   ============================================================ */
 esp_err_t traffic_light_force_phase_masked(uint8_t phase,
                                            uint32_t phase_ms,
                                            uint32_t duration_ms)
@@ -774,9 +778,6 @@ esp_err_t traffic_light_force_phase_masked(uint8_t phase,
     return ESP_OK;
 }
 
-/* ============================================================
-   Публичные геттеры масок ТЕКУЩЕЙ фазы (s_phase).
-   ============================================================ */
 uint16_t traffic_light_get_phase_on_mask(void)
 {
     if (g_config.traffic.sequence_count == 0) return 0;
@@ -799,11 +800,6 @@ uint16_t traffic_light_get_phase_blink_mask(void)
     return m;
 }
 
-/* ============================================================
-   Публичный геттер масок фазы по индексу sequence.
-   Используется root_wd.c для формирования sync: пакета.
-   НЕ требует include traffic_internal.h в вызывающем коде.
-   ============================================================ */
 void traffic_light_get_stage_masks(uint8_t phase,
                                    uint16_t *out_on_mask,
                                    uint16_t *out_blink_mask)

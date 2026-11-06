@@ -25,21 +25,19 @@ extern uint32_t wifi_mqtt_get_down_ms(void);
 extern void     wifi_mqtt_force_restart_modem(void);
 extern volatile bool s_cfg_applied_and_started;
 
-static void modem_retry_task(void *arg) {
-    ESP_LOGI(TAG, "modem_retry_task started (NO Wi-Fi STA fallback)");
+/* ============================================================
+   modem_retry_task
 
-    uint32_t waited_ms = 0;
-    while (!s_cfg_applied_and_started && waited_ms < CFG_WAIT_MAX_MS) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        waited_ms += 1000;
-        if ((waited_ms % 10000) == 0)
-            ESP_LOGI(TAG, "modem_retry: waiting for CFG+traffic (%u s)", waited_ms / 1000);
-    }
-    if (!s_cfg_applied_and_started)
-        ESP_LOGW(TAG, "modem_retry: CFG not applied in %d s — start PPP anyway",
-                 CFG_WAIT_MAX_MS / 1000);
-    else
-        ESP_LOGI(TAG, "modem_retry: CFG+traffic ready → starting PPP");
+   === FIX CONNECT-ANY-ORDER ===
+       PPP стартует СРАЗУ, не ждёт s_cfg_applied_and_started.
+       Раньше ROOT ждал NODE 30 с, PPP не стартовал, MQTT не
+       подключался. Трафик всё равно в ALL_OFF до cfg:ok + RUNNING.
+       PPP/MQTT не влияют на LoRa-обмен CFG и трафик.
+   === END FIX CONNECT-ANY-ORDER ===
+   ============================================================ */
+static void modem_retry_task(void *arg) {
+    ESP_LOGI(TAG, "modem_retry_task started (PPP immediately, "
+                  "traffic waits for CFG)");
 
     uint32_t ppp_down_since_ms = 0;
 
@@ -76,7 +74,6 @@ static void modem_retry_task(void *arg) {
             continue;
         }
 
-        /* Если SIM не готова — не спамим PPP */
         if (!modem_ppp_sim_ready() && s_ppp_fail_count >= 3) {
             ESP_LOGW(TAG, "SIM not ready, skip PPP (fail=%d)", s_ppp_fail_count);
             continue;

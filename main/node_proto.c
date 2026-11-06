@@ -1,25 +1,20 @@
 /* ============================================================
    node_proto.c — NODE: CFG → STOPPED → traffic:start → RUNNING.
 
-   === FIX SYNC-PM: sync:ph:pm_target:next:on_mask:blink_mask
-       pm_target — pm НА МОМЕНТ применения (0 = начало фазы,
-                   >0 = resync).
-       on_mask   — маска каналов, которые включить.
-       blink_mask — маска каналов, которые мигать.
+   === FIX CFG-REQ ===
+   === FIX FAIL-SAFE-REBOOT ===
+   === FIX FAST-STATUS ===
 
-   === FIX SYNC-MASK: NODE применяет маску НАПРЯМУЮ через
-       traffic_light_apply_mask() — не заглядывая в свой
-       stage_dd. ROOT — единственный источник правды.
+   === FIX CONNECT-ANY-ORDER ===
+       ROOT и NODE должны соединиться независимо от порядка
+       загрузки.
 
-   === FIX BACKWARD-COMPAT: NODE принимает и старый 3-полевой
-       sync:ph:pm:next (ROOT на старой прошивке). В этом случае
-       маски берутся из своего stage_dd через публичный
-       traffic_light_get_stage_masks() (БЕЗ traffic_internal.h).
-
-   === FIX P7-sync: NODE ПРИМЕНЯЕТ pedestrian:request от ROOT
-       локально.
-
-   === FIX time-delta: log/note delta при приёме time:.
+       - При получении ping от ROOT: если !s_node_cfg_confirmed
+         && s_cfg_received — сразу шлём cfg:req (ROOT на связи).
+       - node_send_task: в STOPPED STATUS каждые 2 с (вместо 10 с) —
+         ROOT быстро увидит NODE.
+       - node_wd: cfg:req каждые 2 с в первые 30 с (вместо 5 с).
+   === END FIX CONNECT-ANY-ORDER ===
    ============================================================ */
 
 #include "node_proto.h"
@@ -40,6 +35,7 @@
 #include "esp_rom_crc.h"
 #include "esp_mac.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
@@ -49,8 +45,11 @@ static const char *TAG = "node_proto";
 
 #define NODE_COMM_LOST_MS     20000
 #define CFG_OK_PERIODIC_MS    5000
+#define CFG_REQ_PERIODIC_MS   5000
 #define NODE_STATUS_PERIOD_MS 10000
 #define NODE_STATUS_FAULT_MS  1000
+#define NODE_STATUS_STOPPED_MS 2000     /* === FIX CONNECT-ANY-ORDER === */
+#define STATUS_FORCE_MS       5000
 
 #define CFG_REQ_PERIOD_MS     5000
 static volatile uint32_t s_last_cfg_req_ms = 0;
@@ -58,12 +57,29 @@ static volatile uint32_t s_last_cfg_req_ms = 0;
 static volatile bool s_node_cfg_confirmed = false;
 static volatile uint32_t s_last_cfg_req_wd_ms = 0;
 #define WD_CFG_REQ_PERIOD_MS  5000
+#define WD_CFG_REQ_FAST_MS    2000     /* === FIX CONNECT-ANY-ORDER === */
+#define WD_CFG_REQ_FAST_WINDOW_MS 30000
 
-/* === FIX SYNC-PM: SYNC_LEAD_MS = запас на ToA (112) + ack_tx.
-   NODE ждёт SYNC_LEAD_MS после приёма sync:, затем применяет
-   маску через apply_mask(). ROOT делает то же самое. */
 #define SYNC_LEAD_MS          300
-/* === END FIX SYNC-PM === */
+
+static volatile bool     s_status_now = false;
+static volatile uint32_t s_status_force_until_ms = 0;
+
+#define FAIL_CFG_PARSE_MAX      3
+#define FAIL_SYNC_FORMAT_MAX    5
+#define FAIL_APPLY_MASK_MAX     3
+#define FAIL_SYNC_IGNORED_MAX   10
+#define FAIL_NO_SYNC_MS         10000
+#define FAIL_NO_ROOT_DATA_MS    60000
+#define FAIL_REBOOT_DELAY_MS    500
+
+static volatile uint8_t  s_fail_cfg_parse    = 0;
+static volatile uint8_t  s_fail_sync_format  = 0;
+static volatile uint8_t  s_fail_apply_mask   = 0;
+static volatile uint8_t  s_fail_sync_ignored = 0;
+
+static volatile uint32_t s_traffic_started_ms = 0;
+static volatile uint32_t s_last_root_data_ms  = 0;
 
 volatile bool s_fault_from_remote_ex = false;
 volatile bool s_node_running = false;
@@ -83,18 +99,56 @@ extern volatile bool s_cfg_ack;
 
 bool node_cfg_received(void) { return s_cfg_received; }
 
+void node_send_status_now(void)
+{
+    s_status_now = true;
+}
+
+void node_send_status_for_ms(uint32_t ms)
+{
+    s_status_now = true;
+    s_status_force_until_ms = (uint32_t)(esp_timer_get_time() / 1000) + ms;
+}
+
+static void node_fail_safe_reboot(const char *reason)
+{
+    ESP_LOGE(TAG, "=== FAIL-SAFE REBOOT: %s ===", reason);
+    traffic_light_stop();
+    SET_REMOTE_FLAG(true);
+    traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
+    SET_REMOTE_FLAG(false);
+    vTaskDelay(pdMS_TO_TICKS(FAIL_REBOOT_DELAY_MS));
+    esp_restart();
+}
+
+static inline void node_note_root_data(void)
+{
+    s_last_root_data_ms = (uint32_t)(esp_timer_get_time() / 1000);
+}
+
 /* ============================================================
    on_cfg_from_root
    ============================================================ */
 static void on_cfg_from_root(const char *json, size_t len)
 {
+    node_note_root_data();
+
     uint32_t crc = esp_rom_crc32_le(0, (const uint8_t *)json, len);
     if (s_cfg_received && crc == s_last_cfg_crc && len == s_last_cfg_len) {
         ESP_LOGI(TAG, "cfg identical (crc=0x%08X, %u bytes) — skip",
                  crc, (unsigned)len);
+        s_fail_cfg_parse = 0;
         traffic_light_set_follow_root(true);
         s_send_cfg_ok = true;
+        s_node_cfg_confirmed = true;
         transport_clear_cfg_expected();
+
+        if (traffic_light_get_fault() != TRAFFIC_FAULT_NONE) {
+            SET_REMOTE_FLAG(true);
+            traffic_light_set_fault(TRAFFIC_FAULT_NONE);
+            SET_REMOTE_FLAG(false);
+            ESP_LOGI(TAG, "cfg identical → fault cleared");
+        }
         return;
     }
 
@@ -116,12 +170,19 @@ static void on_cfg_from_root(const char *json, size_t len)
 
     if (!ok) {
         ESP_LOGE(TAG, "cfg parse FAILED, NODE stays ALL_OFF");
+        s_fail_cfg_parse++;
         SET_REMOTE_FLAG(true);
         traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
         SET_REMOTE_FLAG(false);
         transport_clear_cfg_expected();
+
+        if (s_fail_cfg_parse >= FAIL_CFG_PARSE_MAX) {
+            node_fail_safe_reboot("cfg parse FAILED x3");
+        }
         return;
     }
+
+    s_fail_cfg_parse = 0;
 
     ESP_LOGI(TAG, "cfg applied: version=%.2f ped_mode=%u",
              g_config.version, g_config.traffic.pedestrian.request_mode);
@@ -168,10 +229,11 @@ static void on_cfg_from_root(const char *json, size_t len)
     traffic_light_reset();
     traffic_light_set_follow_root(true);
 
-    if (traffic_light_get_fault() == TRAFFIC_FAULT_ALL_OFF) {
+    if (traffic_light_get_fault() != TRAFFIC_FAULT_NONE) {
         SET_REMOTE_FLAG(true);
         traffic_light_set_fault(TRAFFIC_FAULT_NONE);
         SET_REMOTE_FLAG(false);
+        ESP_LOGI(TAG, "cfg applied → fault cleared (NODE stays STOPPED)");
     }
 
     ESP_LOGI(TAG, "cfg applied, NODE stays STOPPED until traffic:start from ROOT");
@@ -180,19 +242,12 @@ static void on_cfg_from_root(const char *json, size_t len)
     s_last_cfg_len = len;
     s_cfg_received = true;
     s_send_cfg_ok = true;
+    s_node_cfg_confirmed = true;
     transport_clear_cfg_expected();
 }
 
 /* ============================================================
    on_cmd_from_root
-   === FIX SYNC-PM + SYNC-MASK + BACKWARD-COMPAT:
-       NODE принимает:
-         1) sync:ph:pm_target:next:on_mask:blink_mask  (новый)
-         2) sync:ph:pm_target:next                     (старый)
-       Для нового формата NODE применяет маску НАПРЯМУЮ через
-       apply_mask(). Для старого — маски берутся из своего
-       stage_dd через ПУБЛИЧНЫЙ traffic_light_get_stage_masks()
-       (БЕЗ traffic_internal.h — иначе find_stage не объявлен).
    ============================================================ */
 static void on_cmd_from_root(const char *cmd, size_t len)
 {
@@ -226,8 +281,16 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         return;
     }
 
-    /* === FIX time-delta === */
+    if (strncmp(buf, "fault:yellow_blink", 18) == 0) {
+        ESP_LOGW(TAG, "fault:yellow_blink from ROOT → apply YELLOW_BLINK");
+        SET_REMOTE_FLAG(true);
+        traffic_light_set_fault(TRAFFIC_FAULT_YELLOW_BLINK);
+        SET_REMOTE_FLAG(false);
+        return;
+    }
+
     if (strncmp(buf, "time:", 5) == 0) {
+        node_note_root_data();
         unsigned long sec = 0; unsigned ms = 0; unsigned long rtt = 0;
         if (sscanf(buf + 5, "%lu:%u:%lu", &sec, &ms, &rtt) >= 2) {
             uint32_t local_sec = 0; uint16_t local_ms = 0;
@@ -244,7 +307,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         }
         return;
     }
-    /* === END FIX time-delta === */
 
     if (strcmp(buf, "timeq") == 0) {
         uint32_t t_sec = 0; uint16_t t_ms = 0;
@@ -259,7 +321,18 @@ static void on_cmd_from_root(const char *cmd, size_t len)
     }
 
     if (strcmp(buf, "ping") == 0) {
+        node_note_root_data();
         s_last_sync_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        /* === FIX CONNECT-ANY-ORDER: ROOT на связи, NODE не подтверждён —
+           сразу шлём cfg:req === */
+        if (!s_node_cfg_confirmed && s_cfg_received &&
+            !transport_is_cfg_rx_in_progress()) {
+            esp_err_t err = transport_send_evt("cfg:req", 7);
+            ESP_LOGI(TAG, "ping from ROOT → cfg:req (%s), confirmed=0",
+                     err == ESP_OK ? "OK" : esp_err_to_name(err));
+        }
+        /* === END FIX CONNECT-ANY-ORDER === */
         return;
     }
 
@@ -283,40 +356,35 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         return;
     }
 
-    /* === FIX P7-sync === */
     if (strcmp(buf, "pedestrian:request") == 0) {
         ESP_LOGW(TAG, "pedestrian:request from ROOT → apply locally");
         traffic_light_request_pedestrian();
         return;
     }
-    /* === END FIX P7-sync === */
 
-    /* === FIX SYNC-PM + SYNC-MASK + BACKWARD-COMPAT ===
-       NODE принимает и 5-полевой (новый), и 3-полевой (старый).
-       Маски для старого — через ПУБЛИЧНЫЙ
-       traffic_light_get_stage_masks() (БЕЗ traffic_internal.h). === */
     if (strncmp(buf, "sync:", 5) == 0) {
+        node_note_root_data();
+
         unsigned ph = 0;
         unsigned long pm_target = 0;
         unsigned next_ph = 0;
         uint16_t on_mask = 0;
         uint16_t blink_mask = 0;
 
-        /* Новый формат: sync:ph:pm:next:on_mask:blink_mask.
-           %hx — hex в short (16 бит), совместим с uint16_t*. */
         int matched = sscanf(buf + 5, "%u:%lu:%u:0x%hx:0x%hx",
                              &ph, &pm_target, &next_ph,
                              &on_mask, &blink_mask);
-
         bool has_mask = (matched == 5);
 
         if (!has_mask) {
-            /* Старый формат: sync:ph:pm:next. ROOT outdated.
-               Маски — из своего stage_dd через публичный геттер. */
             matched = sscanf(buf + 5, "%u:%lu:%u",
                              &ph, &pm_target, &next_ph);
             if (matched < 3) {
                 ESP_LOGW(TAG, "sync: bad format: '%s'", buf);
+                s_fail_sync_format++;
+                if (s_fail_sync_format >= FAIL_SYNC_FORMAT_MAX) {
+                    node_fail_safe_reboot("sync bad format x5");
+                }
                 return;
             }
             if (ph < g_config.traffic.sequence_count) {
@@ -327,15 +395,40 @@ static void on_cmd_from_root(const char *cmd, size_t len)
                           "on=0x%04X blink=0x%04X (from local stage_dd)",
                      on_mask, blink_mask);
         }
+        s_fail_sync_format = 0;
 
         if (!s_cfg_received) {
             ESP_LOGW(TAG, "sync ignored — no CFG yet (ALL_OFF)");
+            s_fail_sync_ignored++;
+            if (s_fail_sync_ignored >= FAIL_SYNC_IGNORED_MAX) {
+                node_fail_safe_reboot("sync ignored (no CFG) x10");
+            }
             return;
         }
         if (traffic_light_get_state() != TRAFFIC_STATE_RUNNING) {
             ESP_LOGW(TAG, "sync ignored — NODE not RUNNING");
+            s_fail_sync_ignored++;
+            if (s_fail_sync_ignored >= FAIL_SYNC_IGNORED_MAX) {
+                node_fail_safe_reboot("sync ignored (not RUNNING) x10");
+            }
             return;
         }
+        s_fail_sync_ignored = 0;
+
+        if (on_mask == 0 && blink_mask == 0) {
+            ESP_LOGW(TAG, "sync: empty mask (on=0 blink=0) — ignore");
+            s_fail_apply_mask++;
+            if (s_fail_apply_mask >= FAIL_APPLY_MASK_MAX) {
+                node_fail_safe_reboot("empty mask x3");
+            }
+            return;
+        }
+        s_fail_apply_mask = 0;
+
+        s_traffic_started_ms = 0;
+
+        s_status_force_until_ms = 0;
+        s_status_now = false;
 
         uint32_t t0_ms = (uint32_t)(esp_timer_get_time() / 1000);
         s_last_sync_ms = t0_ms;
@@ -347,43 +440,22 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         }
         uint32_t dur = traffic_light_stage_duration_ms(next_ph);
 
-        uint32_t apply_ms = t0_ms + SYNC_LEAD_MS;
-
-        ESP_LOGI(TAG, "sync: ph=%u pm_target=%lu apply_ms=%lu next=%u "
-                      "on=0x%04X blink=0x%04X%s",
-                 ph, pm_target, (unsigned long)apply_ms, next_ph,
-                 on_mask, blink_mask, has_mask ? "" : " [legacy]");
-
-        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        int32_t wait_ms = (int32_t)(apply_ms - now_ms);
-        if (wait_ms > 2000) {
-            ESP_LOGW(TAG, "sync: wait_ms=%ld > 2000 → clamp", (long)wait_ms);
-            wait_ms = 2000;
-        }
-        if (wait_ms > 0) {
-            vTaskDelay(pdMS_TO_TICKS(wait_ms));
-        }
-
-        now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        int32_t lag = (int32_t)(now_ms - apply_ms);
-        if (lag < 0) lag = 0;
-
-        /* pm_apply = pm_target + lag
-           pm_target=0 → pm_apply=lag — начало фазы.
-           pm_target>0 → pm_apply=pm_target+lag — resync. */
-        uint32_t pm_apply = (uint32_t)pm_target + (uint32_t)lag;
+        uint32_t pm_apply = (uint32_t)pm_target;
         if (dur > 0 && pm_apply >= dur) pm_apply = dur - 1;
 
-        /* NODE применяет маску НАПРЯМУЮ через apply_mask() */
+        ESP_LOGI(TAG, "sync: ph=%u pm_target=%lu next=%u "
+                      "on=0x%04X blink=0x%04X%s",
+                 ph, pm_target, next_ph, on_mask, blink_mask,
+                 has_mask ? "" : " [legacy]");
+
         traffic_light_apply_mask(on_mask, blink_mask,
                                  (uint8_t)ph, pm_apply, dur);
-        ESP_LOGI(TAG, "sync applied (NODE): ph=%u pm=%lu lag=%ld dur=%lu "
+        ESP_LOGI(TAG, "sync applied (NODE): ph=%u pm=%lu dur=%lu "
                       "on=0x%04X blink=0x%04X",
-                 ph, (unsigned long)pm_apply, (long)lag,
+                 ph, (unsigned long)pm_apply,
                  (unsigned long)dur, on_mask, blink_mask);
         return;
     }
-    /* === END FIX SYNC-PM + SYNC-MASK + BACKWARD-COMPAT === */
 
     if (strncmp(buf, "rs485:", 6) == 0 || strncmp(buf, "can:", 4) == 0) {
         extern void node_handle_local_cmd(const char *cmd);
@@ -393,6 +465,7 @@ static void on_cmd_from_root(const char *cmd, size_t len)
 
     int relay = -1, state = -1, mode = 0;
     if (strcmp(buf, "traffic:start") == 0) {
+        node_note_root_data();
         if (!s_cfg_received) {
             ESP_LOGW(TAG, "traffic:start ignored — no CFG yet → ALL_OFF");
             SET_REMOTE_FLAG(true);
@@ -403,10 +476,11 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         if (traffic_light_get_state() == TRAFFIC_STATE_RUNNING) {
             ESP_LOGI(TAG, "traffic:start ignored — already RUNNING");
             s_node_cfg_confirmed = true;
+            node_send_status_for_ms(STATUS_FORCE_MS);
             return;
         }
         ESP_LOGW(TAG, "traffic:start from root → clear ALL_OFF + START");
-        if (traffic_light_get_fault() == TRAFFIC_FAULT_ALL_OFF) {
+        if (traffic_light_get_fault() != TRAFFIC_FAULT_NONE) {
             SET_REMOTE_FLAG(true);
             traffic_light_set_fault(TRAFFIC_FAULT_NONE);
             SET_REMOTE_FLAG(false);
@@ -414,6 +488,12 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         traffic_light_set_follow_root(true);
         s_node_cfg_confirmed = true;
         traffic_light_start();
+
+        s_traffic_started_ms = (uint32_t)(esp_timer_get_time() / 1000);
+
+        node_send_status_for_ms(STATUS_FORCE_MS);
+        ESP_LOGI(TAG, "traffic:start applied → STATUS forced %d ms (RUNNING)",
+                 STATUS_FORCE_MS);
         return;
     }
     if (strcmp(buf, "traffic:stop")   == 0) { traffic_light_stop();   return; }
@@ -608,10 +688,16 @@ static void on_evt_from_node(const char *evt, size_t len)
     }
 }
 
+/* ============================================================
+   cfg_ok_tx_task
+   === FIX CFG-REQ: cfg:req периодически если NVS CFG есть,
+       но ROOT не подтвердил (s_node_cfg_confirmed == false) ===
+   ============================================================ */
 static void cfg_ok_tx_task(void *arg)
 {
     ESP_LOGI(TAG, "cfg_ok_tx_task started");
     uint32_t last_cfg_ok_ms = 0;
+    uint32_t last_cfg_req_ms = 0;
     bool     cfg_ok_sent_once = false;
 
     while (1) {
@@ -640,10 +726,23 @@ static void cfg_ok_tx_task(void *arg)
             }
         }
 
+        if (!s_node_cfg_confirmed && s_cfg_received &&
+            transport_is_lora() && !transport_is_cfg_rx_in_progress() &&
+            (now - last_cfg_req_ms) >= CFG_REQ_PERIODIC_MS) {
+            last_cfg_req_ms = now;
+            esp_err_t err = transport_send_evt("cfg:req", 7);
+            ESP_LOGW(TAG, "cfg:req (periodic, ROOT not confirmed) → %s",
+                     err == ESP_OK ? "OK" : esp_err_to_name(err));
+        }
+
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
+/* ============================================================
+   node_send_task
+   === FIX CONNECT-ANY-ORDER: в STOPPED STATUS каждые 2 с ===
+   ============================================================ */
 static void node_send_task(void *arg)
 {
     char *json = malloc(512);
@@ -690,24 +789,53 @@ static void node_send_task(void *arg)
             traffic_light_fault_str(),
             traffic_light_get_fault_count());
 
-        transport_send_status(json, off);
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        bool force = s_status_now ||
+                     (s_status_force_until_ms != 0 &&
+                      now_ms < s_status_force_until_ms);
+        if (s_status_now) s_status_now = false;
+        if (s_status_force_until_ms != 0 && now_ms >= s_status_force_until_ms) {
+            s_status_force_until_ms = 0;
+        }
 
-        uint32_t period = (cur_fault != TRAFFIC_FAULT_NONE)
-                          ? NODE_STATUS_FAULT_MS
-                          : NODE_STATUS_PERIOD_MS;
+        if (force) {
+            esp_err_t err = transport_send_status_noack(json, off);
+            ESP_LOGI(TAG, "STATUS forced (no-ack) → ROOT: %s",
+                     err == ESP_OK ? "OK" : esp_err_to_name(err));
+        } else {
+            transport_send_status(json, off);
+        }
+
+        /* === FIX CONNECT-ANY-ORDER: в STOPPED STATUS каждые 2 с === */
+        uint32_t period;
+        if (force) {
+            period = 200;
+        } else if (cur_fault != TRAFFIC_FAULT_NONE) {
+            period = NODE_STATUS_FAULT_MS;
+        } else if (traffic_light_get_state() != TRAFFIC_STATE_RUNNING) {
+            period = NODE_STATUS_STOPPED_MS;
+        } else {
+            period = NODE_STATUS_PERIOD_MS;
+        }
+        /* === END FIX CONNECT-ANY-ORDER === */
         vTaskDelay(pdMS_TO_TICKS(period));
     }
 }
 
 /* ============================================================
    node_link_watchdog_task
+   === FIX CONNECT-ANY-ORDER: cfg:req каждые 2 с в первые 30 с ===
    ============================================================ */
 static void node_link_watchdog_task(void *arg)
 {
+    ESP_LOGW(TAG, "node_wd: task started (role=%s)",
+             g_config.role == DEVICE_ROLE_MASTER ? "MASTER" : "SLAVE");
+
     bool     was_connected = false;
     uint32_t disconnected_since_ms = 0;
     bool     in_comm_lost_all_off = false;
     uint32_t boot_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t wd_start_ms = 0;
 
     uint32_t first_sync_ms = 0;
     bool     no_cfg_all_off = false;
@@ -741,6 +869,9 @@ static void node_link_watchdog_task(void *arg)
         s_cfg_received = true;
         traffic_light_reset();
         traffic_light_set_follow_root(true);
+
+        s_node_cfg_confirmed = false;
+        ESP_LOGW(TAG, "node_wd: NVS CFG → request CFG from ROOT (cfg:req)");
     } else {
         ESP_LOGW(TAG, "node_wd: no CFG in NVS → ALL_OFF + request CFG from ROOT");
         s_cfg_received = false;
@@ -759,6 +890,8 @@ static void node_link_watchdog_task(void *arg)
             return;
         }
     }
+    ESP_LOGW(TAG, "node_wd: LoRa ready, entering main loop");
+    wd_start_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(500));
@@ -766,6 +899,21 @@ static void node_link_watchdog_task(void *arg)
 
         bool connected = transport_is_lora();
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+
+        if (connected) {
+            if (s_traffic_started_ms != 0 &&
+                traffic_light_get_state() == TRAFFIC_STATE_RUNNING &&
+                (now - s_traffic_started_ms) >= FAIL_NO_SYNC_MS &&
+                s_last_sync_ms == 0) {
+                node_fail_safe_reboot("traffic:start without sync: > 10 s");
+            }
+
+            if (s_cfg_received && s_last_root_data_ms != 0 &&
+                s_traffic_started_ms != 0 &&
+                (now - s_last_root_data_ms) >= FAIL_NO_ROOT_DATA_MS) {
+                node_fail_safe_reboot("no root data > 60 s");
+            }
+        }
 
         if (connected && !was_connected && first_sync_ms == 0) {
             first_sync_ms = now;
@@ -793,13 +941,21 @@ static void node_link_watchdog_task(void *arg)
             disconnected_since_ms = now;
             if (traffic_light_get_state() == TRAFFIC_STATE_RUNNING)
                 traffic_light_stop();
+            s_traffic_started_ms = 0;
+            s_last_root_data_ms  = 0;
         }
 
         if (connected && !s_node_cfg_confirmed && transport_is_lora() &&
             !transport_is_cfg_rx_in_progress()) {
             uint32_t now_req = xTaskGetTickCount() * portTICK_PERIOD_MS;
+            /* === FIX CONNECT-ANY-ORDER: первые 30 с — каждые 2 с === */
+            uint32_t req_period = WD_CFG_REQ_PERIOD_MS;
+            if (wd_start_ms != 0 && (now - wd_start_ms) < WD_CFG_REQ_FAST_WINDOW_MS) {
+                req_period = WD_CFG_REQ_FAST_MS;
+            }
+            /* === END FIX CONNECT-ANY-ORDER === */
             if (s_last_cfg_req_wd_ms == 0 ||
-                (now_req - s_last_cfg_req_wd_ms) >= WD_CFG_REQ_PERIOD_MS) {
+                (now_req - s_last_cfg_req_wd_ms) >= req_period) {
                 s_last_cfg_req_wd_ms = now_req;
                 esp_err_t rq = transport_send_evt("cfg:req", 7);
                 ESP_LOGI(TAG, "node_wd: cfg:req → ROOT (%s), confirmed=%d",

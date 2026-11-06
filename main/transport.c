@@ -1,9 +1,17 @@
 /* ============================================================
    transport.c — LoRa-транспорт.
 
-   === FIX #3: для T_CMD (sync: и т.п.) — 2 попытки, не 3.
-       send_sync_to_node не должен блокировать phase_sync_task
-       на 6 с (3 × 2000 мс). Снижаем до 4 с (2 × 2000 мс).
+   === FIX SYNC-NO-WAIT ===
+       lora_send_fragmented_noack() — без ACK на последнем фрагменте.
+
+   === FIX FAST-STATUS ===
+       transport_send_status_noack() — STATUS без ACK.
+
+   === FIX CONNECT-ANY-ORDER ===
+       transport_set_ack_cb() — callback при получении ACK.
+       ROOT подписывается в root_wd_start_tasks() и при ACK на
+       ping (NODE на связи) триггерит CFG-push, если s_cfg_ack == false.
+   === END FIX CONNECT-ANY-ORDER ===
    ============================================================ */
 
 #include "transport.h"
@@ -43,9 +51,7 @@ static const char *TAG = "transport";
 #define MAX_RETRIES       3
 #define MAX_RETRIES_CFG   3
 
-/* === FIX #3: CMD max_retries 2 (не 3) === */
 #define MAX_RETRIES_CMD   2
-/* === END FIX #3 === */
 
 #define CFG_NEW_BURST_MS          4000
 #define CFG_EXPECTED_TIMEOUT_MS   15000
@@ -88,6 +94,10 @@ static transport_rx_cb_t s_cmd_cb    = NULL;
 static transport_rx_cb_t s_cfg_cb    = NULL;
 static transport_rx_cb_t s_status_cb = NULL;
 static transport_rx_cb_t s_evt_cb    = NULL;
+
+/* === FIX CONNECT-ANY-ORDER === */
+static transport_ack_cb_t s_ack_cb   = NULL;
+/* === END FIX CONNECT-ANY-ORDER === */
 
 static char   s_accum_cmd[ACCUM_CMD_MAX];
 static char   s_accum_cfg[ACCUM_CFG_MAX];
@@ -257,20 +267,18 @@ static esp_err_t lora_send_packet_ack(uint8_t type, uint8_t seq,
         return err;
     }
 
-    /* === FIX #3: для T_CMD max_retries = 2 (не 3) === */
     int max_retries;
     int ack_timeout;
     if (type == T_CFG) {
         max_retries = MAX_RETRIES_CFG;
         ack_timeout = ACK_TIMEOUT_CFG;
     } else if (type == T_CMD) {
-        max_retries = MAX_RETRIES_CMD;       /* 2 */
+        max_retries = MAX_RETRIES_CMD;
         ack_timeout = ACK_TIMEOUT_CMD;
     } else {
         max_retries = MAX_RETRIES;
         ack_timeout = ACK_TIMEOUT;
     }
-    /* === END FIX #3 === */
 
     for (int retry = 0; retry < max_retries; retry++) {
         xSemaphoreTake(s_ack_sem, 0);
@@ -358,6 +366,57 @@ static esp_err_t lora_send_fragmented(uint8_t type, const char *data, size_t len
     return ESP_OK;
 }
 
+static esp_err_t lora_send_fragmented_noack(uint8_t type,
+                                            const char *data, size_t len)
+{
+    if (!data || len == 0) return ESP_ERR_INVALID_ARG;
+
+    uint32_t start_ms = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t total_budget_ms = TOTAL_BUDGET_OTHER_MS;
+
+    uint8_t seq = (uint8_t)(esp_timer_get_time() & 0xFF);
+    size_t sent = 0;
+    int frag_idx = 0;
+    int frag_total = (len + FRAG_DATA_MAX - 1) / FRAG_DATA_MAX;
+
+    ESP_LOGI(TAG, "TX %s (no-ack, fragmented): total %u bytes, %d fragments",
+             pkt_type_str(type), (unsigned)len, frag_total);
+
+    while (sent < len) {
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        if ((now_ms - start_ms) > total_budget_ms) {
+            ESP_LOGE(TAG, "TX %s no-ack budget exhausted", pkt_type_str(type));
+            return ESP_ERR_TIMEOUT;
+        }
+
+        size_t chunk = (len - sent > FRAG_DATA_MAX) ? FRAG_DATA_MAX : (len - sent);
+        uint8_t flag = (sent + chunk < len) ? 0x01 : 0x00;
+
+        uint8_t buf[PKT_MAX];
+        buf[0] = flag;
+        buf[1] = (uint8_t)frag_idx;
+        buf[2] = (uint8_t)frag_total;
+        memcpy(&buf[3], data + sent, chunk);
+        size_t payload_len = FRAG_HDR_SIZE + chunk;
+
+        esp_err_t err = lora_send_packet_ack(type, seq, buf, payload_len,
+                                             false);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "TX %s no-ack frag %d/%d FAILED: %s",
+                     pkt_type_str(type), frag_idx + 1, frag_total,
+                     esp_err_to_name(err));
+            return err;
+        }
+
+        sent += chunk;
+        seq++;
+        frag_idx++;
+
+        if (sent < len) vTaskDelay(pdMS_TO_TICKS(FRAG_GAP_MS));
+    }
+    return ESP_OK;
+}
+
 static void lora_raw_handler(const uint8_t *data, size_t len)
 {
     if (len < 4 || data[0] != PKT_MAGIC) {
@@ -380,6 +439,9 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
 #endif
         s_last_ack_seq = seq;
         xSemaphoreGive(s_ack_sem);
+        /* === FIX CONNECT-ANY-ORDER: callback для ROOT === */
+        if (s_ack_cb) s_ack_cb(seq, T_ACK);
+        /* === END FIX CONNECT-ANY-ORDER === */
         return;
     }
 
@@ -587,7 +649,8 @@ esp_err_t transport_init(void)
         xTaskCreate(cfg_handler_task, "cfg_handler", 24576, NULL, 4, NULL);
 
         ESP_LOGI(TAG, "Transport = LoRa only, PKT_MAX=%d "
-                      "(frag data=%d, hdr=%d) — FIX H/I-fix/L/M/N/3",
+                      "(frag data=%d, hdr=%d) — FIX H/I-fix/L/M/N/3/"
+                      "SYNC-NO-WAIT/FAST-STATUS/CONNECT-ANY-ORDER",
                  PKT_MAX, FRAG_DATA_MAX, FRAG_HDR_SIZE);
         return ESP_OK;
     }
@@ -621,6 +684,15 @@ esp_err_t transport_send_cmd(const char *cmd, size_t len)
     return lora_send_fragmented(T_CMD, cmd, len);
 }
 
+esp_err_t transport_send_cmd_noack(const char *cmd, size_t len)
+{
+    if (!s_use_lora) {
+        ESP_LOGW(TAG, "transport_send_cmd_noack: LoRa not ready");
+        return ESP_ERR_INVALID_STATE;
+    }
+    return lora_send_fragmented_noack(T_CMD, cmd, len);
+}
+
 esp_err_t transport_send_cfg(const char *json, size_t len)
 {
     if (!s_use_lora) {
@@ -639,6 +711,15 @@ esp_err_t transport_send_status(const char *json, size_t len)
     return lora_send_fragmented(T_STATUS, json, len);
 }
 
+esp_err_t transport_send_status_noack(const char *json, size_t len)
+{
+    if (!s_use_lora) {
+        ESP_LOGW(TAG, "transport_send_status_noack: LoRa not ready");
+        return ESP_ERR_INVALID_STATE;
+    }
+    return lora_send_fragmented_noack(T_STATUS, json, len);
+}
+
 esp_err_t transport_send_evt(const char *evt, size_t len)
 {
     if (!s_use_lora) {
@@ -652,6 +733,10 @@ void transport_set_cmd_cb(transport_rx_cb_t cb)    { s_cmd_cb = cb; }
 void transport_set_cfg_cb(transport_rx_cb_t cb)    { s_cfg_cb = cb; }
 void transport_set_status_cb(transport_rx_cb_t cb) { s_status_cb = cb; }
 void transport_set_evt_cb(transport_rx_cb_t cb)    { s_evt_cb = cb; }
+
+/* === FIX CONNECT-ANY-ORDER === */
+void transport_set_ack_cb(transport_ack_cb_t cb)   { s_ack_cb = cb; }
+/* === END FIX CONNECT-ANY-ORDER === */
 
 bool transport_is_tx_idle(void)
 {
