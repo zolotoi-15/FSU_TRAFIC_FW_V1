@@ -27,10 +27,8 @@ app_config_t g_config;
 
 /* === FIX STACK-OVERFLOW ===
    app_config_t ≈ 7.7 КБ. На стеке main_task (3584 байт default)
-   это вызывает stack overflow → порча newlib lock → assert
-   (pxQueue->uxItemSize == 0) в xQueueSemaphoreTake.
-   Выносим tmp в static + mutex (защита от параллельного вызова
-   из cfg_load_task и mqtt-task). */
+   это вызывает stack overflow → порча newlib lock → assert.
+   Выносим tmp в static + mutex. */
 static app_config_t      s_cfg_load_tmp;
 static SemaphoreHandle_t s_cfg_load_mtx = NULL;
 
@@ -122,6 +120,9 @@ static void set_defaults_to(app_config_t *cfg)
     /* === NEW: hold/insert defaults === */
     cfg->traffic.pedestrian.insert_count      = 0;
     cfg->traffic.pedestrian.insert_lead_ms    = 300;
+    /* === FIX INSERT-RED-SHORT: 0 = использовать phases_ms.red === */
+    cfg->traffic.pedestrian.insert_red_ms     = 0;
+    /* === END FIX INSERT-RED-SHORT === */
     cfg->traffic.pedestrian.return_to_hold    = true;
 
     cfg->traffic.hold.enabled        = false;
@@ -211,13 +212,15 @@ void config_load(void)
         config_save();
     } else {
         ESP_LOGI(TAG, "Config loaded (version=%.2f, SSID='%s', traffic.mode=%u, "
-                      "stages=%u, seq=%u, ped_mode=%u, hold=%d/%u)",
+                      "stages=%u, seq=%u, ped_mode=%u, hold=%d/%u, "
+                      "insert_red_ms=%lu)",
                  g_config.version,
                  g_config.wifi_ssid, g_config.traffic.mode,
                  g_config.traffic.stage_count, g_config.traffic.sequence_count,
                  g_config.traffic.pedestrian.request_mode,
                  g_config.traffic.hold.enabled,
-                 g_config.traffic.hold.stage_count);
+                 g_config.traffic.hold.stage_count,
+                 (unsigned long)g_config.traffic.pedestrian.insert_red_ms);
     }
 }
 
@@ -235,10 +238,11 @@ void config_save(void)
     if (err == ESP_OK) {
         config_cache_invalidate();
         ESP_LOGI(TAG, "Config saved to NVS (version=%.2f, %u bytes, ped_mode=%u, "
-                      "hold=%d)",
+                      "hold=%d, insert_red_ms=%lu)",
                  g_config.version, (unsigned)sizeof(g_config),
                  g_config.traffic.pedestrian.request_mode,
-                 g_config.traffic.hold.enabled);
+                 g_config.traffic.hold.enabled,
+                 (unsigned long)g_config.traffic.pedestrian.insert_red_ms);
     } else {
         ESP_LOGE(TAG, "nvs_set_blob failed: %s", esp_err_to_name(err));
     }
@@ -472,6 +476,10 @@ static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
 
     tc->pedestrian.insert_lead_ms =
         (uint32_t)json_get_int(ped, "insert_lead_ms", 300);
+    /* === FIX INSERT-RED-SHORT: 0 = использовать phases_ms.red === */
+    tc->pedestrian.insert_red_ms =
+        (uint32_t)json_get_int(ped, "insert_red_ms", 0);
+    /* === END FIX INSERT-RED-SHORT === */
     tc->pedestrian.return_to_hold =
         json_get_bool(ped, "return_to_hold", true);
 
@@ -502,13 +510,14 @@ static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
     }
 
     ESP_LOGI(TAG, "pedestrian: button=%d mode=%u insert=%lu min_recall=%lu "
-                  "insert_seq=%u lead=%lu return_hold=%d",
+                  "insert_seq=%u lead=%lu red=%lu return_hold=%d",
              tc->pedestrian.button_enabled,
              tc->pedestrian.request_mode,
              (unsigned long)tc->pedestrian.insert_timeout_ms,
              (unsigned long)tc->pedestrian.min_recall_s,
              tc->pedestrian.insert_count,
              (unsigned long)tc->pedestrian.insert_lead_ms,
+             (unsigned long)tc->pedestrian.insert_red_ms,
              tc->pedestrian.return_to_hold);
 }
 
@@ -665,7 +674,9 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
         for (int i = 0; i < tc->pedestrian.insert_count; i++) {
             bool found = false;
             for (int j = 0; j < tc->stage_count; j++) {
-                if (tc->stages[j].id == tc->pedestrian.insert_sequence[i]) { found = true; break; }
+                if (tc->stages[j].id == tc->pedestrian.insert_sequence[i]) {
+                    found = true; break;
+                }
             }
             if (!found) {
                 ESP_LOGW(TAG, "insert_sequence[%d]=%u not in stages_dd",
@@ -685,17 +696,8 @@ static void parse_control_sources(const cJSON *arr) { (void)arr; }
 static void parse_modules(const cJSON *m)          { (void)m; }
 
 /* ============================================================
-   config_load_json
-
-   === FIX STACK-OVERFLOW ===
-       app_config_t tmp ≈ 7.7 КБ. На стеке main_task (3584 байт
-       default) → stack overflow → порча newlib lock → assert
-       (pxQueue->uxItemSize == 0) в xQueueSemaphoreTake во время
-       ESP_LOGE внутри config_load_json.
-       Фикс: static app_config_t s_cfg_load_tmp + mutex.
-       Mutex нужен, т.к. config_load_json может вызываться из
-       cfg_load_task (24 КБ) и из mqtt-task (~4 КБ) параллельно.
-   === END FIX STACK-OVERFLOW ===
+   config_load_json (FULL)
+   === FIX STACK-OVERFLOW: static tmp + mutex ===
    ============================================================ */
 bool config_load_json(const char *json, size_t len)
 {
@@ -832,14 +834,16 @@ bool config_load_json(const char *json, size_t len)
     config_save();
 
     ESP_LOGI(TAG, "JSON loaded (version=%.2f, role=%s, traffic stages=%u seq=%u, "
-                  "ped_mode=%u, hold=%d/%u)",
+                  "ped_mode=%u, hold=%d/%u, insert_seq=%u, insert_red_ms=%lu)",
              g_config.version,
              g_config.role == DEVICE_ROLE_SLAVE ? "slave" : "master",
              g_config.traffic.stage_count,
              g_config.traffic.sequence_count,
              g_config.traffic.pedestrian.request_mode,
              g_config.traffic.hold.enabled,
-             g_config.traffic.hold.stage_count);
+             g_config.traffic.hold.stage_count,
+             g_config.traffic.pedestrian.insert_count,
+             (unsigned long)g_config.traffic.pedestrian.insert_red_ms);
 
     cfg_load_unlock();
     return true;
@@ -880,7 +884,7 @@ static const char *hold_on_ped_to_str(uint8_t m)
 }
 
 /* ============================================================
-   config_export_json — выгрузка g_config в JSON (кэш).
+   config_export_json (FULL) — выгрузка g_config в JSON (кэш).
    ============================================================ */
 bool config_export_json(char *buf, size_t *len)
 {
@@ -968,6 +972,10 @@ bool config_export_json(char *buf, size_t *len)
                                     g_config.traffic.pedestrian.min_recall_s);
             cJSON_AddNumberToObject(ped, "insert_lead_ms",
                                     g_config.traffic.pedestrian.insert_lead_ms);
+            /* === FIX INSERT-RED-SHORT === */
+            cJSON_AddNumberToObject(ped, "insert_red_ms",
+                                    g_config.traffic.pedestrian.insert_red_ms);
+            /* === END FIX INSERT-RED-SHORT === */
             cJSON_AddBoolToObject(ped, "return_to_hold",
                                   g_config.traffic.pedestrian.return_to_hold);
             cJSON *iseq = cJSON_AddArrayToObject(ped, "insert_sequence");
@@ -1128,6 +1136,8 @@ bool config_export_json(char *buf, size_t *len)
 
 /* ============================================================
    config_export_lora_json — короткий JSON для LoRa.
+   === FIX INSERT-RED-SHORT: в "ped" добавлен insert_red_ms
+       на позицию [6]. insert_count сдвинут на [7], sequence с [8].
    ============================================================ */
 bool config_export_lora_json(char *buf, size_t *len)
 {
@@ -1220,6 +1230,13 @@ bool config_export_lora_json(char *buf, size_t *len)
                     cJSON_CreateNumber(g_config.traffic.hold.stage_ids[i]));
         }
 
+        /* === FIX INSERT-RED-SHORT: порядок элементов в "ped":
+           [0]=button_enabled   [1]=request_mode
+           [2]=insert_timeout   [3]=min_recall_s
+           [4]=insert_lead_ms   [5]=return_to_hold
+           [6]=insert_red_ms    [7]=insert_count
+           [8..]=insert_sequence[]
+        === */
         cJSON *ped = cJSON_AddArrayToObject(t, "ped");
         if (ped) {
             cJSON_AddItemToArray(ped, cJSON_CreateBool(g_config.traffic.pedestrian.button_enabled));
@@ -1228,11 +1245,13 @@ bool config_export_lora_json(char *buf, size_t *len)
             cJSON_AddItemToArray(ped, cJSON_CreateNumber(g_config.traffic.pedestrian.min_recall_s));
             cJSON_AddItemToArray(ped, cJSON_CreateNumber(g_config.traffic.pedestrian.insert_lead_ms));
             cJSON_AddItemToArray(ped, cJSON_CreateBool(g_config.traffic.pedestrian.return_to_hold));
+            cJSON_AddItemToArray(ped, cJSON_CreateNumber(g_config.traffic.pedestrian.insert_red_ms));
             cJSON_AddItemToArray(ped, cJSON_CreateNumber(g_config.traffic.pedestrian.insert_count));
             for (int i = 0; i < g_config.traffic.pedestrian.insert_count; i++)
                 cJSON_AddItemToArray(ped,
                     cJSON_CreateNumber(g_config.traffic.pedestrian.insert_sequence[i]));
         }
+        /* === END FIX INSERT-RED-SHORT === */
 
         cJSON *st = cJSON_AddArrayToObject(t, "st");
         if (st) {
@@ -1312,7 +1331,10 @@ bool config_export_lora_json(char *buf, size_t *len)
 /* ============================================================
    config_load_lora_json
 
-   === FIX STACK-OVERFLOW: static tmp + mutex (как в config_load_json). ===
+   === FIX STACK-OVERFLOW: static tmp + mutex (как в config_load_json).
+   === FIX INSERT-RED-SHORT: поддержка как нового формата "ped"
+       (psz >= 8, insert_red_ms на [6], insert_count на [7],
+       sequence с [8]), так и legacy (psz >= 7, без insert_red_ms).
    ============================================================ */
 bool config_load_lora_json(const char *json, size_t len)
 {
@@ -1445,6 +1467,20 @@ bool config_load_lora_json(const char *json, size_t len)
             }
         }
 
+        /* ============================================================
+           PED — FIX INSERT-RED-SHORT
+
+           Новый формат (psz >= 8):
+             [0]=button_enabled   [1]=request_mode
+             [2]=insert_timeout   [3]=min_recall_s
+             [4]=insert_lead_ms   [5]=return_to_hold
+             [6]=insert_red_ms    [7]=insert_count
+             [8..]=insert_sequence[]
+
+           Legacy (psz >= 7, без insert_red_ms):
+             [0..3] как выше, [4]=insert_lead_ms, [5]=return_to_hold,
+             [6]=insert_count, [7..]=insert_sequence[]
+           ============================================================ */
         const cJSON *ped = cJSON_GetObjectItemCaseSensitive(t, "ped");
         if (cJSON_IsArray(ped) && cJSON_GetArraySize(ped) >= 4) {
             tc->pedestrian.button_enabled    = cJSON_IsTrue(cJSON_GetArrayItem(ped, 0));
@@ -1453,24 +1489,40 @@ bool config_load_lora_json(const char *json, size_t len)
             tc->pedestrian.min_recall_s      = (uint32_t)cJSON_GetArrayItem(ped, 3)->valueint;
 
             int psz = cJSON_GetArraySize(ped);
-            if (psz >= 6) {
-                tc->pedestrian.insert_lead_ms =
-                    (uint32_t)cJSON_GetArrayItem(ped, 4)->valueint;
-                tc->pedestrian.return_to_hold =
-                    cJSON_IsTrue(cJSON_GetArrayItem(ped, 5));
-            }
-            if (psz >= 7) {
-                int cnt = cJSON_GetArrayItem(ped, 6)->valueint;
+            if (psz >= 8) {
+                /* Новый формат: insert_red_ms присутствует */
+                tc->pedestrian.insert_lead_ms = (uint32_t)cJSON_GetArrayItem(ped, 4)->valueint;
+                tc->pedestrian.return_to_hold = cJSON_IsTrue(cJSON_GetArrayItem(ped, 5));
+                tc->pedestrian.insert_red_ms  = (uint32_t)cJSON_GetArrayItem(ped, 6)->valueint;
+                int cnt = cJSON_GetArrayItem(ped, 7)->valueint;
                 if (cnt > MAX_INSERT_SEQ) cnt = MAX_INSERT_SEQ;
+                if (cnt < 0) cnt = 0;
                 tc->pedestrian.insert_count = 0;
-                for (int k = 0; k < cnt && (7 + k) < psz; k++) {
-                    cJSON *it = cJSON_GetArrayItem(ped, 7 + k);
+                for (int k = 0; k < cnt && (8 + k) < psz; k++) {
+                    const cJSON *it = cJSON_GetArrayItem(ped, 8 + k);
                     if (cJSON_IsNumber(it))
                         tc->pedestrian.insert_sequence[tc->pedestrian.insert_count++] =
                             (uint8_t)it->valueint;
                 }
+            } else if (psz >= 7) {
+                /* Legacy без insert_red_ms */
+                tc->pedestrian.insert_lead_ms = (uint32_t)cJSON_GetArrayItem(ped, 4)->valueint;
+                tc->pedestrian.return_to_hold = cJSON_IsTrue(cJSON_GetArrayItem(ped, 5));
+                tc->pedestrian.insert_red_ms  = 0;  /* default */
+                int cnt = cJSON_GetArrayItem(ped, 6)->valueint;
+                if (cnt > MAX_INSERT_SEQ) cnt = MAX_INSERT_SEQ;
+                if (cnt < 0) cnt = 0;
+                tc->pedestrian.insert_count = 0;
+                for (int k = 0; k < cnt && (7 + k) < psz; k++) {
+                    const cJSON *it = cJSON_GetArrayItem(ped, 7 + k);
+                    if (cJSON_IsNumber(it))
+                        tc->pedestrian.insert_sequence[tc->pedestrian.insert_count++] =
+                            (uint8_t)it->valueint;
+                }
+                ESP_LOGW(TAG, "lora_json: legacy 'ped' format (no insert_red_ms)");
             }
         }
+        /* === END FIX INSERT-RED-SHORT === */
 
         const cJSON *st = cJSON_GetObjectItemCaseSensitive(t, "st");
         if (cJSON_IsArray(st)) {
@@ -1574,12 +1626,15 @@ bool config_load_lora_json(const char *json, size_t len)
     config_save();
 
     ESP_LOGI(TAG, "lora_json loaded (version=%.2f, stages=%u seq=%u, "
-                  "ped_mode=%u, hold=%d/%u, %u bytes)",
+                  "ped_mode=%u, hold=%d/%u, insert_seq=%u, insert_red_ms=%lu, "
+                  "%u bytes)",
              g_config.version, g_config.traffic.stage_count,
              g_config.traffic.sequence_count,
              g_config.traffic.pedestrian.request_mode,
              g_config.traffic.hold.enabled,
              g_config.traffic.hold.stage_count,
+             g_config.traffic.pedestrian.insert_count,
+             (unsigned long)g_config.traffic.pedestrian.insert_red_ms,
              (unsigned)len);
 
     cfg_load_unlock();

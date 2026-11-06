@@ -32,6 +32,13 @@ static const char *TAG = "node_proto";
 #define NODE_STATUS_STOPPED_MS 2000
 #define STATUS_FORCE_MS       5000
 
+/* === FIX CFG-ACK-HEARTBEAT: NODE шлёт cfg:ok периодически,
+   чтобы ROOT не считал s_cfg_ack протухшим. Раньше ROOT сбрасывал
+   s_cfg_ack через CFG_ACK_STALE_MS (60 сек), и запускалась
+   циклическая перезагрузка CFG. Период 15 сек < 60 сек. === */
+#define CFG_OK_HEARTBEAT_MS   15000
+/* === END FIX CFG-ACK-HEARTBEAT === */
+
 #define CFG_REQ_PERIOD_MS     5000
 static volatile uint32_t s_last_cfg_req_ms = 0;
 
@@ -76,24 +83,17 @@ static uint32_t s_last_node_pub_ms = 0;
 
 static uint32_t s_last_cfg_crc = 0;
 static size_t   s_last_cfg_len = 0;
-/* === FIX CFG-FROM-ROOT: s_cfg_received ставится ТОЛЬКО из
-   on_cfg_from_root (реальный CFG от ROOT), а не из NVS. === */
 static volatile bool s_cfg_received = false;
-/* === FIX CFG-FROM-ROOT: отдельный флаг — CFG принят и подтверждён
-   ROOT (используется для traffic:start). === */
 static volatile bool s_cfg_confirmed_by_root = false;
 static volatile uint32_t s_cfg_from_root_started_ms = 0;
-/* === END FIX CFG-FROM-ROOT === */
 
 static volatile bool s_send_cfg_ok = false;
 
 extern volatile bool s_cfg_ack;
 
-/* === NEW: HOLD/INSERT: NODE не должен держать stale insert === */
 extern volatile bool     s_insert_pending;
 extern volatile uint8_t  s_insert_count;
 extern volatile uint8_t  s_insert_idx;
-/* === END NEW: HOLD/INSERT === */
 
 #define SET_REMOTE_FLAG(v) do { s_fault_from_remote_ex = (v); } while (0)
 
@@ -136,11 +136,8 @@ static void on_cfg_from_root(const char *json, size_t len)
         traffic_light_set_follow_root(true);
         s_send_cfg_ok = true;
         s_node_cfg_confirmed = true;
-        /* === FIX CFG-FROM-ROOT: даже identical CFG считается
-           подтверждённым от ROOT. === */
         s_cfg_confirmed_by_root = true;
         s_cfg_from_root_started_ms = 0;
-        /* === END FIX CFG-FROM-ROOT === */
         transport_clear_cfg_expected();
 
         if (traffic_light_get_fault() != TRAFFIC_FAULT_NONE) {
@@ -241,12 +238,9 @@ static void on_cfg_from_root(const char *json, size_t len)
 
     s_last_cfg_crc = crc;
     s_last_cfg_len = len;
-    /* === FIX CFG-FROM-ROOT: s_cfg_received и s_cfg_confirmed_by_root
-       ставятся ТОЛЬКО здесь — после реального CFG от ROOT. === */
     s_cfg_received = true;
     s_cfg_confirmed_by_root = true;
     s_cfg_from_root_started_ms = 0;
-    /* === END FIX CFG-FROM-ROOT === */
     s_send_cfg_ok = true;
     s_node_cfg_confirmed = true;
     transport_clear_cfg_expected();
@@ -271,11 +265,8 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         if (s_cfg_received) {
             ESP_LOGW(TAG, "cfg:reset → reset s_cfg_received (wait new CFG)");
             s_cfg_received = false;
-            /* === FIX CFG-FROM-ROOT: сбрасываем и подтверждение,
-               пока не придёт новый CFG. === */
             s_cfg_confirmed_by_root = false;
             s_cfg_from_root_started_ms = (uint32_t)(esp_timer_get_time() / 1000);
-            /* === END FIX CFG-FROM-ROOT === */
         }
         ESP_LOGI(TAG, "cfg:reset — accum_cfg cleared");
         return;
@@ -444,9 +435,7 @@ static void on_cmd_from_root(const char *cmd, size_t len)
             next_ph = (ph + 1) % g_config.traffic.sequence_count;
         }
 
-        /* === FIX SYNC-DUR: dur для ph, а не next_ph === */
         uint32_t dur = traffic_light_stage_duration_ms(ph);
-        /* === END FIX SYNC-DUR === */
 
         uint32_t pm_apply = (uint32_t)pm_target;
         if (dur > 0 && pm_apply >= dur) {
@@ -479,19 +468,14 @@ static void on_cmd_from_root(const char *cmd, size_t len)
     int relay = -1, state = -1, mode = 0;
     if (strcmp(buf, "traffic:start") == 0) {
         node_note_root_data();
-        /* === FIX CFG-FROM-ROOT: не принимаем traffic:start, пока
-           ROOT не прислал реальный CFG (s_cfg_confirmed_by_root). === */
         if (!s_cfg_received || !s_cfg_confirmed_by_root) {
             ESP_LOGW(TAG, "traffic:start ignored — no CFG from ROOT yet → ALL_OFF");
             SET_REMOTE_FLAG(true);
             traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
             SET_REMOTE_FLAG(false);
-            /* Сообщаем ROOT, что мы в ALL_OFF, чтобы он сбросил s_cfg_ack
-               и запушил CFG. */
             node_send_status_for_ms(2000);
             return;
         }
-        /* === END FIX CFG-FROM-ROOT === */
         if (traffic_light_get_state() == TRAFFIC_STATE_RUNNING) {
             ESP_LOGI(TAG, "traffic:start ignored — already RUNNING");
             s_node_cfg_confirmed = true;
@@ -617,6 +601,28 @@ static void on_node_status_from_transport(const char *json, size_t len)
     }
 
     if (g_config.role == DEVICE_ROLE_MASTER) {
+        /* === FIX PHASE-MISMATCH: если NODE на другой фазе, чем ROOT —
+           форсируем resync. Критично после insert и return_to_hold:
+           ROOT вернулся в hold-фазу, а NODE остался на последней
+           insert-фазе. phase_sync_task в hold сам resync шлёт редко,
+           поэтому без этого NODE застревает навсегда. === */
+        if (!s_cfg_pushing &&
+            traffic_light_get_state() == TRAFFIC_STATE_RUNNING) {
+            int node_phase = -1;
+            const char *pp = strstr(json, "\"phase\":");
+            if (pp) {
+                node_phase = atoi(pp + 8);
+            }
+            if (node_phase >= 0 &&
+                node_phase != (int)traffic_light_get_phase()) {
+                ESP_LOGW(TAG, "NODE phase=%d != ROOT phase=%u → force resync",
+                         node_phase, traffic_light_get_phase());
+                extern volatile bool s_force_resync_pending;
+                s_force_resync_pending = true;
+            }
+        }
+        /* === END FIX PHASE-MISMATCH === */
+
         static bool s_node_was_running = false;
         bool node_running = (strstr(json, "\"state\":\"RUNNING\"") != NULL);
         bool node_all_off = (strstr(json, "\"ALL_OFF\"") != NULL);
@@ -629,12 +635,8 @@ static void on_node_status_from_transport(const char *json, size_t len)
                 ESP_LOGW(TAG, "NODE ALL_OFF → reset cfg tracking, re-request CFG");
                 s_cfg_ack = false;
                 s_cfg_applied_and_started = false;
-                /* === FIX CFG-FROM-ROOT: NODE в ALL_OFF — значит CFG
-                   у него не подтверждён. ROOT должен немедленно
-                   запушить CFG. === */
                 extern volatile bool s_cfg_req_pending;
                 s_cfg_req_pending = true;
-                /* === END FIX CFG-FROM-ROOT === */
             }
         }
 
@@ -660,11 +662,8 @@ static void on_evt_from_node(const char *evt, size_t len)
 {
     if (len >= 6 && strncmp(evt, "cfg:ok", 6) == 0) {
         s_cfg_ack = true;
-        /* === FIX CFG-FROM-ROOT: запоминаем время успешного cfg:ok,
-           чтобы root_wd мог отличить свежий ACK от stale. === */
         extern volatile uint32_t s_cfg_last_ok_ms;
         s_cfg_last_ok_ms = (uint32_t)(esp_timer_get_time() / 1000);
-        /* === END FIX CFG-FROM-ROOT === */
         ESP_LOGI(TAG, "NODE confirmed cfg OK (len=%u)", (unsigned)len);
         return;
     }
@@ -723,7 +722,8 @@ static void on_evt_from_node(const char *evt, size_t len)
 
 static void cfg_ok_tx_task(void *arg)
 {
-    ESP_LOGI(TAG, "cfg_ok_tx_task started");
+    ESP_LOGI(TAG, "cfg_ok_tx_task started (CFG-ACK-HEARTBEAT %d ms)",
+             CFG_OK_HEARTBEAT_MS);
     uint32_t last_cfg_ok_ms = 0;
     uint32_t last_cfg_req_ms = 0;
     bool     cfg_ok_sent_once = false;
@@ -744,15 +744,21 @@ static void cfg_ok_tx_task(void *arg)
             }
         }
 
+        /* === FIX CFG-ACK-HEARTBEAT: периодический cfg:ok как heartbeat.
+           ROOT сбрасывает s_cfg_ack по CFG_ACK_STALE_MS (60 сек), если
+           не получает cfg:ok. Раньше cfg:ok слался только один раз
+           после CFG, и ROOT запускал циклическую перезагрузку CFG.
+           Теперь NODE шлёт cfg:ok каждые 15 сек — ROOT всегда знает,
+           что CFG актуален. === */
         if (cfg_ok_sent_once && s_cfg_received &&
-            s_last_sync_ms == 0 &&
-            (now - last_cfg_ok_ms) >= CFG_OK_PERIODIC_MS) {
+            (now - last_cfg_ok_ms) >= CFG_OK_HEARTBEAT_MS) {
             esp_err_t err = transport_send_evt("cfg:ok", strlen("cfg:ok"));
             if (err == ESP_OK) {
-                ESP_LOGI(TAG, "cfg:ok sent (periodic, no sync yet)");
+                ESP_LOGI(TAG, "cfg:ok sent (periodic heartbeat)");
                 last_cfg_ok_ms = now;
             }
         }
+        /* === END FIX CFG-ACK-HEARTBEAT === */
 
         if (!s_node_cfg_confirmed && s_cfg_received &&
             transport_is_lora() && !transport_is_cfg_rx_in_progress() &&
@@ -776,13 +782,9 @@ static void node_send_task(void *arg)
 
     vTaskDelay(pdMS_TO_TICKS(3000));
 
-    /* === FIX CFG-FROM-ROOT: при старте, пока CFG от ROOT не подтверждён,
-       принудительно шлём STATUS STOPPED + ALL_OFF. Это заставит ROOT
-       сбросить stale s_cfg_ack и запушить CFG. === */
     if (!s_cfg_confirmed_by_root) {
         node_send_status_for_ms(3000);
     }
-    /* === END FIX CFG-FROM-ROOT === */
 
     while (1) {
         if (transport_is_cfg_rx_in_progress()) {
@@ -810,13 +812,10 @@ static void node_send_task(void *arg)
         const char *state_str = traffic_light_state_str();
         const char *fault_str = traffic_light_fault_str();
 
-        /* === FIX CFG-FROM-ROOT: пока CFG от ROOT не подтверждён,
-           NODE не может быть RUNNING. Принудительно STOPPED + ALL_OFF. === */
         if (!s_cfg_confirmed_by_root) {
             state_str = "STOPPED";
             fault_str = "ALL_OFF";
         }
-        /* === END FIX CFG-FROM-ROOT === */
 
         int off = snprintf(json, 512,
             "{\"role\":\"node\",\"SR\":{\"state\":%u},"
@@ -881,9 +880,6 @@ static void node_link_watchdog_task(void *arg)
                            g_config.traffic.stage_count > 0);
 
     if (nvs_cfg_exists) {
-        /* === FIX CFG-FROM-ROOT: NVS CFG — только для предварительной
-           настройки пинов/stages. s_cfg_received = false — ждём реальный
-           CFG от ROOT. Не запускаем трафик. === */
         ESP_LOGW(TAG, "node_wd: NVS CFG found (seq=%u) → "
                       "stay STOPPED, wait CFG from ROOT",
                  g_config.traffic.sequence_count);
@@ -906,8 +902,6 @@ static void node_link_watchdog_task(void *arg)
             }
         }
 
-        /* Пины/stages берём из NVS для подготовки (пины выставятся
-           на старте), но s_cfg_received = false — ждём ROOT. */
         traffic_light_reset();
         traffic_light_set_follow_root(true);
         s_cfg_received = false;
@@ -915,13 +909,11 @@ static void node_link_watchdog_task(void *arg)
         s_cfg_from_root_started_ms = (uint32_t)(esp_timer_get_time() / 1000);
         s_node_cfg_confirmed = false;
 
-        /* Принудительно ALL_OFF — пока ROOT не подтвердит CFG. */
         SET_REMOTE_FLAG(true);
         traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
         SET_REMOTE_FLAG(false);
 
         ESP_LOGW(TAG, "node_wd: NVS CFG → request CFG from ROOT (cfg:req)");
-        /* === END FIX CFG-FROM-ROOT === */
     } else {
         ESP_LOGW(TAG, "node_wd: no CFG in NVS → ALL_OFF + request CFG from ROOT");
         s_cfg_received = false;
@@ -952,15 +944,11 @@ static void node_link_watchdog_task(void *arg)
         bool connected = transport_is_lora();
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
 
-        /* === FIX CFG-FROM-ROOT: если CFG от ROOT так и не пришёл
-           за CFG_FROM_ROOT_TIMEOUT_MS — ребут (иначе будет вечный
-           STOPPED + ALL_OFF без трафика). === */
         if (nvs_cfg_exists && !s_cfg_confirmed_by_root &&
             s_cfg_from_root_started_ms != 0 &&
             (now - s_cfg_from_root_started_ms) >= CFG_FROM_ROOT_TIMEOUT_MS) {
             node_fail_safe_reboot("CFG from ROOT not received in 30 s");
         }
-        /* === END FIX CFG-FROM-ROOT === */
 
         if (connected) {
             if (s_traffic_started_ms != 0 &&

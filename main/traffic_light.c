@@ -59,14 +59,12 @@ volatile bool            s_fault_blink_state = false;
 volatile bool            s_mask_received = false;
 volatile bool            s_in_force_phase = false;
 
-/* === NEW: HOLD/INSERT: state === */
 volatile bool            s_hold_active       = false;
 volatile bool            s_insert_pending    = false;
 volatile uint8_t         s_insert_queue[MAX_INSERT_SEQ] = {0};
 volatile uint8_t         s_insert_count      = 0;
 volatile uint8_t         s_insert_idx        = 0;
 volatile uint32_t        s_insert_request_ms = 0;
-/* === END NEW: HOLD/INSERT === */
 
 traffic_fault_notify_cb_t s_fault_notify = NULL;
 traffic_phase_change_cb_t s_phase_change_cb = NULL;
@@ -94,14 +92,19 @@ void traffic_light_set_follow_root(bool en)
 /* ============================================================
    traffic_light_request_pedestrian
 
-   === FIX PED-INSERT-DEDUP ===
-   При s_hold_active + HOLD_PED_INSERT: если s_insert_pending уже
-   true — игнорируем второй P7.
+   === FIX INSERT-MODE-ANY: request_mode=insert теперь работает
+       ВСЕГДА (не только в hold). Раньше INSERT без hold просто
+       ставил s_ped_request, сокращал зелёную фазу до min_green
+       и НЕ проигрывал insert_sequence. Теперь при INSERT без hold
+       тоже ставится s_insert_pending, и traffic_task_loop
+       проигрывает очередь insert-фаз.
 
-   === FIX NODE-FOLLOW-ROOT ===
-   На NODE с follow_root=true не играем insert локально — ROOT
-   сам проиграет insert и разошлёт sync: для каждой фазы. NODE
-   иначе получит двойной insert (свой + от ROOT через sync:).
+   === FIX PED-INSERT-DEDUP: при s_insert_pending уже true
+       игнорируем второй P7.
+
+   === FIX NODE-FOLLOW-ROOT: на NODE с follow_root=true не играем
+       insert локально — ROOT сам проиграет insert и разошлёт
+       sync: для каждой фазы.
    ============================================================ */
 void traffic_light_request_pedestrian(void)
 {
@@ -118,7 +121,9 @@ void traffic_light_request_pedestrian(void)
     }
     /* === END FIX NODE-FOLLOW-ROOT === */
 
-    if (s_hold_active && g_config.traffic.hold.enabled) {
+    /* Hold-логика (применяется только если реально в hold). */
+    bool in_hold = s_hold_active && g_config.traffic.hold.enabled;
+    if (in_hold) {
         if (g_config.traffic.hold.on_ped_request == HOLD_PED_IGNORE) {
             ESP_LOGW(TAG, "pedestrian request ignored: hold + on_ped_request=ignore");
             return;
@@ -128,7 +133,20 @@ void traffic_light_request_pedestrian(void)
             ESP_LOGW(TAG, "pedestrian request: hold + min_recall");
             return;
         }
-        /* HOLD_PED_INSERT */
+        /* HOLD_PED_INSERT: падаем в INSERT-логику ниже. */
+    }
+
+    uint8_t mode = g_config.traffic.pedestrian.request_mode;
+
+    if (mode == PED_REQUEST_MODE_MIN_RECALL) {
+        s_ped_min_recall = true;
+        ESP_LOGW(TAG, "pedestrian request: MIN_RECALL (next cycle min %lu s)",
+                 (unsigned long)g_config.traffic.pedestrian.min_recall_s);
+        return;
+    }
+
+    /* === FIX INSERT-MODE-ANY: INSERT работает и без hold. === */
+    if (mode == PED_REQUEST_MODE_INSERT) {
         if (s_insert_pending) {
             ESP_LOGW(TAG, "pedestrian insert: already pending → ignore");
             return;
@@ -144,30 +162,18 @@ void traffic_light_request_pedestrian(void)
             s_insert_queue[i] = g_config.traffic.pedestrian.insert_sequence[i];
         s_insert_count = g_config.traffic.pedestrian.insert_count;
         s_insert_idx   = 0;
-        ESP_LOGW(TAG, "pedestrian request: INSERT pending (seq=%u, lead=%lu ms)",
+        ESP_LOGW(TAG, "pedestrian request: INSERT pending (seq=%u, lead=%lu ms, hold=%d)",
                  s_insert_count,
-                 (unsigned long)g_config.traffic.pedestrian.insert_lead_ms);
+                 (unsigned long)g_config.traffic.pedestrian.insert_lead_ms,
+                 (int)in_hold);
         return;
     }
+    /* === END FIX INSERT-MODE-ANY === */
 
-    uint8_t mode = g_config.traffic.pedestrian.request_mode;
-
-    if (mode == PED_REQUEST_MODE_MIN_RECALL) {
-        s_ped_min_recall = true;
-        ESP_LOGW(TAG, "pedestrian request: MIN_RECALL (next cycle min %lu s)",
-                 (unsigned long)g_config.traffic.pedestrian.min_recall_s);
-        return;
-    }
-
+    /* STAGE mode */
     s_ped_request = true;
     s_ped_request_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-
-    if (mode == PED_REQUEST_MODE_INSERT) {
-        ESP_LOGW(TAG, "pedestrian request: INSERT (timeout %lu ms)",
-                 (unsigned long)g_config.traffic.pedestrian.insert_timeout_ms);
-    } else {
-        ESP_LOGW(TAG, "pedestrian request: STAGE");
-    }
+    ESP_LOGW(TAG, "pedestrian request: STAGE");
 }
 
 bool traffic_light_ped_button_enabled(void) { return g_config.traffic.pedestrian.button_enabled; }
@@ -338,7 +344,7 @@ void traffic_task_loop(void *arg)
             continue;
         }
 
-        /* === HOLD: определяем, в hold ли текущая фаза === */
+        /* HOLD: определяем, в hold ли текущая фаза */
         {
             bool cur_hold = false;
             if (g_config.traffic.hold.enabled) {
@@ -387,12 +393,15 @@ void traffic_task_loop(void *arg)
         /* ============================================================
            INSERT: проигрывание insert_sequence
 
+           === FIX INSERT-MODE-ANY ===
+           Этот блок теперь работает и при insert без hold,
+           потому что traffic_light_request_pedestrian ставит
+           s_insert_pending в обоих случаях.
+
            === FIX INSERT-DURATION ===
            Каждая фаза insert проигрывается с её duration_ms
-           (из phases_ms), а не пролетает всю очередь за 80 ms.
-           insert_lead_ms применяется ТОЛЬКО к первой фазе
-           (s_insert_idx == 0).
-           === END FIX INSERT-DURATION ===
+           (из phases_ms). insert_lead_ms применяется ТОЛЬКО
+           к первой фазе (s_insert_idx == 0).
            ============================================================ */
         if (s_insert_pending) {
             uint32_t since_req = now - s_insert_request_ms;
@@ -403,15 +412,12 @@ void traffic_task_loop(void *arg)
                 continue;
             }
 
-            /* Ждём окончания dur ТЕКУЩЕЙ insert-фазы (со 2-й итерации).
-               s_insert_idx > 0 && s_insert_idx <= s_insert_count —
-               значит, уже применена хотя бы одна insert-фаза, и
-               s_phase указывает на неё. */
+            /* Ждём окончания dur ТЕКУЩЕЙ insert-фазы. */
             if (s_insert_idx > 0 && s_insert_idx <= s_insert_count) {
                 uint32_t dur_current = insert_duration_ms(s_phase);
                 uint32_t elapsed     = now - s_phase_start_ms;
                 if (elapsed < dur_current) {
-                    continue;  /* ещё рано переключать */
+                    continue;
                 }
             }
 
@@ -439,24 +445,18 @@ void traffic_task_loop(void *arg)
                     xSemaphoreGive(s_mutex);
                 }
 
-                /* === FIX INSERT-NO-DOUBLE-SYNC ===
-                   apply_stage_dd под s_in_force_phase — не дёргает
-                   s_phase_change_cb. Потом гасим pending (на случай
-                   гонки с phase_sync_task). sync: шлём сами с force. */
                 s_in_force_phase = true;
                 apply_stage_dd(seq_idx);
                 s_in_force_phase = false;
                 phase_change_cancel_pending();
 
                 send_sync_to_node_async_ex(seq_idx, 0, dur_ins, true, NULL);
-                /* === END FIX INSERT-NO-DOUBLE-SYNC === */
                 continue;
             }
 
             /* конец очереди — return_to_hold */
             if (g_config.traffic.pedestrian.return_to_hold &&
                 g_config.traffic.hold.stage_count > 0) {
-                /* Ждём окончания dur ПОСЛЕДНЕЙ insert-фазы */
                 uint32_t dur_last = insert_duration_ms(s_phase);
                 uint32_t elapsed  = now - s_phase_start_ms;
                 if (elapsed < dur_last) {
@@ -485,6 +485,11 @@ void traffic_task_loop(void *arg)
                     s_in_force_phase = false;
                     phase_change_cancel_pending();
                     send_sync_to_node_async_ex(seq_idx, 0, dur_hold, true, NULL);
+                    /* === FIX HOLD-RESYNC: force resync, чтобы NODE
+                       гарантированно получил sync после insert
+                       (no-ack может потеряться). === */
+                    s_force_resync_pending = true;
+                    /* === END FIX HOLD-RESYNC === */
                 }
             }
             s_insert_pending = false;
@@ -639,6 +644,8 @@ esp_err_t traffic_light_init(void)
              g_config.traffic.pedestrian.insert_count);
     return ESP_OK;
 }
+
+
 
 void traffic_light_set_pins_single(const traffic_pins_single_t *pins)
 {

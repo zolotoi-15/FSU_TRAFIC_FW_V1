@@ -35,9 +35,18 @@ static const char *TAG = "root_wd";
 #define CFG_RESET_ACK_DELAY_MS      500
 #define HEARTBEAT_INTERVAL_MS       10000
 
-/* === FIX CFG-FROM-ROOT: stale s_cfg_ack защита === */
+/* === FIX CFG-ACK-STALE: stale защита теперь учитывает
+   s_last_node_msg_ms. Если NODE шлёт STATUS (heartbeat),
+   s_cfg_ack считается актуальным, даже если cfg:ok был давно.
+   Сбрасываем s_cfg_ack только если NODE молчит > CFG_ACK_STALE_MS. === */
 #define CFG_ACK_STALE_MS            60000
-/* === END FIX CFG-FROM-ROOT === */
+/* === END FIX CFG-ACK-STALE === */
+
+/* === FIX HOLD-RESYNC: в hold тоже шлём resync раз в 10 сек,
+   чтобы NODE гарантированно получил текущую фазу после insert.
+   Раньше last_ms=now → resync пропускался навсегда. === */
+#define HOLD_RESYNC_INTERVAL_MS     10000
+/* === END FIX HOLD-RESYNC === */
 
 #define CFG_LORA_BUF_SIZE           2048
 
@@ -76,9 +85,9 @@ volatile bool s_cfg_applied_and_started = false;
 volatile bool s_cfg_req_pending = false;
 volatile bool s_force_resync_pending = false;
 
-/* === FIX CFG-FROM-ROOT: время успешного cfg:ok — для stale-защиты === */
+/* === FIX CFG-ACK-STALE: время успешного cfg:ok — для stale-защиты === */
 volatile uint32_t s_cfg_last_ok_ms = 0;
-/* === END FIX CFG-FROM-ROOT === */
+/* === END FIX CFG-ACK-STALE === */
 
 #define SET_REMOTE_FLAG(v) do { s_fault_from_remote_ex = (v); } while (0)
 
@@ -88,16 +97,41 @@ extern void    phase_change_requeue(uint8_t phase, uint32_t dur_ms);
 static volatile uint8_t  s_last_sent_sync_phase = 0xFF;
 static volatile uint32_t s_last_sent_sync_ms    = 0;
 
-/* === FIX CFG-FROM-ROOT: helper для проверки свежести s_cfg_ack === */
+/* ============================================================
+   FIX CFG-ACK-STALE: stale-проверка учитывает s_last_node_msg_ms.
+
+   Если NODE шлёт STATUS (heartbeat) недавно — s_cfg_ack актуален,
+   даже если cfg:ok был давно. NODE шлёт cfg:ok только после CFG,
+   а потом STATUS каждые 10 сек. Раньше ROOT через 60 сек считал
+   s_cfg_ack протухшим и запускал циклическую перезагрузку CFG.
+
+   Теперь: сбрасываем s_cfg_ack ТОЛЬКО если NODE молчит дольше
+   CFG_ACK_STALE_MS (нет STATUS).
+   ============================================================ */
 static inline bool cfg_ack_is_stale(void)
 {
     if (!s_cfg_ack) return false;
+
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    uint32_t node_now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    /* NODE жив и шлёт STATUS — CFG актуален. */
+    if (s_last_node_msg_ms != 0) {
+        uint32_t since_status = node_now - s_last_node_msg_ms;
+        if (since_status < CFG_ACK_STALE_MS) {
+            return false;
+        }
+        ESP_LOGW(TAG, "cfg_ack_is_stale: NODE silent %lu ms",
+                 (unsigned long)since_status);
+        return true;
+    }
+
+    /* NODE ни разу не слал STATUS. Fallback на время cfg:ok. */
     if (s_cfg_last_ok_ms == 0) return true;
     if (now < s_cfg_last_ok_ms) return true;
     return (now - s_cfg_last_ok_ms) > CFG_ACK_STALE_MS;
 }
-/* === END FIX CFG-FROM-ROOT === */
+/* === END FIX CFG-ACK-STALE === */
 
 uint32_t send_sync_to_node_async_ex(uint8_t phase, uint32_t phase_ms,
                                     uint32_t duration_ms, bool force,
@@ -317,10 +351,10 @@ void root_apply_new_config_from_mqtt(const char *json, int len)
     s_cfg_applied_and_started = false;
     s_cfg_pushing = false;
 
-    /* === FIX CFG-FROM-ROOT: сбрасываем s_cfg_last_ok_ms — ROOT
+    /* === FIX CFG-ACK-STALE: сбрасываем s_cfg_last_ok_ms — ROOT
        ждёт новый cfg:ok от NODE. === */
     s_cfg_last_ok_ms = 0;
-    /* === END FIX CFG-FROM-ROOT === */
+    /* === END FIX CFG-ACK-STALE === */
 
     s_cfg_req_pending = true;
 
@@ -345,7 +379,7 @@ static void root_node_watchdog_task(void *arg)
     ESP_LOGI(TAG, "root_node_watchdog_task started (SYNC-MASK, lead=%d ms, "
                   "NO-DOUBLE-SYNC, NO-WAIT, WAIT-NODE-RUNNING, FAST-REACT, "
                   "FAIL-SAFE-ROOT, CFG-REQ-FALLBACK, CONNECT-ANY-ORDER, "
-                  "HOLD/INSERT, CFG-FROM-ROOT)",
+                  "HOLD/INSERT, CFG-FROM-ROOT, CFG-ACK-STALE, HOLD-RESYNC)",
              SYNC_LEAD_MS);
 
     bool     was_connected = false;
@@ -375,17 +409,15 @@ static void root_node_watchdog_task(void *arg)
 
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
 
-        /* === FIX CFG-FROM-ROOT: если s_cfg_ack «протух» (NODE
+        /* === FIX CFG-ACK-STALE: если s_cfg_ack «протух» (NODE
            молчит > CFG_ACK_STALE_MS), сбрасываем и запрашиваем CFG. === */
         if (cfg_ack_is_stale()) {
-            ESP_LOGW(TAG, "ROOT: s_cfg_ack stale (last_ok=%lu ms ago) → "
-                          "reset, request CFG",
-                     (unsigned long)(now - s_cfg_last_ok_ms));
+            ESP_LOGW(TAG, "ROOT: s_cfg_ack stale → reset, request CFG");
             s_cfg_ack = false;
             s_cfg_applied_and_started = false;
             s_cfg_req_pending = true;
         }
-        /* === END FIX CFG-FROM-ROOT === */
+        /* === END FIX CFG-ACK-STALE === */
 
         bool has_node = false;
         if (transport_is_lora() && s_last_node_msg_ms != 0 && !s_cfg_pushing) {
@@ -580,7 +612,8 @@ static void root_node_watchdog_task(void *arg)
 static void phase_sync_task(void *arg)
 {
     ESP_LOGI(TAG, "phase_sync_task started (SYNC-MASK, lead=%d ms, "
-                  "NO-DOUBLE-SYNC, NO-WAIT, FAIL-SAFE-ROOT, HOLD/INSERT)",
+                  "NO-DOUBLE-SYNC, NO-WAIT, FAIL-SAFE-ROOT, HOLD/INSERT, "
+                  "CFG-ACK-STALE, HOLD-RESYNC)",
              SYNC_LEAD_MS);
 
     uint32_t last_ms = 0;
@@ -591,6 +624,9 @@ static void phase_sync_task(void *arg)
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
 
         if (g_config.role == DEVICE_ROLE_MASTER) {
+            /* === FIX CFG-ACK-STALE: cfg_ack_is_stale() теперь учитывает
+               s_last_node_msg_ms — resync работает, пока NODE шлёт STATUS,
+               даже если cfg:ok был давно. === */
             if (s_cfg_pushing || !s_cfg_ack || cfg_ack_is_stale() ||
                 !s_cfg_applied_and_started) {
                 vTaskDelay(pdMS_TO_TICKS(100));
@@ -694,7 +730,20 @@ static void phase_sync_task(void *arg)
 
             if (has_node && st == TRAFFIC_STATE_RUNNING && !in_all_off) {
                 if (s_hold_active && !s_insert_pending) {
-                    last_ms = now;
+                    /* === FIX HOLD-RESYNC: в hold тоже шлём resync раз
+                       в 10 сек, чтобы NODE гарантированно получил
+                       текущую фазу после insert и return_to_hold.
+                       Раньше last_ms=now → resync пропускался навсегда,
+                       и NODE застревал на последней insert-фазе. === */
+                    if (last_ms == 0 ||
+                        (now - last_ms >= HOLD_RESYNC_INTERVAL_MS)) {
+                        uint8_t  phase = traffic_light_get_phase();
+                        uint32_t dur   = traffic_light_get_phase_duration_ms();
+                        uint32_t pm    = traffic_light_get_phase_ms();
+                        send_sync_to_node(phase, pm, dur);
+                        last_ms = now;
+                    }
+                    /* === END FIX HOLD-RESYNC === */
                 } else if (s_insert_pending) {
                     last_ms = now;
                 } else if (last_ms != 0 && (now - last_ms >= LORA_SYNC_INTERVAL_MS)) {
@@ -716,7 +765,8 @@ static void phase_sync_task(void *arg)
 static void cfg_push_task(void *arg)
 {
     ESP_LOGI(TAG, "cfg_push_task started (short JSON for LoRa, "
-                  "CFG-REQ-FALLBACK, CONNECT-ANY-ORDER, CFG-FROM-ROOT)");
+                  "CFG-REQ-FALLBACK, CONNECT-ANY-ORDER, CFG-FROM-ROOT, "
+                  "CFG-ACK-STALE)");
 
     uint32_t waited = 0;
     while (!transport_is_lora() && waited < 10000) {
@@ -728,10 +778,7 @@ static void cfg_push_task(void *arg)
     }
 
     ESP_LOGI(TAG, "cfg_push: wait for cfg:req from NODE or first push");
-    /* === FIX CFG-FROM-ROOT: 500 ms вместо 5000 — реагируем на cfg:req
-       почти сразу, NODE не успевает ребутнуться по таймауту. === */
     vTaskDelay(pdMS_TO_TICKS(CFG_INITIAL_DELAY_MS));
-    /* === END FIX CFG-FROM-ROOT === */
 
     uint32_t last_push_ms = 0;
 
@@ -748,15 +795,15 @@ static void cfg_push_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
-        /* === FIX CFG-FROM-ROOT: если s_cfg_ack «протух», сбрасываем
-           его — NODE перезагрузился, нужно запушить CFG снова. === */
+        /* === FIX CFG-ACK-STALE: если s_cfg_ack «протух» (NODE молчит),
+           сбрасываем — NODE перезагрузился, нужно запушить CFG снова. === */
         if (s_cfg_ack && cfg_ack_is_stale()) {
             ESP_LOGW(TAG, "cfg_push: s_cfg_ack stale → reset, push CFG");
             s_cfg_ack = false;
             s_cfg_applied_and_started = false;
             s_cfg_req_pending = true;
         }
-        /* === END FIX CFG-FROM-ROOT === */
+        /* === END FIX CFG-ACK-STALE === */
         if (s_cfg_ack) {
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
@@ -867,7 +914,7 @@ void root_wd_start_tasks(void)
     ESP_LOGI(TAG, "Starting ROOT watchdog tasks (SYNC-MASK, lead=%d ms, "
                   "NO-DOUBLE-SYNC, NO-WAIT, WAIT-NODE-RUNNING, FAST-REACT, "
                   "FAIL-SAFE-ROOT, CFG-REQ-FALLBACK, CONNECT-ANY-ORDER, "
-                  "HOLD/INSERT, CFG-FROM-ROOT)...",
+                  "HOLD/INSERT, CFG-FROM-ROOT, CFG-ACK-STALE, HOLD-RESYNC)...",
              SYNC_LEAD_MS);
 
     transport_set_ack_cb(on_lora_ack);
