@@ -1,17 +1,10 @@
 /* ============================================================
    root_wd.c — ROOT: CFG на NODE → cfg:ok → START ROOT+NODE.
 
-   === FIX CFG-REQ-FALLBACK: cfg_push по таймауту ===
-   === FIX CONNECT-ANY-ORDER ===
-       ROOT и NODE должны соединиться независимо от порядка
-       загрузки.
-
-       - cfg_push: первый push сразу после CFG_INITIAL_DELAY_MS,
-         повтор каждые CFG_RETRY_PERIOD_MS (5 с), если s_cfg_ack == false.
-       - on_lora_ack(): при ACK от NODE (например, ACK на ping) —
-         если s_cfg_ack == false && !s_cfg_pushing → s_cfg_req_pending
-         (NODE на связи, пора слать CFG).
-   === END FIX CONNECT-ANY-ORDER ===
+   === FIX P0-2: send_sync клампит pm_target < duration_ms.
+   === FIX P1-14: phase_sync_task не спамит одинаковыми sync.
+   === FIX P2-9: time_sync с реальным RTT (blink_get_rtt_us).
+   === FIX P1-5: FAIL_NODE_LOST_MS не срабатывает при cfg_pushing.
    ============================================================ */
 
 #include "root_wd.h"
@@ -38,7 +31,7 @@ static const char *TAG = "root_wd";
 #define NODE_COMM_LOST_MS           20000
 #define LORA_SYNC_INTERVAL_MS       30000
 #define CFG_PUSH_RX_WAIT_MS         3000
-#define CFG_RETRY_PERIOD_MS         5000     /* было 10000 — FIX CONNECT-ANY-ORDER */
+#define CFG_RETRY_PERIOD_MS         5000
 #define NO_CFG_ALL_OFF_MS           (60 * 1000)
 
 #define CFG_INITIAL_DELAY_MS        5000
@@ -63,11 +56,17 @@ static const char *TAG = "root_wd";
 #define FAIL_NODE_LOST_MS           5000
 #define FAIL_ROOT_REBOOT_DELAY_MS   500
 
+/* === FIX P1-14: минимальный интервал между одинаковыми sync. === */
+#define SYNC_MIN_INTERVAL_MS        250
+/* === END FIX P1-14 === */
+
 static volatile uint8_t s_fail_tx_sync = 0;
 
 extern volatile uint32_t s_last_fault_clear_ms;
 extern volatile uint32_t s_last_node_msg_ms;
 extern volatile bool s_node_running;
+
+extern uint32_t blink_get_rtt_us(void);
 
 volatile bool s_cfg_ack = false;
 volatile bool s_cfg_pushing = false;
@@ -79,6 +78,11 @@ volatile bool s_force_resync_pending = false;
 
 extern uint8_t phase_change_take_pending(uint32_t *dur);
 extern void    phase_change_requeue(uint8_t phase, uint32_t dur_ms);
+
+/* === FIX P1-14: anti-spam — запоминаем последнюю отправленную фазу. === */
+static volatile uint8_t  s_last_sent_sync_phase = 0xFF;
+static volatile uint32_t s_last_sent_sync_ms    = 0;
+/* === END FIX P1-14 === */
 
 uint32_t send_sync_to_node_async(uint8_t phase, uint32_t phase_ms,
                                  uint32_t duration_ms,
@@ -99,10 +103,33 @@ uint32_t send_sync_to_node_async(uint8_t phase, uint32_t phase_ms,
         return 0;
     }
 
+    /* === FIX P1-14: anti-spam — если та же фаза и <250 мс — пропускаем. === */
+    uint32_t now_check = (uint32_t)(esp_timer_get_time() / 1000);
+    if (phase == s_last_sent_sync_phase &&
+        (now_check - s_last_sent_sync_ms) < SYNC_MIN_INTERVAL_MS) {
+        ESP_LOGD(TAG, "send_sync: same phase=%u, %lu ms ago — skip",
+                 phase, (unsigned long)(now_check - s_last_sent_sync_ms));
+        return 0;
+    }
+    s_last_sent_sync_phase = phase;
+    s_last_sent_sync_ms    = now_check;
+    /* === END FIX P1-14 === */
+
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
     uint32_t apply_ms = now_ms + SYNC_LEAD_MS;
 
     uint32_t pm_target = phase_ms + SYNC_LEAD_MS;
+
+    /* === FIX P0-2: клампим pm_target < duration_ms. === */
+    uint32_t dur = traffic_light_stage_duration_ms(phase);
+    if (dur > 0 && pm_target >= dur) {
+        ESP_LOGW(TAG, "send_sync: pm_target=%lu >= dur=%lu → clamp to %lu",
+                 (unsigned long)pm_target, (unsigned long)dur,
+                 (unsigned long)(dur - 1));
+        pm_target = dur - 1;
+    }
+    /* === END FIX P0-2 === */
+
     uint8_t next_phase = (phase + 1) % g_config.traffic.sequence_count;
 
     uint16_t on_mask = 0;
@@ -178,9 +205,6 @@ void apply_sync_at(uint8_t phase, uint32_t phase_ms,
     traffic_light_force_phase(phase, phase_ms, duration_ms);
 }
 
-/* ============================================================
-   === FIX MQTT-CFG-LIVE-UPDATE ===
-   ============================================================ */
 void root_apply_new_config_from_mqtt(const char *json, int len)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) {
@@ -267,14 +291,8 @@ void root_apply_new_config_from_mqtt(const char *json, int len)
     ESP_LOGI(TAG, "ROOT: config update queued, waiting for NODE cfg:ok "
                   "(YELLOW_BLINK until then)");
 }
-/* === END FIX MQTT-CFG-LIVE-UPDATE === */
 
-/* ============================================================
-   === FIX CONNECT-ANY-ORDER: ACK callback ===
-   При получении ACK от NODE (например, ACK на ping) — ROOT знает,
-   что NODE на связи. Если s_cfg_ack == false и не идёт CFG-передача,
-   триггерим CFG-push немедленно.
-   ============================================================ */
+/* === FIX CONNECT-ANY-ORDER: ACK callback === */
 static void on_lora_ack(uint8_t seq, uint8_t type)
 {
     (void)seq; (void)type;
@@ -286,7 +304,6 @@ static void on_lora_ack(uint8_t seq, uint8_t type)
     }
     s_cfg_req_pending = true;
 }
-/* === END FIX CONNECT-ANY-ORDER === */
 
 /* ============================================================
    root_node_watchdog_task
@@ -349,7 +366,8 @@ static void root_node_watchdog_task(void *arg)
             node_running_confirmed = false;
         }
 
-        if (s_cfg_applied_and_started && !has_node &&
+        /* === FIX P1-5: не считать NODE потерянным при cfg_pushing. === */
+        if (s_cfg_applied_and_started && !has_node && !s_cfg_pushing &&
             lost_since_ms != 0 &&
             (now - lost_since_ms) >= FAIL_NODE_LOST_MS) {
             if (traffic_light_get_fault() != TRAFFIC_FAULT_ALL_OFF) {
@@ -363,6 +381,7 @@ static void root_node_watchdog_task(void *arg)
                 start_retry_count = 0;
             }
         }
+        /* === END FIX P1-5 === */
 
         if (s_cfg_ack && has_node && !s_cfg_pushing &&
             !s_cfg_applied_and_started && !node_running_confirmed) {
@@ -398,9 +417,12 @@ static void root_node_watchdog_task(void *arg)
             uint32_t utc_sec = 0; uint16_t utc_ms = 0;
             bool time_ok = time_sync_get(&utc_sec, &utc_ms);
             if (time_ok) {
-                time_sync_root_push_force(0);
+                /* === FIX P2-9: реальный RTT вместо 0. === */
+                time_sync_root_push_force(blink_get_rtt_us());
+                /* === END FIX P2-9 === */
                 vTaskDelay(pdMS_TO_TICKS(TIME_PUSH_BEFORE_START_MS));
-                ESP_LOGI(TAG, "ROOT: time: pushed → starting traffic");
+                ESP_LOGI(TAG, "ROOT: time: pushed (rtt=%lu us) → starting traffic",
+                         (unsigned long)blink_get_rtt_us());
             } else {
                 ESP_LOGW(TAG, "ROOT: no valid time yet → traffic:start "
                               "(sync: deferred)");
@@ -544,9 +566,12 @@ static void phase_sync_task(void *arg)
                 if (time_sync_get(&ts, &tm)) {
                     time_pushed_since_start = true;
                     last_time_push_ms = now;
-                    time_sync_root_push_force(0);
-                    ESP_LOGI(TAG, "phase_sync: first time: pushed → "
-                                  "sync:current phase now");
+                    /* === FIX P2-9: реальный RTT. === */
+                    time_sync_root_push_force(blink_get_rtt_us());
+                    /* === END FIX P2-9 === */
+                    ESP_LOGI(TAG, "phase_sync: first time: pushed (rtt=%lu us) → "
+                                  "sync:current phase now",
+                             (unsigned long)blink_get_rtt_us());
                     uint8_t phase = traffic_light_get_phase();
                     uint32_t dur = traffic_light_get_phase_duration_ms();
                     uint32_t pm  = traffic_light_get_phase_ms();
@@ -576,7 +601,7 @@ static void phase_sync_task(void *arg)
                 if (last_time_push_ms == 0 ||
                     (now - last_time_push_ms) >= TIME_PUSH_PERIOD_MS) {
                     last_time_push_ms = now;
-                    time_sync_root_push(0);
+                    time_sync_root_push(blink_get_rtt_us());
                 }
             }
 
@@ -645,9 +670,6 @@ static void phase_sync_task(void *arg)
 
 /* ============================================================
    cfg_push_task
-   === FIX CONNECT-ANY-ORDER: первый push сразу после
-       CFG_INITIAL_DELAY_MS, повтор каждые CFG_RETRY_PERIOD_MS (5 с)
-       по таймауту или по cfg:req от NODE.
    ============================================================ */
 static void cfg_push_task(void *arg)
 {
@@ -666,9 +688,7 @@ static void cfg_push_task(void *arg)
     ESP_LOGI(TAG, "cfg_push: wait for cfg:req from NODE or first push");
     vTaskDelay(pdMS_TO_TICKS(CFG_INITIAL_DELAY_MS));
 
-    /* === FIX CONNECT-ANY-ORDER: last_push_ms = 0 → первый push сразу === */
     uint32_t last_push_ms = 0;
-    /* === END FIX CONNECT-ANY-ORDER === */
 
     while (1) {
         if (g_config.role != DEVICE_ROLE_MASTER) {
@@ -690,7 +710,6 @@ static void cfg_push_task(void *arg)
 
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-        /* === FIX CONNECT-ANY-ORDER === */
         bool by_req = s_cfg_req_pending;
         bool first_push = (last_push_ms == 0);
         bool by_timeout = (!first_push &&
@@ -709,7 +728,6 @@ static void cfg_push_task(void *arg)
                           "push by timeout (CFG-REQ-FALLBACK)",
                      (unsigned long)(now_ms - last_push_ms));
         }
-        /* === END FIX CONNECT-ANY-ORDER === */
 
         s_cfg_req_pending = false;
         last_push_ms = now_ms;
@@ -800,9 +818,7 @@ void root_wd_start_tasks(void)
                   "FAIL-SAFE-ROOT, CFG-REQ-FALLBACK, CONNECT-ANY-ORDER)...",
              SYNC_LEAD_MS);
 
-    /* === FIX CONNECT-ANY-ORDER: подписка на ACK === */
     transport_set_ack_cb(on_lora_ack);
-    /* === END FIX CONNECT-ANY-ORDER === */
 
     xTaskCreate(phase_sync_task,          "phase_sync",    4096, NULL, 4, NULL);
     xTaskCreate(root_node_watchdog_task,  "root_node_wd",  8192, NULL, 3, NULL);

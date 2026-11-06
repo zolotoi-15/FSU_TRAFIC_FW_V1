@@ -1,20 +1,16 @@
 /* ============================================================
    node_proto.c — NODE: CFG → STOPPED → traffic:start → RUNNING.
 
-   === FIX CFG-REQ ===
-   === FIX FAIL-SAFE-REBOOT ===
-   === FIX FAST-STATUS ===
+   === FIX CFG-REQ / FAIL-SAFE-REBOOT / FAST-STATUS /
+       CONNECT-ANY-ORDER ===
 
-   === FIX CONNECT-ANY-ORDER ===
-       ROOT и NODE должны соединиться независимо от порядка
-       загрузки.
-
-       - При получении ping от ROOT: если !s_node_cfg_confirmed
-         && s_cfg_received — сразу шлём cfg:req (ROOT на связи).
-       - node_send_task: в STOPPED STATUS каждые 2 с (вместо 10 с) —
-         ROOT быстро увидит NODE.
-       - node_wd: cfg:req каждые 2 с в первые 30 с (вместо 5 с).
-   === END FIX CONNECT-ANY-ORDER ===
+   === FIX NODE-BLINK-AND-ON ===
+       - При traffic:start гарантируем traffic_light_set_follow_root(true)
+         ДО traffic_light_start(). Иначе traffic_light_start() применит
+         stage_dd(0) локально → NODE мигает жёлтым+зелёным.
+       - При traffic:stop / потере связи — traffic_light_stop()
+         сбрасывает s_blink_mask, s_fault_yellow_mask, каналы OFF.
+   === END FIX NODE-BLINK-AND-ON ===
    ============================================================ */
 
 #include "node_proto.h"
@@ -48,7 +44,7 @@ static const char *TAG = "node_proto";
 #define CFG_REQ_PERIODIC_MS   5000
 #define NODE_STATUS_PERIOD_MS 10000
 #define NODE_STATUS_FAULT_MS  1000
-#define NODE_STATUS_STOPPED_MS 2000     /* === FIX CONNECT-ANY-ORDER === */
+#define NODE_STATUS_STOPPED_MS 2000
 #define STATUS_FORCE_MS       5000
 
 #define CFG_REQ_PERIOD_MS     5000
@@ -57,7 +53,7 @@ static volatile uint32_t s_last_cfg_req_ms = 0;
 static volatile bool s_node_cfg_confirmed = false;
 static volatile uint32_t s_last_cfg_req_wd_ms = 0;
 #define WD_CFG_REQ_PERIOD_MS  5000
-#define WD_CFG_REQ_FAST_MS    2000     /* === FIX CONNECT-ANY-ORDER === */
+#define WD_CFG_REQ_FAST_MS    2000
 #define WD_CFG_REQ_FAST_WINDOW_MS 30000
 
 #define SYNC_LEAD_MS          300
@@ -324,15 +320,12 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         node_note_root_data();
         s_last_sync_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-        /* === FIX CONNECT-ANY-ORDER: ROOT на связи, NODE не подтверждён —
-           сразу шлём cfg:req === */
         if (!s_node_cfg_confirmed && s_cfg_received &&
             !transport_is_cfg_rx_in_progress()) {
             esp_err_t err = transport_send_evt("cfg:req", 7);
             ESP_LOGI(TAG, "ping from ROOT → cfg:req (%s), confirmed=0",
                      err == ESP_OK ? "OK" : esp_err_to_name(err));
         }
-        /* === END FIX CONNECT-ANY-ORDER === */
         return;
     }
 
@@ -480,12 +473,18 @@ static void on_cmd_from_root(const char *cmd, size_t len)
             return;
         }
         ESP_LOGW(TAG, "traffic:start from root → clear ALL_OFF + START");
+
+        /* === FIX NODE-BLINK-AND-ON: follow_root(true) ДО start() ===
+           Иначе traffic_light_start() применит stage_dd(0) локально. */
+        traffic_light_set_follow_root(true);
+        /* === END FIX NODE-BLINK-AND-ON === */
+
         if (traffic_light_get_fault() != TRAFFIC_FAULT_NONE) {
             SET_REMOTE_FLAG(true);
             traffic_light_set_fault(TRAFFIC_FAULT_NONE);
             SET_REMOTE_FLAG(false);
         }
-        traffic_light_set_follow_root(true);
+
         s_node_cfg_confirmed = true;
         traffic_light_start();
 
@@ -688,11 +687,6 @@ static void on_evt_from_node(const char *evt, size_t len)
     }
 }
 
-/* ============================================================
-   cfg_ok_tx_task
-   === FIX CFG-REQ: cfg:req периодически если NVS CFG есть,
-       но ROOT не подтвердил (s_node_cfg_confirmed == false) ===
-   ============================================================ */
 static void cfg_ok_tx_task(void *arg)
 {
     ESP_LOGI(TAG, "cfg_ok_tx_task started");
@@ -739,10 +733,6 @@ static void cfg_ok_tx_task(void *arg)
     }
 }
 
-/* ============================================================
-   node_send_task
-   === FIX CONNECT-ANY-ORDER: в STOPPED STATUS каждые 2 с ===
-   ============================================================ */
 static void node_send_task(void *arg)
 {
     char *json = malloc(512);
@@ -806,7 +796,6 @@ static void node_send_task(void *arg)
             transport_send_status(json, off);
         }
 
-        /* === FIX CONNECT-ANY-ORDER: в STOPPED STATUS каждые 2 с === */
         uint32_t period;
         if (force) {
             period = 200;
@@ -817,15 +806,10 @@ static void node_send_task(void *arg)
         } else {
             period = NODE_STATUS_PERIOD_MS;
         }
-        /* === END FIX CONNECT-ANY-ORDER === */
         vTaskDelay(pdMS_TO_TICKS(period));
     }
 }
 
-/* ============================================================
-   node_link_watchdog_task
-   === FIX CONNECT-ANY-ORDER: cfg:req каждые 2 с в первые 30 с ===
-   ============================================================ */
 static void node_link_watchdog_task(void *arg)
 {
     ESP_LOGW(TAG, "node_wd: task started (role=%s)",
@@ -948,12 +932,10 @@ static void node_link_watchdog_task(void *arg)
         if (connected && !s_node_cfg_confirmed && transport_is_lora() &&
             !transport_is_cfg_rx_in_progress()) {
             uint32_t now_req = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            /* === FIX CONNECT-ANY-ORDER: первые 30 с — каждые 2 с === */
             uint32_t req_period = WD_CFG_REQ_PERIOD_MS;
             if (wd_start_ms != 0 && (now - wd_start_ms) < WD_CFG_REQ_FAST_WINDOW_MS) {
                 req_period = WD_CFG_REQ_FAST_MS;
             }
-            /* === END FIX CONNECT-ANY-ORDER === */
             if (s_last_cfg_req_wd_ms == 0 ||
                 (now_req - s_last_cfg_req_wd_ms) >= req_period) {
                 s_last_cfg_req_wd_ms = now_req;

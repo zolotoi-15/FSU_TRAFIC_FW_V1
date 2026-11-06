@@ -1,10 +1,12 @@
 /* ============================================================
    traffic_config.c — data-driven helpers.
 
-   === FIX #9: expected_sr_mask переименована в stage_sr_mask
-   (семантика: маска всех выходов фазы, включая blink) ===
-   === FIX #14: ESP_LOGI в apply_stage_dd → ESP_LOGD
-   (чтобы не засорять лог при try_recovery) ===
+   === FIX NODE-BLINK-AND-ON ===
+       apply_stage_dd() сначала выключает ВСЕ каналы (active
+       mask), потом включает outputs_on. Это гарантирует, что
+       каналы, которые были в blink, но не в on, выключатся
+       до включения on.
+   === END FIX NODE-BLINK-AND-ON ===
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -106,8 +108,6 @@ uint16_t traffic_light_active_sr_mask_internal(void)
     return m;
 }
 
-/* === FIX #9: переименовано в stage_sr_mask_internal
-   (семантика: ВСЕ выходы фазы, включая blink) === */
 uint16_t traffic_light_stage_sr_mask_internal(void)
 {
     if (g_config.traffic.sequence_count == 0) return 0;
@@ -119,19 +119,28 @@ uint16_t traffic_light_stage_sr_mask_internal(void)
     return m;
 }
 
-/* Backward-compat alias для существующего кода (traffic_fault.c).
-   Семантика: все выходы фазы (on + blink). */
 uint16_t traffic_light_expected_sr_mask_internal(void)
 {
     return traffic_light_stage_sr_mask_internal();
 }
-/* === END FIX #9 === */
 
 void set_all_off(void)
 {
     for (int i = 0; i < 16; i++) sr_output_off(i);
 }
 
+/* ============================================================
+   apply_stage_dd
+
+   === FIX NODE-BLINK-AND-ON ===
+       Порядок:
+         1. Выключить ВСЕ каналы из active mask (все, что где-то
+            в sequence есть on или blink).
+         2. Включить outputs_on текущей фазы.
+         3. Установить s_blink_mask — ТОЛЬКО каналы из
+            outputs_blink, которых НЕТ в outputs_on.
+       Гарантирует, что канал не будет одновременно ON и BLINK.
+   ============================================================ */
 void apply_stage_dd(uint8_t seq_idx)
 {
     if (seq_idx >= g_config.traffic.sequence_count) return;
@@ -146,26 +155,30 @@ void apply_stage_dd(uint8_t seq_idx)
         if (active & (1u << ch)) sr_output_off(ch);
     }
 
+    uint16_t on_mask = 0;
     for (int i = 0; i < st->on_count; i++) {
+        on_mask |= (1u << st->outputs_on[i]);
         sr_output_on(st->outputs_on[i]);
     }
 
-    s_blink_mask = 0;
+    /* === FIX NODE-BLINK-AND-ON: blink_mask &= ~on_mask === */
+    uint16_t blink_mask = 0;
     for (int i = 0; i < st->blink_count; i++) {
-        s_blink_mask |= (1u << st->outputs_blink[i]);
+        blink_mask |= (1u << st->outputs_blink[i]);
     }
+    blink_mask &= ~on_mask;   /* канал не может быть ON и BLINK */
+    s_blink_mask = blink_mask;
+    /* === END FIX NODE-BLINK-AND-ON === */
 
     s_blink_on = false;
     s_blink_last_phase = 0;
 
     uint32_t dur = stage_duration_ms(seq_idx);
-    /* === FIX #14: LOGD вместо LOGI — не засоряем лог при recovery === */
-    ESP_LOGD(TAG, "Stage → %u (%s) kind=%u dur=%lu on=%u blink=%u%s",
+    ESP_LOGD(TAG, "Stage → %u (%s) kind=%u dur=%lu on=0x%04X blink=0x%04X%s",
              st->id, st->name, st->duration_kind,
              (unsigned long)dur,
-             st->on_count, st->blink_count,
+             (unsigned)on_mask, (unsigned)blink_mask,
              stage_is_pedestrian(seq_idx) ? " (PED)" : "");
-    /* === END FIX #14 === */
 
     if (!s_follow_root && s_phase_change_cb) {
         s_phase_change_cb(seq_idx, dur);

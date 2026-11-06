@@ -1,14 +1,11 @@
 /* ============================================================
    mqtt_apply.c — применение конфига к runtime.
 
-   === FIX: mqtt_notify_phase через transport_send_cmd (LoRa),
-   а не через node_link_* (заглушки возвращали NOT_SUPPORTED).
-
-   === ВАЖНО ===
-   phase_change_cb в fault_handler.c НЕ регистрируется —
-   sync: пакеты шлёт только root_wd.c:phase_sync_task.
-   mqtt_notify_phase оставлен как fallback (вызывается только
-   из mqtt_apply, если когда-то понадобится).
+   === FIX NODE-BLINK-AND-ON ===
+       mqtt_apply_config_runtime() НЕ вызывает traffic_light_start()
+       для NODE — NODE остаётся в STOPPED + ALL_OFF до traffic:start
+       от ROOT. Для ROOT — ALL_OFF до cfg:ok от NODE.
+   === END FIX NODE-BLINK-AND-ON ===
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -76,6 +73,11 @@ void mqtt_apply_config_runtime(void)
         return;
     }
 
+    /* === FIX NODE-BLINK-AND-ON: ROOT и NODE НЕ стартуют здесь ===
+       ROOT: ALL_OFF до cfg:ok от NODE.
+       NODE: ALL_OFF до traffic:start от ROOT.
+       traffic_light_start() вызывается в root_node_watchdog_task
+       (ROOT) и node_proto on_cmd_from_root (NODE). */
     if (g_config.role == DEVICE_ROLE_MASTER) {
         ESP_LOGI(TAG, "ROOT: ALL_OFF at start (wait for cfg:ok from NODE)");
         traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
@@ -85,11 +87,9 @@ void mqtt_apply_config_runtime(void)
         traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
         return;
     }
+    /* === END FIX NODE-BLINK-AND-ON === */
 }
 
-/* === FIX: sync через transport_send_cmd, не через node_link_* ===
-   Формат: sync:phase:pm:dur:root_now_ms:apply_ms
-   Используется тот же, что в root_wd.c:send_sync_to_node(). */
 void mqtt_notify_phase(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) return;
@@ -122,4 +122,3 @@ void mqtt_notify_phase(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms)
         ESP_LOGW(TAG, "sync TX failed: %s", esp_err_to_name(err));
     }
 }
-/* === END FIX === */

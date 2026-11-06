@@ -1,33 +1,12 @@
 /* ============================================================
    traffic_light.c — публичный API и главный цикл traffic_task.
 
-   === FIX SYNC-PM ===
-       force_phase принимает pm_target НА МОМЕНТ применения.
-       pm_target=0 → начало фазы (phase_change).
-       pm_target>0 → resync.
-       ROOT (follow_root=false): та же фаза + pm=0 → игнор,
-                                 pm>0 → resync.
-       NODE (follow_root=true): применяем pm_target ВСЕГДА.
-
-   === FIX SYNC-MASK ===
-       ROOT вычисляет маску каналов из своего stage_dd и шлёт
-       NODE в sync:. NODE применяет маску НАПРЯМУЮ через
-       traffic_light_apply_mask() — не заглядывая в свой
-       stage_dd. ROOT — единственный источник правды.
-
-       traffic_light_get_stage_masks(phase, &on, &blink) —
-       ПУБЛИЧНЫЙ геттер масок по индексу sequence.
-
-   === FIX NODE-NO-APPLY-UNTIL-SYNC ===
-       traffic_light_start() НЕ применяет stage_dd(0), если
-       s_follow_root == true (NODE). NODE переходит в STANDBY
-       и ждёт sync: с маской от ROOT. Иначе NODE включает
-       каналы фазы 0 до sync:, и фазы не совпадают с ROOT
-       (в логах pm=640/8000 до первого sync:).
-
-       ROOT (follow_root=false) применяет stage_dd(0) как
-       обычно — ROOT источник правды.
-   === END FIX NODE-NO-APPLY-UNTIL-SYNC ===
+   === FIX P0-1: s_mask_received (NODE) — не считать fault до
+       получения первой маски от ROOT.
+   === FIX P0-3: убран s_phase_start_ms = now в ветке
+       in_transport_green — теперь удерживаем только до max_green.
+   === FIX P1-14: s_in_force_phase — apply_stage_dd не дёргает
+       on_phase_change, если его вызвал force_phase.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -86,6 +65,15 @@ volatile bool            s_mux_reading = false;
 volatile uint32_t        s_last_recovery_ok_ms = 0;
 volatile bool            s_fault_blink_state = false;
 
+/* === FIX P0-1: NODE — получена ли первая маска от ROOT === */
+volatile bool            s_mask_received = false;
+/* === END FIX P0-1 === */
+
+/* === FIX P1-14: apply_stage_dd не должен дёргать on_phase_change,
+   если его вызвал force_phase (иначе — бесконечный цикл sync). === */
+volatile bool            s_in_force_phase = false;
+/* === END FIX P1-14 === */
+
 traffic_fault_notify_cb_t s_fault_notify = NULL;
 traffic_phase_change_cb_t s_phase_change_cb = NULL;
 
@@ -105,6 +93,10 @@ void traffic_light_set_phase_change_cb(traffic_phase_change_cb_t cb) { s_phase_c
 void traffic_light_set_follow_root(bool en)
 {
     s_follow_root = en;
+    /* === FIX P0-1: при переходе в follow_root сбрасываем
+       s_mask_received — ждём первую маску от ROOT. === */
+    if (en) s_mask_received = false;
+    /* === END FIX P0-1 === */
     ESP_LOGI(TAG, "follow_root=%d", en);
 }
 
@@ -152,6 +144,20 @@ static inline uint32_t phase_blink_period_ms(void)
     return (p >= BLINK_MIN_PERIOD_MS) ? p : 500;
 }
 
+/* === FIX P0-3: максимум удержания зелёного (адаптивно) ===
+   Раньше: in_transport_green && !ped_request → бесконечное удержание
+   (сбрасывали s_phase_start_ms = now). Теперь — не более max_green,
+   после чего фаза переключается штатно. Значение = 3× green,
+   но не менее phases_ms.green (для совместимости). */
+static inline uint32_t max_green_hold_ms(void)
+{
+    uint32_t base = g_config.traffic.phases_ms.green;
+    uint32_t maxg = base * 3;
+    if (maxg < base) maxg = base;   /* защита от переполнения */
+    return maxg;
+}
+/* === END FIX P0-3 === */
+
 void traffic_task_loop(void *arg)
 {
     ESP_LOGI(TAG, "Traffic task started (step=20ms, follow_root=%d)", s_follow_root);
@@ -182,7 +188,7 @@ void traffic_task_loop(void *arg)
 
                 ESP_LOGI(TAG, "PHASE: role=%s seq=%u stage=%u %s%s "
                               "pm=%lu/%lu state=%s fault=%s "
-                              "utc=%lu.%03u delta=%ld",
+                              "utc=%lu.%03u delta=%ld mask_recv=%d",
                          g_config.role == DEVICE_ROLE_MASTER ? "ROOT" : "NODE",
                          s_phase,
                          g_config.traffic.sequence[s_phase],
@@ -194,7 +200,8 @@ void traffic_task_loop(void *arg)
                          fault_str,
                          utc_ok ? (unsigned long)utc_sec : 0u,
                          utc_ok ? utc_ms : 0,
-                         (long)time_sync_get_delta_ms());
+                         (long)time_sync_get_delta_ms(),
+                         (int)s_mask_received);
             } else {
                 ESP_LOGI(TAG, "PHASE: role=%s state=%s (seq=%u fault=%s)",
                          g_config.role == DEVICE_ROLE_MASTER ? "ROOT" : "NODE",
@@ -208,6 +215,13 @@ void traffic_task_loop(void *arg)
 
         /* NODE: только blink + fault */
         if (s_follow_root) {
+            /* === FIX P0-1: пока не пришла первая маска, не мигаем
+               и не считаем fault (каналы и так OFF). === */
+            if (!s_mask_received) {
+                continue;
+            }
+            /* === END FIX P0-1 === */
+
             uint16_t bm = s_blink_mask;
             uint32_t per = phase_blink_period_ms();
             if (bm && (now - s_blink_last_phase >= per)) {
@@ -344,6 +358,8 @@ void traffic_task_loop(void *arg)
 
         if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE) continue;
 
+        /* === FIX P0-3: удержание зелёного до max_green_hold_ms,
+           НО без сброса s_phase_start_ms. После — переключаемся. === */
         {
             const traffic_stage_dd_t *cur_st = find_stage(g_config.traffic.sequence[s_phase]);
             bool in_transport_green = false;
@@ -354,11 +370,19 @@ void traffic_task_loop(void *arg)
             }
             bool min_recall_hold = s_ped_min_recall && in_transport_green;
             if (in_transport_green && !s_ped_request && !min_recall_hold) {
-                s_phase_start_ms = now;
-                xSemaphoreGive(s_mutex);
-                continue;
+                uint32_t maxg = max_green_hold_ms();
+                uint32_t elapsed = now - s_phase_start_ms;
+                if (elapsed < maxg) {
+                    /* ещё не время принудительно переключать — просто
+                       НЕ сбрасываем s_phase_start_ms. */
+                    xSemaphoreGive(s_mutex);
+                    continue;
+                }
+                ESP_LOGW(TAG, "green hold reached max_green=%lu ms → force next",
+                         (unsigned long)maxg);
             }
         }
+        /* === END FIX P0-3 === */
 
         uint8_t next_phase;
 
@@ -403,9 +427,7 @@ void traffic_task_loop(void *arg)
                  (unsigned long)stage_duration_ms(s_phase),
                  stage_is_pedestrian(s_phase) ? " (PED)" : "");
 
-        if (s_phase_change_cb) {
-            s_phase_change_cb(s_phase, dur);
-        }
+        /* on_phase_change вызывается из apply_stage_dd; здесь не дублируем */
     }
 }
 
@@ -492,14 +514,6 @@ esp_err_t traffic_light_set_mode(traffic_mode_t mode)
     return ESP_OK;
 }
 
-/* ============================================================
-   === FIX NODE-NO-APPLY-UNTIL-SYNC ===
-   traffic_light_start():
-     - ROOT (follow_root=false): apply_stage_dd(0) как обычно.
-     - NODE (follow_root=true):  НЕ применяет stage_dd, ждёт
-       sync: с маской от ROOT. Каналы остаются выключены до
-       traffic_light_apply_mask().
-   ============================================================ */
 esp_err_t traffic_light_start(void)
 {
     if (g_config.traffic.sequence_count == 0) {
@@ -536,10 +550,6 @@ esp_err_t traffic_light_start(void)
     }
     xSemaphoreGive(s_mutex);
 
-    /* === FIX NODE-NO-APPLY-UNTIL-SYNC ===
-       NODE в follow_root режиме НЕ применяет stage_dd —
-       ждёт sync: с маской от ROOT. Иначе NODE включает каналы
-       фазы 0 до sync:, фазы не совпадают с ROOT. */
     if (s_follow_root) {
         ESP_LOGI(TAG, "START (follow_root=true) — STANDBY, "
                       "waiting sync: from ROOT (channels OFF)");
@@ -549,7 +559,6 @@ esp_err_t traffic_light_start(void)
     } else {
         apply_fault_mode(f);
     }
-    /* === END FIX NODE-NO-APPLY-UNTIL-SYNC === */
 
     ESP_LOGI(TAG, "START (mode=%d, seq=%u, fault=%s, follow_root=%d)",
              s_mode, g_config.traffic.sequence_count,
@@ -585,6 +594,9 @@ esp_err_t traffic_light_stop(void)
     s_fault_blink_state = false;
     s_ped_request = false;
     s_ped_min_recall = false;
+    /* === FIX P0-1: сбрасываем флаг маски. === */
+    s_mask_received = false;
+    /* === END FIX P0-1 === */
     xSemaphoreGive(s_mutex);
     set_all_off();
     ESP_LOGI(TAG, "STOP");
@@ -627,6 +639,7 @@ esp_err_t traffic_light_reset(void)
     if (!s_mutex) {
         s_state = TRAFFIC_STATE_STOPPED;
         s_phase = 0;
+        s_mask_received = false;   /* FIX P0-1 */
         set_all_off();
         ESP_LOGI(TAG, "RESET (no mutex yet)");
         return ESP_OK;
@@ -650,6 +663,7 @@ esp_err_t traffic_light_reset(void)
     s_fault_blink_state = false;
     s_ped_request = false;
     s_ped_min_recall = false;
+    s_mask_received = false;   /* FIX P0-1 */
     xSemaphoreGive(s_mutex);
     set_all_off();
     ESP_LOGI(TAG, "RESET");
@@ -674,6 +688,8 @@ esp_err_t traffic_light_next_phase(void)
     return ESP_OK;
 }
 
+/* === FIX P1-14: force_phase — apply_stage_dd не дёргает
+   on_phase_change (см. traffic_config.c). === */
 esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
                                     uint32_t duration_ms)
 {
@@ -722,7 +738,9 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
     xSemaphoreGive(s_mutex);
 
     if (!in_fault) {
+        s_in_force_phase = true;
         apply_stage_dd(phase);
+        s_in_force_phase = false;
     }
 
     ESP_LOGI(TAG, "FORCE phase=%u phase_ms=%lu (fault=%s)",
@@ -730,7 +748,11 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
              in_fault ? "ACTIVE" : "NONE");
     return ESP_OK;
 }
+/* === END FIX P1-14 === */
 
+/* === FIX P0-1: apply_mask выставляет s_mask_received,
+   FIX P1-14: apply_mask не должен дёргать on_phase_change
+   (это делает ROOT; NODE только применяет). === */
 void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
                               uint8_t phase, uint32_t phase_ms,
                               uint32_t duration_ms)
@@ -739,7 +761,22 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
         return;
 
+    uint16_t blink_orig = blink_mask;
+    blink_mask &= ~on_mask;
+    if (blink_orig != blink_mask) {
+        ESP_LOGW(TAG, "APPLY MASK: on=0x%04X blink_orig=0x%04X → blink=0x%04X "
+                      "(blink ∩ on removed)",
+                 (unsigned)on_mask, (unsigned)blink_orig,
+                 (unsigned)blink_mask);
+    }
+
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+    if (duration_ms > 0 && phase_ms >= duration_ms) {
+        ESP_LOGW(TAG, "apply_mask: pm=%lu >= dur=%lu → clamp",
+                 (unsigned long)phase_ms, (unsigned long)duration_ms);
+        phase_ms = duration_ms - 1;
+    }
 
     s_phase            = phase;
     s_phase_start_ms   = now - phase_ms;
@@ -747,6 +784,13 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
     s_blink_mask       = blink_mask;
     s_blink_on         = false;
     s_blink_last_phase = 0;
+    /* === FIX P0-1: первая маска получена — теперь fault-детектор
+       и мигание разрешены. === */
+    if (!s_mask_received) {
+        ESP_LOGI(TAG, "APPLY MASK: first mask from ROOT → fault detection enabled");
+        s_mask_received = true;
+    }
+    /* === END FIX P0-1 === */
     xSemaphoreGive(s_mutex);
 
     uint16_t active = traffic_light_active_sr_mask_internal();
@@ -763,6 +807,7 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
              phase, (unsigned long)phase_ms, (unsigned long)duration_ms,
              (unsigned)on_mask, (unsigned)blink_mask);
 }
+/* === END FIX P0-1 / P1-14 === */
 
 esp_err_t traffic_light_force_phase_masked(uint8_t phase,
                                            uint32_t phase_ms,
@@ -818,6 +863,8 @@ void traffic_light_get_stage_masks(uint8_t phase,
         on |= (1u << st->outputs_on[k]);
     for (int k = 0; k < st->blink_count; k++)
         blink |= (1u << st->outputs_blink[k]);
+
+    blink &= ~on;
 
     if (out_on_mask)    *out_on_mask = on;
     if (out_blink_mask) *out_blink_mask = blink;

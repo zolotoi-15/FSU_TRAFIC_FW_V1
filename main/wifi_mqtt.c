@@ -1,8 +1,10 @@
 /* ============================================================
    wifi_mqtt.c — публичный API + MQTT-клиент.
 
-   === FIX #7: URI с портом (esp-mqtt игнорирует broker.address.port) ===
-   === FIX #8: MQTT_DOWN_RESTART_MS 5 мин → 90 с ===
+   === FIX P1-5: MQTT_DOWN_RESTART_MS 90s → 5 мин.
+   === FIX P1-5: убран двойной modem_ppp_stop() — watchdog
+       срабатывает один раз, потом сбрасывает down_since.
+   === FIX #7: URI с портом (esp-mqtt игнорирует broker.address.port)
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -43,8 +45,9 @@ int        s_publish_fail_count = 0;
 static bool       s_restart_in_progress = false;
 static SemaphoreHandle_t s_restart_mutex = NULL;
 
-/* === FIX #8: 5 мин → 90 с === */
-#define MQTT_DOWN_RESTART_MS   (90 * 1000)
+/* === FIX P1-5: 90 с → 5 мин. === */
+#define MQTT_DOWN_RESTART_MS   (5 * 60 * 1000)
+/* === END FIX P1-5 === */
 
 static volatile uint32_t s_mqtt_last_connected_ms    = 0;
 static volatile uint32_t s_mqtt_last_disconnected_ms = 0;
@@ -393,6 +396,7 @@ static void mqtt_publish_task(void *arg)
     }
 }
 
+/* === FIX P1-5: watchdog — не дёргает одновременно restart и force_modem. === */
 static void mqtt_watchdog_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(30000));
@@ -416,6 +420,8 @@ static void mqtt_watchdog_task(void *arg)
                 ESP_LOGE(TAG, "MQTT down %lu ms (> %d) → force restart modem",
                          (unsigned long)down_ms, MQTT_DOWN_RESTART_MS);
                 wifi_mqtt_force_restart_modem();
+                /* FIX P1-5: сбрасываем down_since, чтобы watchdog
+                   не крутил stop() каждые 30 с. */
                 mqtt_set_down_since((uint32_t)(esp_timer_get_time() / 1000));
                 s_last_event_time = xTaskGetTickCount();
             } else if (since > MQTT_STUCK_TIMEOUT_MS) {
@@ -427,6 +433,7 @@ static void mqtt_watchdog_task(void *arg)
         }
     }
 }
+/* === END FIX P1-5 === */
 
 esp_err_t wifi_mqtt_init(void)
 {
