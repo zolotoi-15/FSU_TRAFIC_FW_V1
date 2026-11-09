@@ -13,3 +13,4 @@ managed_components/
 .idea/
 .DS_Store
 *.log
+/blink
