@@ -2,21 +2,23 @@
    traffic_fault.c — аварии: apply_fault_mode, try_recovery,
    check_faults, set_fault, build_fault_report.
 
+   === FIX RECOVERY-NODE-SKIP ===
+       try_recovery для NODE в follow_root НЕ вызывает
+       apply_stage_dd — ROOT сам пришлёт sync:. Это защита
+       от CONFLICT при recovery, если stage_dd противоречив
+       (тестовый стенд MESH).
+
+   === FIX RECOVERY-SKIP-DURING-CFG ===
+       try_recovery не выполняется, пока идёт приём CFG от ROOT.
+
    === FIX P0-1: NODE не проверяет fault, пока не получена первая
        маска (sync:) от ROOT.
    === FIX 1: apply_fault_mode сбрасывает s_blink_mask / s_blink_on /
        s_blink_last_phase — иначе в follow_root одновременно мигают
        старый s_blink_mask (зелёный) и fault_blink_yellow (жёлтый).
    === FIX 4: для NODE в follow_root маска жёлтых берётся из
-       s_fault_yellow_mask_from_root (передаётся ROOT в
-       fault:yellow_blink:0xXXXX:...). s_fault_mask_valid отличает
-       «маска не передана» от «передана 0x0000» (валидная пустая).
-       Fallback — по s_mode (legacy / ROOT).
-   === FIX 5: fault мигает даже без s_mask_received.
-   === FIX GOST-PED-YELLOW-BLINK:
-       set_fault(YELLOW_BLINK) блокируется, если активна
-       пешеходная фаза (ГОСТ Р 52289: жёлтое мигание не
-       должно заставать пешеходов в переходе).
+       s_fault_yellow_mask_from_root.
+   === FIX GOST-PED-YELLOW-BLINK ===
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -24,6 +26,7 @@
 #include "mux.h"
 #include "mux_data.h"
 #include "config_manager.h"
+#include "transport.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
@@ -40,15 +43,10 @@ extern int       board_read_iload_raw(uint8_t channel,
                                       imon_state_t *out_state,
                                       int *out_mv);
 
-/* === FIX P0-1: флаг «NODE получил первую маску от ROOT» === */
 extern volatile bool s_mask_received;
-/* === END FIX P0-1 === */
 
-/* === FIX 4: маска жёлтых, переданная ROOT в fault:yellow_blink:...
-   s_fault_mask_valid отличает «не передана» от «передана 0x0000». */
 volatile uint16_t s_fault_yellow_mask_from_root = 0;
 volatile bool     s_fault_mask_valid            = false;
-/* === END FIX 4 === */
 
 static inline uint32_t fault_blink_period_ms(void)
 {
@@ -56,15 +54,6 @@ static inline uint32_t fault_blink_period_ms(void)
     return (p >= BLINK_MIN_PERIOD_MS) ? p : 500;
 }
 
-/* ============================================================
-   apply_fault_mode
-
-   === FIX 1: сбрасываем s_blink_mask / s_blink_on / s_blink_last_phase.
-   === FIX 4: маска жёлтых:
-       - если s_follow_root && s_fault_mask_valid
-         → используем s_fault_yellow_mask_from_root (ROOT прислал);
-       - иначе — вычисляем по s_mode (ROOT или legacy NODE).
-   ============================================================ */
 void apply_fault_mode(traffic_fault_t fault)
 {
     set_all_off();
@@ -82,9 +71,7 @@ void apply_fault_mode(traffic_fault_t fault)
         return;
     }
 
-    /* === FIX 4: приоритет — маска от ROOT (NODE в follow_root).
-       s_fault_mask_valid позволяет принять даже 0x0000 (валидная
-       пустая маска, ROOT без жёлтых в s_mode). === */
+    /* === FIX 4 === */
     if (s_follow_root && s_fault_mask_valid) {
         s_fault_yellow_mask = s_fault_yellow_mask_from_root;
         ESP_LOGE(TAG, "FAULT → YELLOW_BLINK (mask=0x%04X from ROOT)",
@@ -127,8 +114,25 @@ void fault_blink_yellow(bool on)
     s_fault_blink_state = on;
 }
 
+/* ============================================================
+   try_recovery
+
+   === FIX RECOVERY-NODE-SKIP ===
+   Для NODE в follow_root НЕ вызываем apply_stage_dd — ROOT сам
+   пришлёт sync:. Иначе apply_stage_dd может упасть в ALL_OFF
+   из-за CONFLICT в stage_dd.
+
+   === FIX RECOVERY-SKIP-DURING-CFG ===
+   ============================================================ */
 void try_recovery(uint32_t now_ms, uint32_t *blink_last)
 {
+    /* === FIX RECOVERY-SKIP-DURING-CFG === */
+    if (transport_is_cfg_rx_in_progress()) {
+        ESP_LOGD(TAG, "recovery: skipped (CFG rx in progress)");
+        return;
+    }
+    /* === END FIX RECOVERY-SKIP-DURING-CFG === */
+
     traffic_fault_info_t snap[TRAFFIC_FAULT_MAX];
     uint8_t cnt = 0;
     if (xSemaphoreTake(s_fault_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
@@ -208,8 +212,8 @@ void try_recovery(uint32_t now_ms, uint32_t *blink_last)
                 s_fault = TRAFFIC_FAULT_NONE;
                 s_fault_count = 0;
                 s_fault_yellow_mask = 0;
-                s_fault_yellow_mask_from_root = 0;   /* FIX 4 */
-                s_fault_mask_valid            = false; /* FIX 4 */
+                s_fault_yellow_mask_from_root = 0;
+                s_fault_mask_valid            = false;
                 s_last_fault_notify_ms = 0;
                 s_last_recovery_ok_ms = now_ms;
                 s_fault_blink_state = false;
@@ -233,9 +237,14 @@ void try_recovery(uint32_t now_ms, uint32_t *blink_last)
         return;
     }
 
+    /* === FIX RECOVERY-NODE-SKIP ===
+       fire=true только для ROOT (!s_follow_root).
+       NODE в follow_root не применяет apply_stage_dd —
+       ROOT сам пришлёт sync:. */
     if (fire) {
         apply_stage_dd(s_phase);
     }
+    /* === END FIX RECOVERY-NODE-SKIP === */
 
     if (fire && s_fault_notify) s_fault_notify(TRAFFIC_FAULT_NONE);
 }
@@ -317,13 +326,9 @@ void traffic_light_check_faults(const mux_data_t *data)
     if (!data || !data->valid) return;
     if (s_fault != TRAFFIC_FAULT_NONE) return;
 
-    /* === FIX P0-1 / FIX 5: NODE в follow_root, но маска ещё не пришла
-       от ROOT — каналы заведомо OFF, проверять нечего. Но если уже
-       есть fault — не блокируемся (fault мигает независимо). === */
     if (s_follow_root && !s_mask_received && s_fault == TRAFFIC_FAULT_NONE) {
         return;
     }
-    /* === END FIX P0-1 / FIX 5 === */
 
     uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     if (now_ms - s_phase_start_ms < g_config.traffic.fault.phase_grace_ms) return;
@@ -466,17 +471,6 @@ void traffic_light_check_faults(const mux_data_t *data)
     if (fire && s_fault_notify) s_fault_notify(nf);
 }
 
-/* ============================================================
-   traffic_light_set_fault
-
-   === FIX GOST-PED-YELLOW-BLINK ===
-   ГОСТ Р 52289: в режиме жёлтого мигания запрещено оставлять
-   пешеходный переход в активной пешеходной фазе — пешеходы
-   должны быть уверены, что их сигнал управляется.
-   Блокируем переход в YELLOW_BLINK, если текущая фаза —
-   пешеходная. ALL_OFF (полный отказ) — разрешён всегда,
-   т.к. это безопасное состояние «всё выключено».
-   ============================================================ */
 void traffic_light_set_fault(traffic_fault_t fault)
 {
     /* === FIX GOST-PED-YELLOW-BLINK === */
@@ -516,8 +510,8 @@ void traffic_light_set_fault(traffic_fault_t fault)
         if (fire) s_last_fault_notify_ms = s_last_recovery_ms;
     } else {
         s_fault_yellow_mask = 0;
-        s_fault_yellow_mask_from_root = 0;   /* FIX 4 */
-        s_fault_mask_valid            = false; /* FIX 4 */
+        s_fault_yellow_mask_from_root = 0;
+        s_fault_mask_valid            = false;
         s_fault_count = 0;
         s_last_fault_notify_ms = 0;
         s_fault_blink_state = false;
@@ -565,16 +559,10 @@ size_t traffic_light_build_fault_report(char *buf, size_t size)
 
     int off = snprintf(buf, size, "fault:%s:", fault_mode_str(f));
 
-    /* === FIX 4: для yellow_blink добавляем маску жёлтых, чтобы NODE
-       мигал теми же каналами, что ROOT. Формат:
-         fault:yellow_blink:0x0092:<ch>,<ch>:<reason>,<reason>
-       ROOT (s_mode) вычисляет s_fault_yellow_mask в apply_fault_mode.
-       NODE (follow_root) использует её через s_fault_yellow_mask_from_root. */
     if (f == TRAFFIC_FAULT_YELLOW_BLINK) {
         off += snprintf(buf + off, size - off, "0x%04X:",
                         (unsigned)s_fault_yellow_mask);
     }
-    /* === END FIX 4 === */
 
     bool first = true;
     for (uint8_t i = 0; i < cnt; i++) {

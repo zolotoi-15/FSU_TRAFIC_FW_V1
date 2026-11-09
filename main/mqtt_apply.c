@@ -1,11 +1,11 @@
 /* ============================================================
    mqtt_apply.c — применение конфига к runtime.
 
-   === FIX NODE-BLINK-AND-ON ===
+   === FIX SYNC-LEAD-CONSISTENT: SYNC_LEAD_MS из sync_config.h ===
+   === FIX NODE-BLINK-AND-ON:
        mqtt_apply_config_runtime() НЕ вызывает traffic_light_start()
        для NODE — NODE остаётся в STOPPED + ALL_OFF до traffic:start
        от ROOT. Для ROOT — ALL_OFF до cfg:ok от NODE.
-   === END FIX NODE-BLINK-AND-ON ===
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -13,14 +13,12 @@
 #include "traffic_light.h"
 #include "transport.h"
 #include "root_wd.h"
+#include "sync_config.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <stdio.h>
 
 static const char *TAG = "mqtt_apply";
-
-#define PHASE_SYNC_MIN_INTERVAL_MS  250
-#define SYNC_LEAD_MS                700
 
 static volatile uint8_t  s_last_sync_phase = 0xFF;
 static volatile uint32_t s_last_sync_ms    = 0;
@@ -75,9 +73,7 @@ void mqtt_apply_config_runtime(void)
 
     /* === FIX NODE-BLINK-AND-ON: ROOT и NODE НЕ стартуют здесь ===
        ROOT: ALL_OFF до cfg:ok от NODE.
-       NODE: ALL_OFF до traffic:start от ROOT.
-       traffic_light_start() вызывается в root_node_watchdog_task
-       (ROOT) и node_proto on_cmd_from_root (NODE). */
+       NODE: ALL_OFF до traffic:start от ROOT. */
     if (g_config.role == DEVICE_ROLE_MASTER) {
         ESP_LOGI(TAG, "ROOT: ALL_OFF at start (wait for cfg:ok from NODE)");
         traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
@@ -87,9 +83,12 @@ void mqtt_apply_config_runtime(void)
         traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
         return;
     }
-    /* === END FIX NODE-BLINK-AND-ON === */
 }
 
+/* ============================================================
+   mqtt_notify_phase — sync: из MQTT (только ROOT).
+   Использует SYNC_LEAD_MS из sync_config.h.
+   ============================================================ */
 void mqtt_notify_phase(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) return;
@@ -100,7 +99,7 @@ void mqtt_notify_phase(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms)
     uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
     if (phase == s_last_sync_phase &&
-        (now_ms - s_last_sync_ms) < PHASE_SYNC_MIN_INTERVAL_MS) {
+        (now_ms - s_last_sync_ms) < SYNC_MIN_INTERVAL_MS) {
         return;
     }
     s_last_sync_phase = phase;

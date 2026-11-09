@@ -1,3 +1,17 @@
+/* ============================================================
+   traffic_light.c — основной цикл traffic_task + force_phase.
+
+   === FIX FORCE-PHASE-PM0 ===
+   === FIX HOLD-PM-FREEZE ===
+   === FIX HOLD-RESYNC-PM0 ===
+   === FIX HOLD-NODE-PM-CLEAR ===
+   === FIX APPLY-MASK-SYNC-ROOT ===
+   === FIX APPLY-MASK-CONFLICT-CHECK ===
+       traffic_light_apply_mask проверяет конфликт каналов.
+       Fail-safe: не включать конфликтующие каналы из sync:,
+       даже если ROOT прислал их при рассинхроне.
+   ============================================================ */
+
 #include "traffic_internal.h"
 #include "traffic_light.h"
 #include "shift_register.h"
@@ -69,21 +83,17 @@ volatile uint32_t        s_insert_request_ms = 0;
 traffic_fault_notify_cb_t s_fault_notify = NULL;
 traffic_phase_change_cb_t s_phase_change_cb = NULL;
 
-/* === FIX GOST-NIGHT-MODE === */
 static volatile bool s_night_mode = false;
-/* === END FIX GOST-NIGHT-MODE === */
 
-/* === FIX GOST-ALL-RED: состояние виртуальной all-red фазы === */
 static volatile bool     s_all_red_active      = false;
 static volatile uint32_t s_all_red_start_ms    = 0;
 static volatile uint8_t  s_all_red_next_seq    = 0xFF;
 static volatile uint32_t s_all_red_next_dur_ms = 0;
-/* === END FIX GOST-ALL-RED === */
 
-/* === FIX GOST-MANUAL-CONTROL === */
 static volatile bool    s_manual_override = false;
 static volatile uint8_t s_manual_seq = 0;
-/* === END FIX GOST-MANUAL-CONTROL === */
+
+static volatile bool     s_hold_pm_frozen = false;
 
 bool traffic_light_get_fault_blink_state(void) { return s_fault_blink_state; }
 
@@ -262,11 +272,9 @@ void traffic_task_loop(void *arg)
             }
         }
 
-        /* === FIX GOST-NIGHT-MODE: ночной режим — тоже работаем. === */
         if (s_state != TRAFFIC_STATE_RUNNING &&
             s_state != TRAFFIC_STATE_NIGHT_YELLOW_BLINK) continue;
 
-        /* === FIX GOST-NIGHT-MODE: ночное жёлтое мигание (без fault). === */
         if (s_state == TRAFFIC_STATE_NIGHT_YELLOW_BLINK) {
             uint32_t per = g_config.traffic.phases_ms.fault_blink_period;
             if (per < BLINK_MIN_PERIOD_MS) per = 500;
@@ -277,9 +285,7 @@ void traffic_task_loop(void *arg)
             }
             continue;
         }
-        /* === END FIX GOST-NIGHT-MODE === */
 
-        /* NODE: только blink + fault */
         if (s_follow_root) {
             if (!s_mask_received && s_fault == TRAFFIC_FAULT_NONE) {
                 continue;
@@ -318,13 +324,10 @@ void traffic_task_loop(void *arg)
             continue;
         }
 
-        /* ROOT: обычная логика */
-
-        /* === FIX GOST-ALL-RED: виртуальная all-red фаза. === */
         if (s_all_red_active) {
             uint32_t elapsed = now - s_all_red_start_ms;
             if (elapsed < ALL_RED_MIN_MS) {
-                continue;   /* держим all-red */
+                continue;
             }
             uint8_t next_seq = s_all_red_next_seq;
             uint32_t next_dur = s_all_red_next_dur_ms;
@@ -346,7 +349,6 @@ void traffic_task_loop(void *arg)
             send_sync_to_node_async_ex(next_seq, 0, next_dur, true, NULL);
             continue;
         }
-        /* === END FIX GOST-ALL-RED === */
 
         if (s_ped_request &&
             g_config.traffic.pedestrian.request_mode == PED_REQUEST_MODE_INSERT) {
@@ -375,7 +377,6 @@ void traffic_task_loop(void *arg)
             continue;
         }
 
-        /* HOLD */
         {
             bool cur_hold = false;
             if (g_config.traffic.hold.enabled) {
@@ -392,6 +393,17 @@ void traffic_task_loop(void *arg)
                          cur_hold ? "ENTER" : "EXIT",
                          g_config.traffic.sequence[s_phase], s_phase);
                 s_hold_active = cur_hold;
+
+                if (cur_hold) {
+                    s_hold_pm_frozen = true;
+                    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
+                        s_phase_start_ms = now;
+                        xSemaphoreGive(s_mutex);
+                    }
+                    ESP_LOGI(TAG, "hold: pm frozen to 0 (phase_start_ms=now)");
+                } else {
+                    s_hold_pm_frozen = false;
+                }
             }
         }
 
@@ -412,11 +424,16 @@ void traffic_task_loop(void *arg)
                              g_config.traffic.sequence[s_phase], s_phase,
                              (unsigned long)(now - s_phase_start_ms));
                 }
+                if (s_hold_pm_frozen) {
+                    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
+                        s_phase_start_ms = now;
+                        xSemaphoreGive(s_mutex);
+                    }
+                }
                 continue;
             }
         }
 
-        /* INSERT (без изменений — код из предыдущих листингов) */
         if (s_insert_pending) {
             uint32_t since_req = now - s_insert_request_ms;
 
@@ -468,6 +485,7 @@ void traffic_task_loop(void *arg)
                     s_phase = seq_idx;
                     s_phase_start_ms = now;
                     s_hold_active = false;
+                    s_hold_pm_frozen = false;
                     xSemaphoreGive(s_mutex);
                 }
 
@@ -649,6 +667,7 @@ void traffic_task_loop(void *arg)
                     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
                         s_phase = hold_seq;
                         s_phase_start_ms = now;
+                        s_hold_pm_frozen = true;
                         xSemaphoreGive(s_mutex);
                     }
                     s_in_force_phase = true;
@@ -668,7 +687,6 @@ void traffic_task_loop(void *arg)
             continue;
         }
 
-        /* обычный blink_mask */
         uint16_t bm = s_blink_mask;
         uint32_t per = phase_blink_period_ms();
         if (bm && (now - s_blink_last_phase >= per)) {
@@ -715,19 +733,15 @@ void traffic_task_loop(void *arg)
             continue;
         }
 
-        /* === FIX GOST-MANUAL-CONTROL: в ручном режиме не переключаем === */
         if (s_manual_override) {
             continue;
         }
-        /* === END FIX GOST-MANUAL-CONTROL === */
 
         uint32_t dur = effective_stage_duration_ms(s_phase);
 
         if (s_ped_request && stage_is_transport_green(s_phase)) {
             uint32_t min_green = g_config.traffic.phases_ms.green / 2;
-            /* === FIX GOST-MIN-GREEN: нижняя граница 20 с (ГОСТ Р 52289 п. 4.4.4) === */
             if (min_green < 20000) min_green = 20000;
-            /* === END FIX GOST-MIN-GREEN === */
             if (dur > min_green) {
                 dur = min_green;
                 if (last_min_green_phase != s_phase) {
@@ -787,8 +801,6 @@ void traffic_task_loop(void *arg)
             }
         }
 
-        /* === FIX GOST-ALL-RED: вставка all-red при переходе
-           между двумя зелёными без промежуточного all-red. === */
         uint8_t prev_seq = s_phase;
         if (need_virtual_all_red(prev_seq, next_phase)) {
             uint32_t next_dur_calc = effective_stage_duration_ms(next_phase);
@@ -814,10 +826,10 @@ void traffic_task_loop(void *arg)
             if (n > 0) transport_send_cmd_noack(cmd, n);
             continue;
         }
-        /* === END FIX GOST-ALL-RED === */
 
         s_phase = next_phase;
         s_phase_start_ms = now;
+        s_hold_pm_frozen = false;
         xSemaphoreGive(s_mutex);
         apply_stage_dd(s_phase);
 
@@ -854,10 +866,6 @@ esp_err_t traffic_light_init(void)
              g_config.traffic.conflict_count);
     return ESP_OK;
 }
-
-/* ... set_pins_single/cross/cross_ped, set_mode, start, stop,
-   pause, resume, reset, next_phase, force_phase, apply_mask,
-   get_* — БЕЗ ИЗМЕНЕНИЙ (кроме state_str и новых функций). ... */
 
 void traffic_light_set_pins_single(const traffic_pins_single_t *pins)
 {
@@ -925,6 +933,7 @@ esp_err_t traffic_light_set_mode(traffic_mode_t mode)
     s_ped_request = false;
     s_ped_min_recall = false;
     s_hold_active = false;
+    s_hold_pm_frozen = false;
     s_insert_pending = false;
     s_insert_count = 0;
     s_insert_idx = 0;
@@ -956,6 +965,7 @@ esp_err_t traffic_light_start(void)
     s_phase = 0;
     s_phase_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     s_night_mode = false;
+    s_hold_pm_frozen = false;
 
     traffic_fault_t f = s_fault;
     if (f == TRAFFIC_FAULT_NONE) {
@@ -1018,6 +1028,7 @@ esp_err_t traffic_light_stop(void)
     s_ped_min_recall = false;
     s_mask_received = false;
     s_hold_active = false;
+    s_hold_pm_frozen = false;
     s_insert_pending = false;
     s_insert_count = 0;
     s_insert_idx = 0;
@@ -1094,6 +1105,7 @@ esp_err_t traffic_light_reset(void)
     s_ped_min_recall = false;
     s_mask_received = false;
     s_hold_active = false;
+    s_hold_pm_frozen = false;
     s_insert_pending = false;
     s_insert_count = 0;
     s_insert_idx = 0;
@@ -1118,6 +1130,7 @@ esp_err_t traffic_light_next_phase(void)
     s_phase = (s_phase + 1) % g_config.traffic.sequence_count;
     s_phase_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     s_hold_active = false;
+    s_hold_pm_frozen = false;
     s_insert_pending = false;
     uint8_t ph = s_phase;
     xSemaphoreGive(s_mutex);
@@ -1149,22 +1162,17 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
     bool in_fault = (s_fault != TRAFFIC_FAULT_NONE);
 
     if (s_phase == phase && s_state == TRAFFIC_STATE_RUNNING) {
-        if (!s_follow_root) {
-            if (phase_ms > 0) {
-                s_phase_start_ms = now - phase_ms;
-                xSemaphoreGive(s_mutex);
-                ESP_LOGI(TAG, "force_phase: same phase=%u (ROOT), resync pm=%lu",
-                         phase, (unsigned long)phase_ms);
-                return ESP_OK;
-            }
-            ESP_LOGD(TAG, "force_phase: same phase=%u (root), no change", phase);
+        s_phase_start_ms = now - phase_ms;
+        if (in_fault) {
             xSemaphoreGive(s_mutex);
+            ESP_LOGD(TAG, "force_phase: same phase=%u (fault active), "
+                          "resync pm=%lu", phase, (unsigned long)phase_ms);
             return ESP_OK;
         }
-        s_phase_start_ms = now - phase_ms;
         xSemaphoreGive(s_mutex);
-        ESP_LOGI(TAG, "force_phase: same phase=%u (NODE), pm=%lu sync",
-                 phase, (unsigned long)phase_ms);
+        ESP_LOGI(TAG, "force_phase: same phase=%u (%s), resync pm=%lu",
+                 phase, s_follow_root ? "NODE" : "ROOT",
+                 (unsigned long)phase_ms);
         return ESP_OK;
     }
 
@@ -1185,13 +1193,36 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
     return ESP_OK;
 }
 
+/* === FIX APPLY-MASK-CONFLICT-CHECK === */
 void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
                               uint8_t phase, uint32_t phase_ms,
                               uint32_t duration_ms)
 {
     if (!s_mutex) return;
+
+    if (s_follow_root && s_sync_delay_us > 0) {
+        uint32_t delay_ms = s_sync_delay_us / 1000;
+        if (delay_ms > 0 && delay_ms < 2000) {
+            vTaskDelay(pdMS_TO_TICKS(delay_ms));
+        }
+    }
+
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
         return;
+
+    if (traffic_mask_has_conflict(on_mask)) {
+        ESP_LOGE(TAG, "APPLY MASK: CONFLICT 0x%04X → ALL_OFF "
+                      "(GOST Р 52289 п.7.4.1)", (unsigned)on_mask);
+        set_all_off();
+        s_blink_mask = 0;
+        s_blink_on = false;
+        s_blink_last_phase = 0;
+        s_phase = phase;
+        s_phase_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        s_state = TRAFFIC_STATE_RUNNING;
+        xSemaphoreGive(s_mutex);
+        return;
+    }
 
     uint16_t blink_orig = blink_mask;
     blink_mask &= ~on_mask;
@@ -1216,6 +1247,7 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
     s_blink_mask       = blink_mask;
     s_blink_on         = false;
     s_blink_last_phase = 0;
+    s_hold_pm_frozen   = false;
     if (!s_mask_received) {
         ESP_LOGI(TAG, "APPLY MASK: first mask from ROOT → fault detection enabled");
         s_mask_received = true;
@@ -1322,9 +1354,7 @@ const char *traffic_light_state_str(void)
     switch (s_state) {
         case TRAFFIC_STATE_RUNNING: return "RUNNING";
         case TRAFFIC_STATE_PAUSED:  return "PAUSED";
-        /* === FIX GOST-NIGHT-MODE === */
         case TRAFFIC_STATE_NIGHT_YELLOW_BLINK: return "NIGHT_YELLOW_BLINK";
-        /* === END FIX GOST-NIGHT-MODE === */
         default:                    return "STOPPED";
     }
 }
@@ -1394,10 +1424,6 @@ uint32_t traffic_light_stage_duration_ms(uint8_t seq_idx)
     return stage_duration_ms(seq_idx);
 }
 
-/* ============================================================
-   === FIX GOST-NIGHT-MODE ===
-   Штатный ночной режим — жёлтое мигание без записи в fault.
-   ============================================================ */
 esp_err_t traffic_light_set_night_mode(bool enable)
 {
     if (!s_mutex) return ESP_ERR_INVALID_STATE;
@@ -1418,6 +1444,7 @@ esp_err_t traffic_light_set_night_mode(bool enable)
         s_blink_on = false;
         s_blink_last_phase = 0;
         s_mask_received = false;
+        s_hold_pm_frozen = false;
         xSemaphoreGive(s_mutex);
 
         uint16_t yellow = 0;
@@ -1456,12 +1483,7 @@ esp_err_t traffic_light_set_night_mode(bool enable)
 }
 
 bool traffic_light_is_night_mode(void) { return s_night_mode; }
-/* === END FIX GOST-NIGHT-MODE === */
 
-/* ============================================================
-   === FIX GOST-MANUAL-CONTROL ===
-   Ручное управление от поста ДПС (ГОСТ Р 52289 п.5.1).
-   ============================================================ */
 esp_err_t traffic_light_manual_override(uint8_t seq_idx)
 {
     if (seq_idx >= g_config.traffic.sequence_count) return ESP_ERR_INVALID_ARG;
@@ -1478,6 +1500,7 @@ esp_err_t traffic_light_manual_override(uint8_t seq_idx)
     s_phase_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     s_fault = TRAFFIC_FAULT_NONE;
     s_fault_count = 0;
+    s_hold_pm_frozen = false;
     xSemaphoreGive(s_mutex);
 
     s_in_force_phase = true;
@@ -1499,12 +1522,7 @@ esp_err_t traffic_light_manual_release(void)
 }
 
 bool traffic_light_is_manual_override(void) { return s_manual_override; }
-/* === END FIX GOST-MANUAL-CONTROL === */
 
-/* ============================================================
-   === FIX GOST-PRIORITY-GREEN ===
-   Приоритет общественного транспорта / «зелёная улица».
-   ============================================================ */
 #define PRIORITY_MAX_EXTEND_MS  60000
 
 esp_err_t traffic_light_priority_extend(uint32_t ms)
@@ -1554,4 +1572,3 @@ esp_err_t traffic_light_priority_shorten(uint32_t ms)
              (unsigned long)ms);
     return ESP_OK;
 }
-/* === END FIX GOST-PRIORITY-GREEN === */

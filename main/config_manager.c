@@ -25,10 +25,7 @@ static const char *TAG = "CFG";
 
 app_config_t g_config;
 
-/* === FIX STACK-OVERFLOW ===
-   app_config_t ≈ 7.7 КБ. На стеке main_task (3584 байт default)
-   это вызывает stack overflow → порча newlib lock → assert.
-   Выносим tmp в static + mutex. */
+/* === FIX STACK-OVERFLOW === */
 static app_config_t      s_cfg_load_tmp;
 static SemaphoreHandle_t s_cfg_load_mtx = NULL;
 
@@ -114,16 +111,14 @@ static void set_defaults_to(app_config_t *cfg)
     cfg->traffic.pedestrian.button_enabled    = true;
     cfg->traffic.pedestrian.request_mode      = PED_REQUEST_MODE_STAGE;
     cfg->traffic.pedestrian.insert_timeout_ms = 30000;
-    cfg->traffic.pedestrian.min_recall_s      = 15;   /* GOST: ≥ 15 s */
+    cfg->traffic.pedestrian.min_recall_s      = 15;
 
     cfg->traffic.pedestrian.insert_count      = 0;
     cfg->traffic.pedestrian.insert_lead_ms    = 300;
     cfg->traffic.pedestrian.insert_red_ms     = 0;
     cfg->traffic.pedestrian.return_to_hold    = true;
 
-    /* === FIX-SAFE-EXIT-CFG: пусто → fallback [red, red_yellow] === */
     cfg->traffic.pedestrian.safe_exit_count   = 0;
-    /* === END FIX-SAFE-EXIT-CFG === */
 
     cfg->traffic.hold.enabled        = false;
     cfg->traffic.hold.stage_count    = 0;
@@ -143,17 +138,11 @@ static void set_defaults_to(app_config_t *cfg)
 
     cfg->traffic.phases_ms.red          = 8000;
     cfg->traffic.phases_ms.red_yellow   = 2000;
-    /* === FIX GOST-PHASE-VALIDATION: green ≥ 20 s === */
     cfg->traffic.phases_ms.green        = 25000;
-    /* === END FIX GOST-PHASE-VALIDATION === */
     cfg->traffic.phases_ms.green_blink  = 3000;
-    /* === FIX GOST-YELLOW-DURATION: жёлтый = 3 с (ГОСТ Р 52289) === */
     cfg->traffic.phases_ms.yellow       = 3000;
-    /* === END FIX GOST-YELLOW-DURATION === */
     cfg->traffic.phases_ms.yellow_blink = 2000;
-    /* === FIX GOST-PHASE-VALIDATION: ped_green ≥ 15 s === */
     cfg->traffic.phases_ms.ped_green    = 15000;
-    /* === END FIX GOST-PHASE-VALIDATION === */
     cfg->traffic.phases_ms.ped_blink    = 4000;
     cfg->traffic.phases_ms.fault_blink_period = 500;
     cfg->traffic.phases_ms.phase_blink_period = 500;
@@ -183,27 +172,15 @@ static void set_defaults_to(app_config_t *cfg)
     cfg->traffic.sequence[3] = 4;
     cfg->traffic.sequence_count = 4;
 
-    /* === FIX GOST-CONFLICT-MATRIX: дефолтная таблица конфликтов. === */
-    {
-        const traffic_conflict_pair_t def_conflicts[] = {
-            /* напр.1 vs напр.2 */
-            {2, 5}, {2, 4}, {1, 5},
-            /* напр.1 vs дублёр */
-            {2, 8}, {2, 7}, {1, 8},
-            /* напр.2 vs дублёр */
-            {5, 8}, {5, 7}, {4, 8},
-            /* напр.4 (пешеходный) vs все транспортные зелёные */
-            {10, 2}, {10, 5}, {10, 8},
-            /* напр.4 зелёный vs транспортные жёлтые */
-            {10, 1}, {10, 4}, {10, 7},
-        };
-        int n = sizeof(def_conflicts) / sizeof(def_conflicts[0]);
-        if (n > MAX_CONFLICT_PAIRS) n = MAX_CONFLICT_PAIRS;
-        memcpy(cfg->traffic.conflicting_channels, def_conflicts,
-               n * sizeof(traffic_conflict_pair_t));
-        cfg->traffic.conflict_count = (uint8_t)n;
-    }
-    /* === END FIX GOST-CONFLICT-MATRIX === */
+    /* === FIX CONFLICT-DEFAULTS-EMPTY ===
+       Дефолтная таблица конфликтов ПУСТАЯ. Если нужна защита —
+       задавать в config.json явно. Иначе set_defaults_to заполняет
+       15 пар, и пустой [] в config.json их НЕ очищает (см. FIX
+       CONFLICT-ARRAY-RESET в parse_traffic). */
+    memset(cfg->traffic.conflicting_channels, 0,
+           sizeof(cfg->traffic.conflicting_channels));
+    cfg->traffic.conflict_count = 0;
+    /* === END FIX CONFLICT-DEFAULTS-EMPTY === */
 
     for (int i = 0; i < MAX_OUTPUTS; i++) {
         cfg->sr.outputs[i].ch = (uint8_t)i;
@@ -264,12 +241,13 @@ void config_save(void)
     nvs_close(nvs);
     if (err == ESP_OK) {
         config_cache_invalidate();
-        ESP_LOGI(TAG, "Config saved to NVS (version=%.2f, %u bytes, ped_mode=%u, "
-                      "hold=%d, insert_red_ms=%lu)",
+        ESP_LOGI(TAG, "Config saved to NVS (version=%.2f, %u bytes, "
+                      "ped_mode=%u, hold=%d, insert_red_ms=%lu, conflicts=%u)",
                  g_config.version, (unsigned)sizeof(g_config),
                  g_config.traffic.pedestrian.request_mode,
                  g_config.traffic.hold.enabled,
-                 (unsigned long)g_config.traffic.pedestrian.insert_red_ms);
+                 (unsigned long)g_config.traffic.pedestrian.insert_red_ms,
+                 g_config.traffic.conflict_count);
     } else {
         ESP_LOGE(TAG, "nvs_set_blob failed: %s", esp_err_to_name(err));
     }
@@ -486,18 +464,11 @@ static void parse_transitions(const cJSON *arr, traffic_config_t *tc)
     ESP_LOGI(TAG, "Parsed %u transitions", tc->transition_count);
 }
 
-/* ============================================================
-   === FIX GOST-PHASE-VALIDATION ===
-   Валидация длительностей сигналов по ГОСТ Р 52282 / Р 52289.
-   Возвращает true, если все значения в норме. При выходе за
-   пределы — логирует и КОРРЕКТИРУЕТ значение (clamp), чтобы
-   даже ошибочный JSON не дал опасный сигнал.
-   ============================================================ */
+/* === FIX GOST-PHASE-VALIDATION === */
 static bool validate_phase_timings(traffic_config_t *tc)
 {
     bool ok = true;
 
-    /* --- Жёлтый: 3..5 с (ГОСТ Р 52282 п. 5.6.2) --- */
     if (tc->phases_ms.yellow < 3000) {
         ESP_LOGE(TAG, "GOST: yellow=%lu < 3000 ms → clamp to 3000",
                  (unsigned long)tc->phases_ms.yellow);
@@ -508,7 +479,6 @@ static bool validate_phase_timings(traffic_config_t *tc)
         tc->phases_ms.yellow = 5000; ok = false;
     }
 
-    /* --- Красный+жёлтый: 1..2 с (ГОСТ Р 52282 п. 5.6.2) --- */
     if (tc->phases_ms.red_yellow < 1000) {
         ESP_LOGE(TAG, "GOST: red_yellow=%lu < 1000 ms → clamp to 1000",
                  (unsigned long)tc->phases_ms.red_yellow);
@@ -519,14 +489,12 @@ static bool validate_phase_timings(traffic_config_t *tc)
         tc->phases_ms.red_yellow = 2000; ok = false;
     }
 
-    /* --- Зелёный мигающий: 3 с (ГОСТ Р 52282 п. 5.6.3) --- */
     if (tc->phases_ms.green_blink < 2000) {
         ESP_LOGW(TAG, "GOST: green_blink=%lu < 2000 ms → clamp to 3000",
                  (unsigned long)tc->phases_ms.green_blink);
         tc->phases_ms.green_blink = 3000; ok = false;
     }
 
-    /* --- Частота мигания: 1 Гц ± 10% → период 450..550 мс --- */
     if (tc->phases_ms.phase_blink_period < 450 ||
         tc->phases_ms.phase_blink_period > 550) {
         ESP_LOGW(TAG, "GOST: phase_blink_period=%lu ms → clamp to 500 ms "
@@ -535,7 +503,6 @@ static bool validate_phase_timings(traffic_config_t *tc)
         tc->phases_ms.phase_blink_period = 500; ok = false;
     }
 
-    /* --- Минимальный транспортный зелёный: ≥ 20 с (ГОСТ Р 52289 п. 4.4.4) --- */
     if (tc->phases_ms.green < 20000) {
         ESP_LOGE(TAG, "GOST: green=%lu < 20000 ms → clamp to 20000 "
                       "(ГОСТ Р 52289 п. 4.4.4)",
@@ -543,7 +510,6 @@ static bool validate_phase_timings(traffic_config_t *tc)
         tc->phases_ms.green = 20000; ok = false;
     }
 
-    /* --- Минимальный пешеходный зелёный: ≥ 15 с (ГОСТ Р 52289 п. 4.4.5) --- */
     if (tc->phases_ms.ped_green < 15000) {
         ESP_LOGE(TAG, "GOST: ped_green=%lu < 15000 ms → clamp to 15000 "
                       "(ГОСТ Р 52289 п. 4.4.5)",
@@ -551,7 +517,6 @@ static bool validate_phase_timings(traffic_config_t *tc)
         tc->phases_ms.ped_green = 15000; ok = false;
     }
 
-    /* --- Пешеходный мигающий: 3..5 с (ГОСТ Р 52289 п. 4.4.5.2) --- */
     if (tc->phases_ms.ped_blink < 3000) {
         ESP_LOGW(TAG, "GOST: ped_blink=%lu < 3000 ms → clamp to 3000",
                  (unsigned long)tc->phases_ms.ped_blink);
@@ -562,7 +527,6 @@ static bool validate_phase_timings(traffic_config_t *tc)
         tc->phases_ms.ped_blink = 5000; ok = false;
     }
 
-    /* --- min_recall_s для пешеходов: ≥ 15 с (ГОСТ Р 52289 п. 4.4.5) --- */
     if (tc->pedestrian.min_recall_s < 15) {
         ESP_LOGW(TAG, "GOST: ped min_recall_s=%lu < 15 s → clamp to 15",
                  (unsigned long)tc->pedestrian.min_recall_s);
@@ -573,9 +537,6 @@ static bool validate_phase_timings(traffic_config_t *tc)
 }
 /* === END FIX GOST-PHASE-VALIDATION === */
 
-/* ============================================================
-   parse_pedestrian — добавить парсинг safe_exit_sequence.
-   ============================================================ */
 static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
 {
     const cJSON *ped = cJSON_GetObjectItemCaseSensitive(t, "pedestrian");
@@ -624,7 +585,6 @@ static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
         }
     }
 
-    /* === FIX-SAFE-EXIT-CFG: safe_exit_sequence === */
     tc->pedestrian.safe_exit_count = 0;
     const cJSON *ses = cJSON_GetObjectItemCaseSensitive(ped, "safe_exit_sequence");
     if (cJSON_IsArray(ses)) {
@@ -637,7 +597,6 @@ static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
             }
         }
     }
-    /* === END FIX-SAFE-EXIT-CFG === */
 
     ESP_LOGI(TAG, "pedestrian: button=%d mode=%u insert=%lu min_recall=%lu "
                   "insert_seq=%u lead=%lu red=%lu return_hold=%d safe_exit=%u",
@@ -784,8 +743,7 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
         }
     }
 
-    /* === FIX GOST-ALL-RED: валидация sequence.
-       Между двумя транспортными зелёными должна быть all-red стадия. */
+    /* === FIX GOST-ALL-RED === */
     if (tc->sequence_count >= 2) {
         int green_adjacent = 0;
         for (int i = 0; i < tc->sequence_count; i++) {
@@ -817,8 +775,15 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
     }
     /* === END FIX GOST-ALL-RED === */
 
-    /* === FIX GOST-CONFLICT-MATRIX: парсинг "conflicting_channels": [[a,b], ...] === */
+    /* === FIX CONFLICT-ARRAY-RESET ===
+       set_defaults_to() НЕ заполняет conflicting_channels (см. FIX
+       CONFLICT-DEFAULTS-EMPTY). Но для надёжности всё равно memset —
+       если дефолты когда-то вернут, пустой [] не оставит их. */
     tc->conflict_count = 0;
+    memset(tc->conflicting_channels, 0,
+           sizeof(tc->conflicting_channels));
+    /* === END FIX CONFLICT-ARRAY-RESET === */
+
     const cJSON *conf = cJSON_GetObjectItemCaseSensitive(t, "conflicting_channels");
     if (cJSON_IsArray(conf)) {
         const cJSON *pair = NULL;
@@ -841,7 +806,6 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
     } else {
         ESP_LOGI(TAG, "conflicting_channels missing → no software protection");
     }
-    /* === END FIX GOST-CONFLICT-MATRIX === */
 
     if (tc->hold.enabled) {
         if (tc->hold.stage_count == 0) {
@@ -875,9 +839,7 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
         }
     }
 
-    /* === FIX GOST-PHASE-VALIDATION: clamp длительностей === */
     validate_phase_timings(tc);
-    /* === END FIX GOST-PHASE-VALIDATION === */
 }
 
 static void parse_signal_groups(const cJSON *sg) { (void)sg; }
@@ -891,7 +853,6 @@ static void parse_modules(const cJSON *m)          { (void)m; }
 
 /* ============================================================
    config_load_json (FULL)
-   === FIX STACK-OVERFLOW: static tmp + mutex ===
    ============================================================ */
 bool config_load_json(const char *json, size_t len)
 {
@@ -1075,10 +1036,7 @@ static const char *hold_on_ped_to_str(uint8_t m)
     }
 }
 
-/* ============================================================
-   config_export_json — сериализовать safe_exit_sequence
-   + conflicting_channels (FIX GOST-CONFLICT-MATRIX).
-   ============================================================ */
+/* ============================================================ */
 bool config_export_json(char *buf, size_t *len)
 {
     if (!buf || !len || *len < 256) return false;
@@ -1284,7 +1242,6 @@ bool config_export_json(char *buf, size_t *len)
                 cJSON_AddItemToArray(seq, cJSON_CreateNumber(g_config.traffic.sequence[i]));
         }
 
-        /* === FIX GOST-CONFLICT-MATRIX === */
         cJSON *conf = cJSON_AddArrayToObject(t, "conflicting_channels");
         if (conf) {
             for (int i = 0; i < g_config.traffic.conflict_count; i++) {
@@ -1296,7 +1253,6 @@ bool config_export_json(char *buf, size_t *len)
                 cJSON_AddItemToArray(conf, pair);
             }
         }
-        /* === END FIX GOST-CONFLICT-MATRIX === */
 
         cJSON *tr = cJSON_AddArrayToObject(t, "transitions");
         if (tr) {
@@ -1341,14 +1297,12 @@ bool config_export_json(char *buf, size_t *len)
     s_cfg_json_len = n;
     free(out);
 
-    ESP_LOGI(TAG, "config_export_json: OK (%u bytes, cached)", (unsigned)n);
+    ESP_LOGI(TAG, "config_export_json: OK (%u bytes, conflicts=%u)",
+             (unsigned)n, g_config.traffic.conflict_count);
     return true;
 }
 
-/* ============================================================
-   config_export_lora_json — расширенный формат "ped"
-   + "cf" (conflict pairs flat).
-   ============================================================ */
+/* ============================================================ */
 bool config_export_lora_json(char *buf, size_t *len)
 {
     if (!buf || !len || *len < 256) return false;
@@ -1493,7 +1447,6 @@ bool config_export_lora_json(char *buf, size_t *len)
                 cJSON_AddItemToArray(seq, cJSON_CreateNumber(g_config.traffic.sequence[i]));
         }
 
-        /* === FIX GOST-CONFLICT-MATRIX: flat array [a1,b1,a2,b2,...] === */
         cJSON *cf = cJSON_AddArrayToObject(t, "cf");
         if (cf) {
             for (int i = 0; i < g_config.traffic.conflict_count; i++) {
@@ -1503,7 +1456,6 @@ bool config_export_lora_json(char *buf, size_t *len)
                     cJSON_CreateNumber(g_config.traffic.conflicting_channels[i].b));
             }
         }
-        /* === END FIX GOST-CONFLICT-MATRIX === */
 
         cJSON *tr = cJSON_AddArrayToObject(t, "tr");
         if (tr) {
@@ -1545,13 +1497,14 @@ bool config_export_lora_json(char *buf, size_t *len)
     *len = n;
     free(out);
 
-    ESP_LOGI(TAG, "config_export_lora_json: OK (%u bytes)", (unsigned)n);
+    ESP_LOGI(TAG, "config_export_lora_json: OK (%u bytes, cf=%u pairs)",
+             (unsigned)n, g_config.traffic.conflict_count);
     return true;
 }
 
 /* ============================================================
    config_load_lora_json — парсинг "ped" + "cf"
-   + GOST-PHASE-VALIDATION.
+   === FIX CONFLICT-ARRAY-RESET-LORA ===
    ============================================================ */
 bool config_load_lora_json(const char *json, size_t len)
 {
@@ -1794,13 +1747,17 @@ bool config_load_lora_json(const char *json, size_t len)
             }
         }
 
-        /* === FIX GOST-CONFLICT-MATRIX === */
+        /* === FIX CONFLICT-ARRAY-RESET-LORA === */
+        tc->conflict_count = 0;
+        memset(tc->conflicting_channels, 0,
+               sizeof(tc->conflicting_channels));
+        /* === END FIX CONFLICT-ARRAY-RESET-LORA === */
+
         const cJSON *cf = cJSON_GetObjectItemCaseSensitive(t, "cf");
         if (cJSON_IsArray(cf)) {
             int n = cJSON_GetArraySize(cf);
             int pairs = n / 2;
             if (pairs > MAX_CONFLICT_PAIRS) pairs = MAX_CONFLICT_PAIRS;
-            tc->conflict_count = 0;
             for (int i = 0; i < pairs; i++) {
                 const cJSON *ca = cJSON_GetArrayItem(cf, i * 2);
                 const cJSON *cb = cJSON_GetArrayItem(cf, i * 2 + 1);
@@ -1811,8 +1768,8 @@ bool config_load_lora_json(const char *json, size_t len)
                 tc->conflicting_channels[tc->conflict_count].b = (uint8_t)b;
                 tc->conflict_count++;
             }
+            ESP_LOGI(TAG, "lora_json: cf parsed: %u pairs", tc->conflict_count);
         }
-        /* === END FIX GOST-CONFLICT-MATRIX === */
 
         const cJSON *tr = cJSON_GetObjectItemCaseSensitive(t, "tr");
         if (cJSON_IsArray(tr)) {
@@ -1857,9 +1814,7 @@ bool config_load_lora_json(const char *json, size_t len)
         tmp->traffic.sequence_count = tmp->traffic.stage_count;
     }
 
-    /* === FIX GOST-PHASE-VALIDATION: NODE тоже валидирует CFG от ROOT === */
     validate_phase_timings(&tmp->traffic);
-    /* === END FIX GOST-PHASE-VALIDATION === */
 
     g_config = *tmp;
     config_save();

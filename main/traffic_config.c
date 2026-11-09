@@ -1,35 +1,18 @@
 /* ============================================================
    traffic_config.c — data-driven helpers.
 
-   === FIX NODE-BLINK-AND-ON ===
-       apply_stage_dd() сначала выключает ВСЕ каналы (active
-       mask), потом включает outputs_on.
+   === FIX APPLY-MASK-FOLLOW-ROOT ===
+       apply_stage_dd для NODE в follow_root НЕ применяет маску
+       по stage_dd — только set_all_off. ROOT пришлёт sync: с
+       маской. Это защита от CONFLICT на NODE, даже если
+       stage_dd в конфиге противоречив.
 
-   === FIX INSERT-NO-DOUBLE-SYNC ===
-       apply_stage_dd не дёргает s_phase_change_cb, если
-       s_in_force_phase == true (вызывающий сам отправит sync:).
-       Используется в traffic_light_force_phase и в insert-блоке.
+   === FIX CONFLICT-LOG-ONCE ===
+       Лог CONFLICT не спамит — не чаще 1 раза в 5 с на стадию.
 
-   === FIX PED-BLINK-MASK ===
-       apply_stage_dd устанавливает s_blink_mask ДО вызова
-       s_phase_change_cb. Для PED-фазы с мигающим зелёным
-       (stage id=7) blink_mask = outputs_blink. ROOT должен
-       blink-ать так же, как NODE.
-
-   === FIX GOST-RED-YELLOW-LIMIT ===
-       stage_duration_ms() жёстко ограничивает длительность
-       фазы «красный+жёлтый» 2000 мс (ГОСТ Р 52289).
-
-   === FIX GOST-CONFLICT-MATRIX ===
-       traffic_mask_has_conflict() — проверка маски фазы по
-       таблице conflicting_channels. apply_stage_dd() гасит
-       все каналы и не включает конфликтующую пару, если
-       конфиг ошибочный.
-
-   === FIX GOST-ALL-RED ===
-       need_virtual_all_red() — определяет необходимость
-       вставки виртуальной all-red фазы при переходе между
-       двумя транспортными зелёными без промежуточного red.
+   Остальные FIX сохранены: GOST-RED-YELLOW-LIMIT,
+   GOST-CONFLICT-MATRIX, GOST-ALL-RED, PED-BLINK-MASK,
+   INSERT-NO-DOUBLE-SYNC.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -89,15 +72,7 @@ uint8_t next_phase_smooth_ped(uint8_t cur_seq)
     return (cur_seq + 1) % g_config.traffic.sequence_count;
 }
 
-/* ============================================================
-   stage_duration_ms
-
-   === FIX GOST-RED-YELLOW-LIMIT ===
-   ГОСТ Р 52289: длительность сигнала «красный с жёлтым»
-   не должна превышать 2 с. Жёсткий потолок — даже если
-   в конфиге/CFG пришло больше. Логируем (не чаще 1 раза
-   в 5 с), чтобы было видно расхождение в логах.
-   ============================================================ */
+/* === FIX GOST-RED-YELLOW-LIMIT === */
 uint32_t stage_duration_ms(uint8_t seq_idx)
 {
     if (seq_idx >= g_config.traffic.sequence_count) return 1000;
@@ -118,7 +93,6 @@ uint32_t stage_duration_ms(uint8_t seq_idx)
     default:                  dur = st->duration_ms;                         break;
     }
 
-    /* === FIX GOST-RED-YELLOW-LIMIT: жёсткий потолок 2000 мс === */
     if (st->duration_kind == DD_DUR_RED_YELLOW && dur > 2000) {
         static uint32_t s_last_warn_ms = 0;
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -130,7 +104,6 @@ uint32_t stage_duration_ms(uint8_t seq_idx)
         }
         dur = 2000;
     }
-    /* === END FIX GOST-RED-YELLOW-LIMIT === */
 
     return dur;
 }
@@ -178,19 +151,7 @@ void set_all_off(void)
     for (int i = 0; i < 16; i++) sr_output_off(i);
 }
 
-/* ============================================================
-   traffic_mask_has_conflict
-
-   === FIX GOST-CONFLICT-MATRIX ===
-   Проверяет маску on_mask по таблице conflicting_channels.
-   Возвращает true, если есть ХОТЯ БЫ ОДНА конфликтующая пара,
-   у которой ОБА канала включены.
-
-   Используется в apply_stage_dd() ДО подачи сигналов: если
-   конфиг ошибочный (например, зелёные двух конфликтующих
-   направлений в одной фазе), каналы не включаются вообще —
-   лучше тёмный светофор, чем конфликтующий зелёный.
-   ============================================================ */
+/* === FIX GOST-CONFLICT-MATRIX === */
 bool traffic_mask_has_conflict(uint16_t on_mask)
 {
     if (g_config.traffic.conflict_count == 0) return false;
@@ -206,24 +167,8 @@ bool traffic_mask_has_conflict(uint16_t on_mask)
     }
     return conflict;
 }
-/* === END FIX GOST-CONFLICT-MATRIX === */
 
-/* ============================================================
-   need_virtual_all_red
-
-   === FIX GOST-ALL-RED ===
-   Возвращает true, если переход from_seq → to_seq требует
-   вставки виртуальной all-red фазы:
-     - from_seq — транспортный зелёный (DD_DUR_GREEN или
-       DD_DUR_GREEN_BLINK), И
-     - to_seq   — транспортный зелёный (то же), И
-     - в sequence между ними НЕТ стадии с duration_kind ==
-       DD_DUR_RED (all-red).
-
-   Если между двумя зелёными нет red-фазы, traffic_light.c
-   вставит «виртуальную» all-red длительностью ALL_RED_MIN_MS
-   перед включением to_seq.
-   ============================================================ */
+/* === FIX GOST-ALL-RED === */
 bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq)
 {
     if (from_seq == to_seq) return false;
@@ -240,8 +185,6 @@ bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq)
                s2->duration_kind == DD_DUR_GREEN_BLINK);
     if (!g1 || !g2) return false;
 
-    /* Идём по sequence от from_seq+1 до to_seq-1 (в циклическом
-       порядке) и ищем стадию DD_DUR_RED. */
     int steps = (to_seq > from_seq)
                     ? (to_seq - from_seq)
                     : (to_seq + g_config.traffic.sequence_count - from_seq);
@@ -250,7 +193,6 @@ bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq)
         const traffic_stage_dd_t *st = find_stage(g_config.traffic.sequence[idx]);
         if (!st) continue;
         if (st->duration_kind == DD_DUR_RED) {
-            /* Нашли all-red между зелёными → вставка не нужна. */
             return false;
         }
     }
@@ -260,29 +202,18 @@ bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq)
                   "(GOST Р 52289)", from_seq, to_seq);
     return true;
 }
-/* === END FIX GOST-ALL-RED === */
 
 /* ============================================================
    apply_stage_dd
 
-   === FIX PED-BLINK-MASK ===
-   blink_mask вычисляется и сохраняется в s_blink_mask ДО
-   вызова s_phase_change_cb. Для PED-фазы (stage id=7)
-   blink_mask = outputs_blink = [ped_green], ROOT начинает
-   мигать сразу (первый тик через phase_blink_period).
-   Раньше ROOT применял blink_mask, но s_phase_change_cb
-   вызывался до того, как blink-логика в traffic_task_loop
-   успевала запуститься — на практике blink_mask был 0
-   в момент cb. Теперь blink_mask гарантированно установлен.
+   === FIX APPLY-MASK-FOLLOW-ROOT ===
+       Для NODE в follow_root НЕ применяем маску по stage_dd —
+       только set_all_off. ROOT пришлёт sync: с маской.
+       Это защита от CONFLICT на NODE, даже если stage_dd
+       в конфиге противоречив (тестовый стенд MESH).
 
-   === FIX INSERT-NO-DOUBLE-SYNC ===
-   не дёргаем cb, если вызывающий сам отправит sync:.
-
-   === FIX GOST-CONFLICT-MATRIX ===
-   Если маска фазы содержит конфликтующую пару (оба канала
-   из conflicting_channels включены), НЕ включаем ничего —
-   set_all_off() и return. Лучше тёмный светофор, чем
-   конфликтующий зелёный.
+   === FIX CONFLICT-LOG-ONCE ===
+       Лог CONFLICT не спамит — не чаще 1 раза в 5 с на стадию.
    ============================================================ */
 void apply_stage_dd(uint8_t seq_idx)
 {
@@ -293,23 +224,42 @@ void apply_stage_dd(uint8_t seq_idx)
         return;
     }
 
-    /* === FIX GOST-CONFLICT-MATRIX: проверяем маску фазы ДО подачи
-       сигналов. Если конфиг ошибочный — не включаем НИЧЕГО. === */
+    /* === FIX APPLY-MASK-FOLLOW-ROOT ===
+       NODE в follow_root не применяет stage_dd — ждёт sync: от ROOT.
+       Это защита от CONFLICT, даже если stage_dd в конфиге противоречив. */
+    if (s_follow_root) {
+        set_all_off();
+        s_blink_mask = 0;
+        s_blink_on = false;
+        s_blink_last_phase = 0;
+        ESP_LOGD(TAG, "apply_stage_dd: NODE follow_root → all off "
+                      "(wait sync:)");
+        return;
+    }
+    /* === END FIX APPLY-MASK-FOLLOW-ROOT === */
+
     uint16_t will_be_on = 0;
     for (int i = 0; i < st->on_count; i++)
         will_be_on |= (1u << st->outputs_on[i]);
 
     if (traffic_mask_has_conflict(will_be_on)) {
-        ESP_LOGE(TAG, "Stage id=%u (seq=%u) has conflicting mask 0x%04X "
-                      "→ forcing ALL_OFF (GOST Р 52289)",
-                 st->id, seq_idx, (unsigned)will_be_on);
+        /* === FIX CONFLICT-LOG-ONCE: не спамим === */
+        static uint32_t s_last_conflict_warn_ms = 0;
+        uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (s_last_conflict_warn_ms == 0 ||
+            (now - s_last_conflict_warn_ms) > 5000) {
+            s_last_conflict_warn_ms = now;
+            ESP_LOGE(TAG, "Stage id=%u (seq=%u) has conflicting mask 0x%04X "
+                          "→ forcing ALL_OFF (GOST Р 52289)",
+                     st->id, seq_idx, (unsigned)will_be_on);
+        }
+        /* === END FIX CONFLICT-LOG-ONCE === */
         set_all_off();
         s_blink_mask = 0;
         s_blink_on = false;
         s_blink_last_phase = 0;
         return;
     }
-    /* === END FIX GOST-CONFLICT-MATRIX === */
 
     uint16_t active = traffic_light_active_sr_mask_internal();
     for (int ch = 0; ch < 16; ch++) {
@@ -328,9 +278,7 @@ void apply_stage_dd(uint8_t seq_idx)
     }
     blink_mask &= ~on_mask;
 
-    /* === FIX PED-BLINK-MASK: устанавливаем s_blink_mask ДО cb,
-       чтобы при следующей итерации traffic_task_loop blink
-       гарантированно стартовал (в т.ч. для PED blink). === */
+    /* === FIX PED-BLINK-MASK === */
     s_blink_mask = blink_mask;
     s_blink_on = false;
     s_blink_last_phase = 0;
@@ -343,8 +291,7 @@ void apply_stage_dd(uint8_t seq_idx)
              (unsigned)on_mask, (unsigned)blink_mask,
              stage_is_pedestrian(seq_idx) ? " (PED)" : "");
 
-    /* === FIX INSERT-NO-DOUBLE-SYNC: не дёргаем cb, если вызывающий
-       сам отправит sync: (force_phase / insert). === */
+    /* === FIX INSERT-NO-DOUBLE-SYNC === */
     if (!s_follow_root && s_phase_change_cb && !s_in_force_phase) {
         s_phase_change_cb(seq_idx, dur);
     }
