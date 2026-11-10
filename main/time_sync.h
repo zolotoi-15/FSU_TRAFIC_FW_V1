@@ -1,32 +1,34 @@
+/* ============================================================
+   sync_config.h — общие константы синхронизации ROOT/NODE.
+
+   === FIX SYNC-LEAD-CONSISTENT ===
+   Раньше SYNC_LEAD_MS был разным в root_wd.c (500),
+   mqtt_apply.c (700) и node_proto.c (300). ROOT и NODE
+   применяли фазу с разной задержкой → рассинхрон светофоров.
+   Теперь единая константа для всех модулей.
+
+   === FIX SYNC-INTERVAL-1S ===
+   LORA_SYNC_INTERVAL_MS было 3000 → 1000. Окно несинхронности
+   при потере c: сокращается с 3 с до 1 с. Трафик: 29 байт/с
+   (ToA ~112 мс SF9/BW250) ≈ 11% эфира — приемлемо.
+   ============================================================ */
 #pragma once
-#include "esp_err.h"
-#include <stdint.h>
-#include <stdbool.h>
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/* Задержка между отправкой sync: и моментом применения фазы
+   на NODE. Должна покрывать: LoRa ToA (~112 мс SF9/BW250) +
+   FRAG_GAP_MS (250 мс) + запас на джиттер. */
+#define SYNC_LEAD_MS        250
 
-esp_err_t time_sync_init(void);
-bool time_sync_get(uint32_t *unix_sec, uint16_t *ms);
-void time_sync_set(uint32_t unix_sec, uint16_t ms, uint32_t rtt_us);
-esp_err_t time_sync_start_sntp(void);
-void time_sync_node_report(void);
+/* Минимальный интервал между двумя sync: с одинаковой фазой
+   (защита от дублей). */
+#define SYNC_MIN_INTERVAL_MS  250
 
-/* === FIX UTC: обычный push с 30-секундным троттлингом === */
-void time_sync_root_push(uint32_t rtt_us);
+/* Период push time: (ROOT → NODE). */
+#define TIME_PUSH_PERIOD_MS   30000
 
-/* === FIX TIME-FIRST: force=true обходит троттлинг.
-   Используется при первом sync: после старта NODE,
-   чтобы NODE получил time: до первого sync:. === */
-void time_sync_root_push_force(uint32_t rtt_us);
+/* Период hold-resync (ROOT повторяет sync: пока NODE в hold). */
+#define HOLD_RESYNC_INTERVAL_MS  500
 
-/* === FIX #3a: дельта ROOT/NODE (по последнему sync:) === */
-void     time_sync_note_delta_ms(int32_t delta_ms);
-int32_t  time_sync_get_delta_ms(void);
-uint32_t time_sync_get_delta_age_ms(void);   /* для диагностики */
-/* === END FIX #3a === */
-
-#ifdef __cplusplus
-}
-#endif
+/* Период полного sync: (ROOT → NODE) в обычном режиме.
+   === FIX SYNC-INTERVAL-1S: 3000 → 1000 === */
+#define LORA_SYNC_INTERVAL_MS    1000

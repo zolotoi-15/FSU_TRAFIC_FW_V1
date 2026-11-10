@@ -2,7 +2,7 @@
   "meta": {
     "version": 1.0,
     "id": 5555,
-    "name": "Тестовая мастерская — 2 направления + дублёр + пешеход (MESH)"
+    "name": "Тестовая мастерская — 2 направления + дублёр + пешеход (MESH, плавные переходы)"
   },
 
   "wifi": {
@@ -20,111 +20,6 @@
     "password": "LTHNW22D",
     "base_topic": "FSU_Trafic",
     "timepause_min": 5
-  },
-
-  "signalGroups": {
-    "default": {
-      "amber": 3,
-      "amberBlink": 4,
-      "greenBlink": 3,
-      "minGreen": 4,
-      "minRed": 3,
-      "redAmber": 2
-    },
-    "items": [
-      { "id": 1, "name": "Направление 1",        "type": "traffic" },
-      { "id": 2, "name": "Направление 2",        "type": "traffic" },
-      { "id": 3, "name": "Дублёр (напр. 3)",     "type": "traffic", "minRed": 1 },
-      { "id": 4, "name": "Пешеходный (напр. 4)", "type": "pedestrian", "minRed": 1 }
-    ]
-  },
-
-  "IGM": [
-    {
-      "id": 1,
-      "name": "Матрица. 1",
-      "safety": true,
-      "default": true,
-      "items": [
-        { "clearing": 1, "entering": 2, "time": 6.00 },
-        { "clearing": 1, "entering": 3, "time": 6.00 },
-        { "clearing": 1, "entering": 4, "time": 4.00 },
-        { "clearing": 2, "entering": 1, "time": 6.00 },
-        { "clearing": 2, "entering": 3, "time": 6.00 },
-        { "clearing": 2, "entering": 4, "time": 4.00 },
-        { "clearing": 3, "entering": 1, "time": 4.00 },
-        { "clearing": 3, "entering": 2, "time": 4.00 },
-        { "clearing": 3, "entering": 4, "time": 4.00 },
-        { "clearing": 4, "entering": 1, "time": 3.00 },
-        { "clearing": 4, "entering": 2, "time": 3.00 },
-        { "clearing": 4, "entering": 3, "time": 3.00 }
-      ]
-    }
-  ],
-
-  "stages": [
-    { "id": 1, "name": "Фаза.1 (все красные)",       "groups": [1, 2, 3] },
-    { "id": 2, "name": "Фаза.2 (все зелёные)",       "groups": [1, 2, 3] },
-    { "id": 3, "name": "Фаза.3 (все жёлтые)",        "groups": [1, 2, 3] },
-    { "id": 4, "name": "Фаза.4 (пешеходный)",         "groups": [4] }
-  ],
-
-  "plans": [
-    { "id": 2, "name": "Программа.2", "algorithm": { "type": "Special", "mode": "AB" } },
-    {
-      "id": 1,
-      "name": "Программа.1",
-      "algorithm": {
-        "type": "StageRing",
-        "matrix": 1,
-        "sequence": [1, 2, 3, 4],
-        "coordinated": false,
-        "phases": [
-          { "id": 1, "stage": 1, "recall": "min", "passage": 3, "minGreen": 15, "maxGreen": 15 },
-          { "id": 2, "stage": 2, "recall": "min", "passage": 3, "minGreen": 15, "maxGreen": 15 },
-          { "id": 3, "stage": 3, "recall": "min", "passage": 3, "minGreen": 15, "maxGreen": 15 },
-          { "id": 4, "stage": 4, "recall": "min", "minGreen": 15, "maxGreen": 15 }
-        ],
-        "conditions": [
-          { "phase": 1, "control": true, "detector": 1 }
-        ]
-      }
-    }
-  ],
-
-  "schedule": {
-    "days": [
-      { "id": 1, "plans": [ { "plan": 1, "time": "0:0:0", "sparePlan": 2 } ] }
-    ],
-    "weeks": [
-      { "id": 1, "days": [1, 1, 1, 1, 1, 1, 1] }
-    ]
-  },
-
-  "modules": {
-    "SystemBus": {
-      "devices": {
-        "KSK1": {
-          "switches": {
-            "default": { "type": "SP2_SW4" },
-            "items": [
-              { "id": 1,  "name": "1-1",  "addr": 0,  "signalGroup": 1, "control": true,  "heads": 1, "color": "red" },
-              { "id": 2,  "name": "1-2",  "addr": 1,  "signalGroup": 1, "control": false, "heads": 1, "color": "amber" },
-              { "id": 3,  "name": "1-3",  "addr": 2,  "signalGroup": 1, "control": false, "heads": 1, "color": "green" },
-              { "id": 4,  "name": "1-4",  "addr": 3,  "signalGroup": 2, "control": true,  "heads": 1, "color": "red" },
-              { "id": 5,  "name": "1-5",  "addr": 4,  "signalGroup": 2, "control": false, "heads": 1, "color": "amber" },
-              { "id": 6,  "name": "1-6",  "addr": 5,  "signalGroup": 2, "control": false, "heads": 1, "color": "green" },
-              { "id": 7,  "name": "1-7",  "addr": 6,  "signalGroup": 3, "control": true,  "heads": 1, "color": "red" },
-              { "id": 8,  "name": "1-8",  "addr": 7,  "signalGroup": 3, "control": false, "heads": 1, "color": "amber" },
-              { "id": 9,  "name": "1-9",  "addr": 8,  "signalGroup": 3, "control": false, "heads": 1, "color": "green" },
-              { "id": 10, "name": "1-10", "addr": 9,  "signalGroup": 4, "control": true,  "heads": 1, "color": "red" },
-              { "id": 11, "name": "1-11", "addr": 10, "signalGroup": 4, "control": false, "heads": 1, "color": "green" },
-              { "id": 12, "name": "1-12", "addr": 11, "signalGroup": 4, "control": false, "heads": 1, "color": "screen_walk" }
-            ]
-          }
-        }
-      }
-    }
   },
 
   "traffic": {
@@ -165,7 +60,7 @@
       "imin_mv": 10,
       "vin_on_min_v": 5.0,
       "vin_off_min_v": 5.0,
-      "phase_grace_ms": 2500,
+      "phase_grace_ms": 30000,
       "recovery_ms": 2000,
       "vin_off_confirmations": 3
     },
@@ -173,7 +68,7 @@
     "hold": {
       "enabled": true,
       "stage_ids": [3],
-      "max_hold_ms": 60000,
+      "max_hold_ms": 0,
       "on_ped_request": "insert"
     },
 
@@ -182,9 +77,9 @@
       "request_mode": "insert",
       "insert_timeout_ms": 30000,
       "min_recall_s": 15,
-      "insert_sequence": [3, 5, 1, 6, 7],
-      "insert_lead_ms": 100,
-      "insert_red_ms": 0,
+      "insert_sequence": [4, 5, 1, 6, 7],
+      "insert_lead_ms": 10000,
+      "insert_red_ms": 3000,
       "return_to_hold": true,
       "safe_exit_sequence": [1, 2]
     },
@@ -192,7 +87,7 @@
     "stages_dd": [
       {
         "id": 1,
-        "name": "Фаза.1 (все красные: напр.1+2+дублёр+пешеход)",
+        "name": "Фаза.1 (все красные)",
         "groups": [1],
         "duration_kind": "red",
         "outputs_on": [0, 3, 6, 9],
@@ -200,7 +95,7 @@
       },
       {
         "id": 2,
-        "name": "Фаза.2 (все красный+жёлтый: напр.1+2+дублёр)",
+        "name": "Фаза.2 (красный+жёлтый)",
         "groups": [2],
         "duration_kind": "red_yellow",
         "outputs_on": [0, 1, 3, 4, 6, 7, 9],
@@ -208,7 +103,7 @@
       },
       {
         "id": 3,
-        "name": "Фаза.3 (все зелёные: напр.1+2+дублёр)",
+        "name": "Фаза.3 (зелёные — hold)",
         "groups": [3],
         "duration_kind": "green",
         "outputs_on": [2, 5, 8, 9],
@@ -216,7 +111,7 @@
       },
       {
         "id": 4,
-        "name": "Фаза.4 (все зелёные мигающие: напр.1+2+дублёр)",
+        "name": "Фаза.4 (зелёные мигающие)",
         "groups": [4],
         "duration_kind": "green_blink",
         "outputs_on": [9],
@@ -224,7 +119,7 @@
       },
       {
         "id": 5,
-        "name": "Фаза.5 (все жёлтые: напр.1+2+дублёр)",
+        "name": "Фаза.5 (все жёлтые)",
         "groups": [5],
         "duration_kind": "yellow",
         "outputs_on": [1, 4, 7, 9],
@@ -248,18 +143,14 @@
       }
     ],
 
-    "sequence": [1, 2, 3, 4, 5, 6, 7],
+    "sequence": [3, 4, 5, 1, 2, 6, 7, 1, 2],
 
-    /* === FIX TEST-STAND-MESH ===
-       Тестовый стенд: 3 «направления» (напр.1, напр.2, дублёр) —
-       это ОДИН физический светофор с одним зелёным сигналом,
-       продублированным на 3 выхода (2, 5, 8). Они ДОЛЖНЫ
-       гореть одновременно.
-       Поэтому таблица конфликтов ПУСТАЯ.
-       Для реального перекрёстка — разбить stage_dd на отдельные
-       фазы и заполнить conflicting_channels.
-       === END FIX TEST-STAND-MESH === */
-    "conflicting_channels": [],
+    "conflicting_channels": [
+      [2, 11],
+      [5, 11],
+      [8, 11],
+      [11, 10]
+    ],
 
     "transitions": [
       { "clearing": 1, "entering": 2, "time": 6.00 },

@@ -1,21 +1,11 @@
 /* ============================================================
    blink_example_main.c — PRODUCTION app_main().
 
-   === FIX CFG-FALLBACK ===
-       После config_init() проверяем, что g_config реально
-       содержит sequence/stages. Если нет — принудительно
-       грузим embedded config.json (страховка от пустого NVS
-       + сбой парсинга в load_embedded_config_if_needed).
-       Раньше NODE мог остаться с дефолтными stage_dd,
-       которые конфликтуют сами с собой (recovery-loop).
-
-   === FIX: apply_pending_cfg_from_nvs НЕ стирает pending при
-       ошибке парсинга.
-   === LINK LOSS: 5 пропущенных пакетов подряд → связь потеряна.
-   === FIX C: LINK_*_EXPECT_MS с запасом над реальными периодами.
-   === FIX time-log: периодический лог дельты времени NODE vs ROOT.
-   === FIX MQTT-NO-IP: on_got_ip проверяет modem_ppp_is_connected().
-   === FIX STACK-OVERFLOW: cfg_load в отдельной задаче (24 КБ).
+   === FIX LINK-LOSS-SMART ===
+       link_monitor_task: счётчик пропусков инкрементится ТОЛЬКО
+       если в окне LINK_*_EXPECT_MS реально не было пакета.
+       Раньше счётчик рос слепо по таймеру и ложно срабатывал
+       (has_node=0 при живом NODE).
    ============================================================ */
 
 #include <stdio.h>
@@ -68,14 +58,10 @@ static const char *TAG = "board";
 #define NVS_KEY_CHUNK    "chunk_%d"
 #define PENDING_CHUNK_SZ 4096
 
-/* === FIX C: LINK LOSS: период ожидания БОЛЬШЕ реального периода === */
 #define LINK_ROOT_EXPECT_MS   15000
 #define LINK_NODE_EXPECT_MS   15000
-/* === END FIX C === */
 
-/* === FIX STACK-OVERFLOW: стек задачи cfg_load === */
 #define CFG_LOAD_TASK_STACK   24576
-/* === END FIX STACK-OVERFLOW === */
 
 ds1307_handle_t rtc_handle = NULL;
 
@@ -89,10 +75,8 @@ volatile int32_t  s_rtt_samples      = 0;
 volatile uint32_t s_last_node_msg_ms    = 0;
 volatile uint32_t s_last_fault_clear_ms = 0;
 
-/* === LINK LOSS: счётчики пропусков === */
 volatile uint8_t s_root_missed_status = 0;
 volatile uint8_t s_node_missed_ping   = 0;
-/* === END LINK LOSS === */
 
 int32_t  blink_get_rtt_samples(void)  { return s_rtt_samples; }
 uint32_t blink_get_rtt_us(void)       { return s_rtt_us; }
@@ -116,6 +100,10 @@ void link_monitor_note_ping_rx(void)   { s_node_missed_ping   = 0; }
 bool link_monitor_root_lost(void) { return s_root_missed_status >= LINK_LOST_MISSED_PKTS; }
 bool link_monitor_node_lost(void) { return s_node_missed_ping   >= LINK_LOST_MISSED_PKTS; }
 
+/* ============================================================
+   link_monitor_task
+   === FIX LINK-LOSS-SMART ===
+   ============================================================ */
 static void link_monitor_task(void *arg)
 {
     ESP_LOGI(TAG, "link_monitor_task started (%u missed pkts = link lost, "
@@ -135,21 +123,55 @@ static void link_monitor_task(void *arg)
         if (g_config.role == DEVICE_ROLE_MASTER) {
             if (now - last_root_ms >= LINK_ROOT_EXPECT_MS) {
                 last_root_ms = now;
-                if (s_root_missed_status < LINK_LOST_MISSED_PKTS + 1)
-                    s_root_missed_status++;
-                if (s_root_missed_status == LINK_LOST_MISSED_PKTS) {
-                    ESP_LOGE(TAG, "ROOT: %u missed STATUS → link LOST",
-                             LINK_LOST_MISSED_PKTS);
+
+                /* === FIX LINK-LOSS-SMART:
+                   Проверяем, был ли STATUS реально за окно.
+                   s_last_node_msg_ms обновляется в transport.c
+                   на КАЖДЫЙ RX от NODE (STATUS/EVT). === */
+                bool got_status = false;
+                if (s_last_node_msg_ms != 0) {
+                    uint32_t node_tick = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                    if (node_tick >= s_last_node_msg_ms &&
+                        (node_tick - s_last_node_msg_ms) <
+                        (uint32_t)LINK_ROOT_EXPECT_MS) {
+                        got_status = true;
+                    }
+                }
+                if (!got_status) {
+                    if (s_root_missed_status < LINK_LOST_MISSED_PKTS + 1)
+                        s_root_missed_status++;
+                    if (s_root_missed_status == LINK_LOST_MISSED_PKTS) {
+                        ESP_LOGE(TAG, "ROOT: %u missed STATUS → link LOST",
+                                 LINK_LOST_MISSED_PKTS);
+                    }
+                } else {
+                    /* Был пакет — сбрасываем счётчик (на случай
+                       гонки с link_monitor_note_status_rx). */
+                    s_root_missed_status = 0;
                 }
             }
         } else {
             if (now - last_node_ms >= LINK_NODE_EXPECT_MS) {
                 last_node_ms = now;
-                if (s_node_missed_ping < LINK_LOST_MISSED_PKTS + 1)
-                    s_node_missed_ping++;
-                if (s_node_missed_ping == LINK_LOST_MISSED_PKTS) {
-                    ESP_LOGE(TAG, "NODE: %u missed ping/CMD → link LOST",
-                             LINK_LOST_MISSED_PKTS);
+
+                bool got_ping = false;
+                if (s_last_sync_ms != 0) {
+                    uint32_t node_tick = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                    if (node_tick >= s_last_sync_ms &&
+                        (node_tick - s_last_sync_ms) <
+                        (uint32_t)LINK_NODE_EXPECT_MS) {
+                        got_ping = true;
+                    }
+                }
+                if (!got_ping) {
+                    if (s_node_missed_ping < LINK_LOST_MISSED_PKTS + 1)
+                        s_node_missed_ping++;
+                    if (s_node_missed_ping == LINK_LOST_MISSED_PKTS) {
+                        ESP_LOGE(TAG, "NODE: %u missed ping/CMD → link LOST",
+                                 LINK_LOST_MISSED_PKTS);
+                    }
+                } else {
+                    s_node_missed_ping = 0;
                 }
             }
         }
@@ -170,18 +192,6 @@ static void link_monitor_task(void *arg)
 }
 /* === END LINK LOSS === */
 
-/* ============================================================
-   on_got_ip
-
-   === FIX GOT-IP-NO-RACE ===
-       Убрана проверка modem_ppp_is_connected(). Раньше обработчик
-       IP_EVENT_PPP_GOT_IP мог сработать раньше, чем s_connected
-       выставлен в modem_ppp.c:ip_event_handler() (порядок
-       обработчиков esp_event не гарантирован), и MQTT не стартовал.
-       wifi_mqtt_init() сам проверит modem_ppp_is_connected() и
-       вернёт ESP_ERR_INVALID_STATE (не ошибка — повторим на
-       следующей итерации modem_retry_task).
-   ============================================================ */
 static void on_got_ip(void *arg, esp_event_base_t base,
                       int32_t id, void *data)
 {
@@ -203,15 +213,12 @@ static void on_got_ip(void *arg, esp_event_base_t base,
     }
 }
 
-/* ============================================================
-   nvs_app_cfg_exists (FIX STACK-OVERFLOW)
-   ============================================================ */
 static bool nvs_app_cfg_exists(void)
 {
     nvs_handle_t nvs;
     if (nvs_open("app_cfg", NVS_READONLY, &nvs) != ESP_OK) return false;
 
-    static app_config_t tmp;   /* FIX STACK-OVERFLOW */
+    static app_config_t tmp;
 
     size_t sz = sizeof(tmp);
     bool ok = false;
@@ -223,9 +230,6 @@ static bool nvs_app_cfg_exists(void)
     return ok;
 }
 
-/* ============================================================
-   apply_pending_cfg_from_nvs (FIX STACK-OVERFLOW)
-   ============================================================ */
 static bool apply_pending_cfg_from_nvs(void)
 {
     nvs_handle_t nvs;
@@ -301,11 +305,6 @@ static bool apply_pending_cfg_from_nvs(void)
     return ok;
 }
 
-/* ============================================================
-   load_embedded_config_if_needed
-
-   === FIX CFG-FALLBACK: логируем результат и не молчим при ошибке ===
-   ============================================================ */
 static void load_embedded_config_if_needed(void)
 {
     size_t len = (size_t)(config_json_end - config_json_start);
@@ -333,9 +332,6 @@ static void load_embedded_config_if_needed(void)
     }
 }
 
-/* ============================================================
-   cfg_load_task (FIX STACK-OVERFLOW)
-   ============================================================ */
 typedef struct {
     bool              pending_applied;
     SemaphoreHandle_t done;
@@ -384,7 +380,6 @@ static bool run_cfg_load(void)
     vSemaphoreDelete(ctx.done);
     return ctx.pending_applied;
 }
-/* === END FIX STACK-OVERFLOW === */
 
 static void log_heap(const char *stage)
 {
@@ -427,10 +422,6 @@ static void rtc_init(void)
     }
 }
 
-/* ============================================================
-   ensure_valid_cfg — страховка: если g_config пуст, грузим embedded.
-   === FIX CFG-FALLBACK ===
-   ============================================================ */
 static void ensure_valid_cfg(void)
 {
     if (g_config.traffic.sequence_count > 0 &&
@@ -463,7 +454,6 @@ static void ensure_valid_cfg(void)
                  g_config.traffic.pedestrian.request_mode);
     }
 }
-/* === END FIX CFG-FALLBACK === */
 
 void app_main(void)
 {
@@ -479,18 +469,14 @@ void app_main(void)
 
     log_heap("app_main start");
 
-    /* === FIX STACK-OVERFLOW === */
     bool pending_applied = run_cfg_load();
     if (pending_applied) {
         log_heap("after pending_cfg applied");
     }
-    /* === END FIX STACK-OVERFLOW === */
 
     config_init();
 
-    /* === FIX CFG-FALLBACK: страховка от пустого NVS + сбой парсинга === */
     ensure_valid_cfg();
-    /* === END FIX CFG-FALLBACK === */
 
     bool is_root = (g_config.role == DEVICE_ROLE_MASTER);
     ESP_LOGI(TAG, "role = %s", is_root ? "ROOT" : "NODE");

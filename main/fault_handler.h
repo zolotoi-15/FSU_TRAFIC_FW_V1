@@ -7,15 +7,12 @@ extern "C" {
 
 void fault_handler_register(void);
 
-/* === FIX REQUEUE: phase_sync_task при ошибке send_sync возвращает
-   pending-фазу через phase_change_requeue(), чтобы не потерять. === */
+/* === SIMPLIFIED-NO-CFG: stubs для совместимости с traffic_internal.h ===
+   traffic_light.c по-прежнему вызывает phase_change_cancel_pending()
+   в force_phase/next/insert — реализация в fault_handler.c как no-op. */
 uint8_t phase_change_take_pending(uint32_t *dur);
 void    phase_change_requeue(uint8_t phase, uint32_t dur_ms);
-
-/* === FIX INSERT-NO-DOUBLE-SYNC: traffic_light.c insert гасит pending,
-   чтобы phase_sync_task не отправил дубль sync: после apply_stage_dd. === */
 void    phase_change_cancel_pending(void);
-/* === END FIX INSERT-NO-DOUBLE-SYNC === */
 
 #ifdef __cplusplus
 }

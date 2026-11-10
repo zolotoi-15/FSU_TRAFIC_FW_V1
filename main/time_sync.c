@@ -23,10 +23,8 @@ static volatile int64_t  s_t0_us    = 0;
 static volatile bool     s_valid    = false;
 static SemaphoreHandle_t s_mtx      = NULL;
 
-/* === FIX #3a: дельта ROOT/NODE по последнему sync: === */
 static volatile int32_t  s_last_delta_ms = 0;
 static volatile uint32_t s_last_delta_update_ms = 0;
-/* === END FIX #3a === */
 
 #define TIME_SYNC_PUSH_PERIOD_MS   30000
 #define TIME_SYNC_REPORT_PERIOD_MS 5000
@@ -135,7 +133,6 @@ void time_sync_set(uint32_t unix_sec, uint16_t ms, uint32_t rtt_us)
     set_base(unix_sec, ms, rtt_us);
 }
 
-/* === FIX #3a: дельта ROOT/NODE === */
 void time_sync_note_delta_ms(int32_t delta_ms)
 {
     s_last_delta_ms = delta_ms;
@@ -155,7 +152,6 @@ uint32_t time_sync_get_delta_age_ms(void)
     if (now < s_last_delta_update_ms) return 0;
     return now - s_last_delta_update_ms;
 }
-/* === END FIX #3a === */
 
 static void sntp_sync_cb(struct timeval *tv)
 {
@@ -179,8 +175,12 @@ esp_err_t time_sync_start_sntp(void)
 }
 
 /* ============================================================
-   time_sync_root_push_ex — внутренняя реализация с флагом force.
-   force=true обходит 30-секундный троттлинг.
+   time_sync_root_push_ex
+   === FIX TIME-NOACK ===
+       time: — идемпотентная команда, отправится повторно через
+       30 с при потере. ACK-таймаут (2 с) при занятом эфире
+       (STATUS NODE) ложно помечает передачу как FAILED.
+       Используем noack.
    ============================================================ */
 static void time_sync_root_push_ex(uint32_t rtt_us, bool force)
 {
@@ -206,12 +206,14 @@ static void time_sync_root_push_ex(uint32_t rtt_us, bool force)
                      (unsigned long)sec, (unsigned)ms,
                      (unsigned long)rtt_us);
     if (n > 0) {
-        esp_err_t err = transport_send_cmd(cmd, n);
+        /* === FIX TIME-NOACK === */
+        esp_err_t err = transport_send_cmd_noack(cmd, n);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "time_sync_root_push: %s", esp_err_to_name(err));
         } else {
             ESP_LOGD(TAG, "→ node: %s", cmd);
         }
+        /* === END FIX TIME-NOACK === */
     }
 }
 

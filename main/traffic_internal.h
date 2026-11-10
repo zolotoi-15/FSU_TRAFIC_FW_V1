@@ -88,7 +88,9 @@ void phase_change_cancel_pending(void);
 /* === Callbacks === */
 extern traffic_fault_notify_cb_t s_fault_notify;
 extern traffic_phase_change_cb_t s_phase_change_cb;
-
+extern volatile uint8_t s_pending_sync_phase;
+extern volatile uint16_t s_expected_mask_from_root;
+extern volatile uint16_t s_active_mask_from_root;
 /* ============================================================
    traffic_config.c
    ============================================================ */

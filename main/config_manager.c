@@ -21,11 +21,10 @@ static const char *TAG = "CFG";
 #define NVS_KEY_ROLE  "role"
 #define NVS_KEY_LOCK  "role_lock"
 
-#define CFG_MIN_HEAP_FOR_PARSE  (48 * 1024)
+#define CFG_MIN_HEAP_FOR_PARSE  (24 * 1024)
 
 app_config_t g_config;
 
-/* === FIX STACK-OVERFLOW === */
 static app_config_t      s_cfg_load_tmp;
 static SemaphoreHandle_t s_cfg_load_mtx = NULL;
 
@@ -40,7 +39,6 @@ static inline void cfg_load_unlock(void)
 {
     if (s_cfg_load_mtx) xSemaphoreGive(s_cfg_load_mtx);
 }
-/* === END FIX STACK-OVERFLOW === */
 
 static char  *s_cfg_json_cache = NULL;
 static size_t s_cfg_json_len   = 0;
@@ -58,6 +56,10 @@ static void config_cache_invalidate(void)
 static const char *duration_kind_to_str(uint8_t kind);
 static const char *ped_request_mode_to_str(uint8_t m);
 static const char *hold_on_ped_to_str(uint8_t m);
+
+/* Forward declarations for validators */
+static bool validate_phase_timings(traffic_config_t *tc);
+static void validate_insert_seq_against_sequence(traffic_config_t *tc);
 
 /* ============================================================
    set_defaults_to — не трогает глобальный g_config.
@@ -172,15 +174,9 @@ static void set_defaults_to(app_config_t *cfg)
     cfg->traffic.sequence[3] = 4;
     cfg->traffic.sequence_count = 4;
 
-    /* === FIX CONFLICT-DEFAULTS-EMPTY ===
-       Дефолтная таблица конфликтов ПУСТАЯ. Если нужна защита —
-       задавать в config.json явно. Иначе set_defaults_to заполняет
-       15 пар, и пустой [] в config.json их НЕ очищает (см. FIX
-       CONFLICT-ARRAY-RESET в parse_traffic). */
     memset(cfg->traffic.conflicting_channels, 0,
            sizeof(cfg->traffic.conflicting_channels));
     cfg->traffic.conflict_count = 0;
-    /* === END FIX CONFLICT-DEFAULTS-EMPTY === */
 
     for (int i = 0; i < MAX_OUTPUTS; i++) {
         cfg->sr.outputs[i].ch = (uint8_t)i;
@@ -193,7 +189,15 @@ static void set_defaults_to(app_config_t *cfg)
 
 static void set_defaults(void) { set_defaults_to(&g_config); }
 
-/* ============================================================ */
+/* ============================================================
+   config_load — читает NVS и валидирует.
+
+   === FIX VALIDATE-ON-LOAD ===
+       После чтения NVS-blob применяем validate_phase_timings и
+       validate_insert_seq_against_sequence. Иначе старые NVS-конфиги
+       (до фикса валидации) содержат insert_sequence с несуществующими
+       id — insert «пропускает» шаги, safe_exit пуст.
+   ============================================================ */
 void config_load(void)
 {
     nvs_handle_t nvs;
@@ -214,9 +218,29 @@ void config_load(void)
         set_defaults();
         config_save();
     } else {
+        /* === FIX VALIDATE-ON-LOAD === */
+        bool timings_changed = !validate_phase_timings(&g_config.traffic);
+        uint8_t ins_before = g_config.traffic.pedestrian.insert_count;
+        uint8_t sex_before = g_config.traffic.pedestrian.safe_exit_count;
+        uint8_t hld_before = g_config.traffic.hold.stage_count;
+        validate_insert_seq_against_sequence(&g_config.traffic);
+        bool seq_changed =
+            (ins_before != g_config.traffic.pedestrian.insert_count) ||
+            (sex_before != g_config.traffic.pedestrian.safe_exit_count) ||
+            (hld_before != g_config.traffic.hold.stage_count);
+
+        if (timings_changed || seq_changed) {
+            ESP_LOGW(TAG, "config_load: config was sanitized on load "
+                          "(timings=%d seq=%d) → re-save",
+                     timings_changed ? 1 : 0, seq_changed ? 1 : 0);
+            config_save();
+        }
+        /* === END FIX VALIDATE-ON-LOAD === */
+
         ESP_LOGI(TAG, "Config loaded (version=%.2f, SSID='%s', traffic.mode=%u, "
                       "stages=%u, seq=%u, ped_mode=%u, hold=%d/%u, "
-                      "insert_red_ms=%lu, conflicts=%u)",
+                      "insert_red_ms=%lu, insert_seq=%u, safe_exit=%u, "
+                      "conflicts=%u)",
                  g_config.version,
                  g_config.wifi_ssid, g_config.traffic.mode,
                  g_config.traffic.stage_count, g_config.traffic.sequence_count,
@@ -224,6 +248,8 @@ void config_load(void)
                  g_config.traffic.hold.enabled,
                  g_config.traffic.hold.stage_count,
                  (unsigned long)g_config.traffic.pedestrian.insert_red_ms,
+                 g_config.traffic.pedestrian.insert_count,
+                 g_config.traffic.pedestrian.safe_exit_count,
                  g_config.traffic.conflict_count);
     }
 }
@@ -242,11 +268,14 @@ void config_save(void)
     if (err == ESP_OK) {
         config_cache_invalidate();
         ESP_LOGI(TAG, "Config saved to NVS (version=%.2f, %u bytes, "
-                      "ped_mode=%u, hold=%d, insert_red_ms=%lu, conflicts=%u)",
+                      "ped_mode=%u, hold=%d, insert_red_ms=%lu, "
+                      "insert_seq=%u, safe_exit=%u, conflicts=%u)",
                  g_config.version, (unsigned)sizeof(g_config),
                  g_config.traffic.pedestrian.request_mode,
                  g_config.traffic.hold.enabled,
                  (unsigned long)g_config.traffic.pedestrian.insert_red_ms,
+                 g_config.traffic.pedestrian.insert_count,
+                 g_config.traffic.pedestrian.safe_exit_count,
                  g_config.traffic.conflict_count);
     } else {
         ESP_LOGE(TAG, "nvs_set_blob failed: %s", esp_err_to_name(err));
@@ -464,7 +493,6 @@ static void parse_transitions(const cJSON *arr, traffic_config_t *tc)
     ESP_LOGI(TAG, "Parsed %u transitions", tc->transition_count);
 }
 
-/* === FIX GOST-PHASE-VALIDATION === */
 static bool validate_phase_timings(traffic_config_t *tc)
 {
     bool ok = true;
@@ -497,22 +525,19 @@ static bool validate_phase_timings(traffic_config_t *tc)
 
     if (tc->phases_ms.phase_blink_period < 450 ||
         tc->phases_ms.phase_blink_period > 550) {
-        ESP_LOGW(TAG, "GOST: phase_blink_period=%lu ms → clamp to 500 ms "
-                      "(1 Hz ± 10%%, ГОСТ Р 52282 п. 5.6.3)",
+        ESP_LOGW(TAG, "GOST: phase_blink_period=%lu ms → clamp to 500 ms",
                  (unsigned long)tc->phases_ms.phase_blink_period);
         tc->phases_ms.phase_blink_period = 500; ok = false;
     }
 
     if (tc->phases_ms.green < 20000) {
-        ESP_LOGE(TAG, "GOST: green=%lu < 20000 ms → clamp to 20000 "
-                      "(ГОСТ Р 52289 п. 4.4.4)",
+        ESP_LOGE(TAG, "GOST: green=%lu < 20000 ms → clamp to 20000",
                  (unsigned long)tc->phases_ms.green);
         tc->phases_ms.green = 20000; ok = false;
     }
 
     if (tc->phases_ms.ped_green < 15000) {
-        ESP_LOGE(TAG, "GOST: ped_green=%lu < 15000 ms → clamp to 15000 "
-                      "(ГОСТ Р 52289 п. 4.4.5)",
+        ESP_LOGE(TAG, "GOST: ped_green=%lu < 15000 ms → clamp to 15000",
                  (unsigned long)tc->phases_ms.ped_green);
         tc->phases_ms.ped_green = 15000; ok = false;
     }
@@ -535,7 +560,6 @@ static bool validate_phase_timings(traffic_config_t *tc)
 
     return ok;
 }
-/* === END FIX GOST-PHASE-VALIDATION === */
 
 static void parse_pedestrian(const cJSON *t, traffic_config_t *tc)
 {
@@ -652,6 +676,81 @@ static void parse_hold(const cJSON *t, traffic_config_t *tc)
              tc->hold.on_ped_request);
 }
 
+static void validate_insert_seq_against_sequence(traffic_config_t *tc)
+{
+    if (tc->pedestrian.insert_count > 0 && tc->sequence_count > 0) {
+        uint8_t valid_count = 0;
+        for (int i = 0; i < tc->pedestrian.insert_count; i++) {
+            uint8_t id = tc->pedestrian.insert_sequence[i];
+            bool found = false;
+            for (int j = 0; j < tc->sequence_count; j++) {
+                if (tc->sequence[j] == id) { found = true; break; }
+            }
+            if (!found) {
+                ESP_LOGE(TAG, "insert_sequence[%d]=%u NOT IN SEQUENCE "
+                              "(sequence_count=%u), removing",
+                         i, id, tc->sequence_count);
+            } else {
+                tc->pedestrian.insert_sequence[valid_count++] = id;
+            }
+        }
+        if (valid_count != tc->pedestrian.insert_count) {
+            ESP_LOGW(TAG, "insert_sequence filtered: %u → %u valid",
+                     tc->pedestrian.insert_count, valid_count);
+            tc->pedestrian.insert_count = valid_count;
+        }
+    }
+
+    if (tc->pedestrian.safe_exit_count > 0 && tc->sequence_count > 0) {
+        uint8_t valid_count = 0;
+        for (int i = 0; i < tc->pedestrian.safe_exit_count; i++) {
+            uint8_t id = tc->pedestrian.safe_exit_sequence[i];
+            bool found = false;
+            for (int j = 0; j < tc->sequence_count; j++) {
+                if (tc->sequence[j] == id) { found = true; break; }
+            }
+            if (!found) {
+                ESP_LOGE(TAG, "safe_exit_sequence[%d]=%u NOT IN SEQUENCE, removing",
+                         i, id);
+            } else {
+                tc->pedestrian.safe_exit_sequence[valid_count++] = id;
+            }
+        }
+        if (valid_count != tc->pedestrian.safe_exit_count) {
+            ESP_LOGW(TAG, "safe_exit_sequence filtered: %u → %u valid",
+                     tc->pedestrian.safe_exit_count, valid_count);
+            tc->pedestrian.safe_exit_count = valid_count;
+        }
+    }
+
+    if (tc->hold.enabled && tc->hold.stage_count > 0 &&
+        tc->sequence_count > 0) {
+        uint8_t valid_count = 0;
+        for (int i = 0; i < tc->hold.stage_count; i++) {
+            uint8_t id = tc->hold.stage_ids[i];
+            bool found = false;
+            for (int j = 0; j < tc->sequence_count; j++) {
+                if (tc->sequence[j] == id) { found = true; break; }
+            }
+            if (!found) {
+                ESP_LOGE(TAG, "hold.stage_ids[%d]=%u NOT IN SEQUENCE, removing",
+                         i, id);
+            } else {
+                tc->hold.stage_ids[valid_count++] = id;
+            }
+        }
+        if (valid_count != tc->hold.stage_count) {
+            ESP_LOGW(TAG, "hold.stage_ids filtered: %u → %u valid",
+                     tc->hold.stage_count, valid_count);
+            tc->hold.stage_count = valid_count;
+        }
+        if (tc->hold.stage_count == 0) {
+            ESP_LOGE(TAG, "hold.enabled=true but no valid stage_ids → disable");
+            tc->hold.enabled = false;
+        }
+    }
+}
+
 static void parse_traffic(const cJSON *t, traffic_config_t *tc)
 {
     if (!cJSON_IsObject(t)) return;
@@ -743,8 +842,7 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
         }
     }
 
-    /* === FIX GOST-ALL-RED === */
-    if (tc->sequence_count >= 2) {
+     if (tc->sequence_count >= 2) {
         int green_adjacent = 0;
         for (int i = 0; i < tc->sequence_count; i++) {
             int nxt = (i + 1) % tc->sequence_count;
@@ -754,12 +852,10 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
                 if (tc->stages[j].id == tc->sequence[nxt]) s2 = &tc->stages[j];
             }
             if (!s1 || !s2) continue;
-            bool g1 = (s1->duration_kind == DD_DUR_GREEN ||
-                       s1->duration_kind == DD_DUR_GREEN_BLINK ||
-                       s1->duration_kind == DD_DUR_RED_YELLOW);
-            bool g2 = (s2->duration_kind == DD_DUR_GREEN ||
-                       s2->duration_kind == DD_DUR_GREEN_BLINK ||
-                       s2->duration_kind == DD_DUR_RED_YELLOW);
+            /* === FIX ALL-RED-GREEN-ONLY: синхронизировано с
+               need_virtual_all_red() в traffic_config.c === */
+            bool g1 = (s1->duration_kind == DD_DUR_GREEN);
+            bool g2 = (s2->duration_kind == DD_DUR_GREEN);
             if (g1 && g2) {
                 ESP_LOGW(TAG, "sequence: green stage id=%u followed by "
                               "green id=%u WITHOUT all-red — will insert "
@@ -773,16 +869,10 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
             ESP_LOGI(TAG, "sequence: all-red between greens OK");
         }
     }
-    /* === END FIX GOST-ALL-RED === */
 
-    /* === FIX CONFLICT-ARRAY-RESET ===
-       set_defaults_to() НЕ заполняет conflicting_channels (см. FIX
-       CONFLICT-DEFAULTS-EMPTY). Но для надёжности всё равно memset —
-       если дефолты когда-то вернут, пустой [] не оставит их. */
     tc->conflict_count = 0;
     memset(tc->conflicting_channels, 0,
            sizeof(tc->conflicting_channels));
-    /* === END FIX CONFLICT-ARRAY-RESET === */
 
     const cJSON *conf = cJSON_GetObjectItemCaseSensitive(t, "conflicting_channels");
     if (cJSON_IsArray(conf)) {
@@ -807,37 +897,7 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
         ESP_LOGI(TAG, "conflicting_channels missing → no software protection");
     }
 
-    if (tc->hold.enabled) {
-        if (tc->hold.stage_count == 0) {
-            ESP_LOGW(TAG, "hold.enabled=true but stage_ids empty → disable");
-            tc->hold.enabled = false;
-        } else {
-            for (int i = 0; i < tc->hold.stage_count; i++) {
-                bool found = false;
-                for (int j = 0; j < tc->stage_count; j++) {
-                    if (tc->stages[j].id == tc->hold.stage_ids[i]) { found = true; break; }
-                }
-                if (!found) {
-                    ESP_LOGW(TAG, "hold.stage_ids[%d]=%u not in stages_dd",
-                             i, tc->hold.stage_ids[i]);
-                }
-            }
-        }
-    }
-    if (tc->pedestrian.insert_count > 0) {
-        for (int i = 0; i < tc->pedestrian.insert_count; i++) {
-            bool found = false;
-            for (int j = 0; j < tc->stage_count; j++) {
-                if (tc->stages[j].id == tc->pedestrian.insert_sequence[i]) {
-                    found = true; break;
-                }
-            }
-            if (!found) {
-                ESP_LOGW(TAG, "insert_sequence[%d]=%u not in stages_dd",
-                         i, tc->pedestrian.insert_sequence[i]);
-            }
-        }
-    }
+    validate_insert_seq_against_sequence(tc);
 
     validate_phase_timings(tc);
 }
@@ -1505,6 +1565,7 @@ bool config_export_lora_json(char *buf, size_t *len)
 /* ============================================================
    config_load_lora_json — парсинг "ped" + "cf"
    === FIX CONFLICT-ARRAY-RESET-LORA ===
+   === FIX INSERT-SEQ-VALIDATE ===
    ============================================================ */
 bool config_load_lora_json(const char *json, size_t len)
 {
@@ -1747,11 +1808,9 @@ bool config_load_lora_json(const char *json, size_t len)
             }
         }
 
-        /* === FIX CONFLICT-ARRAY-RESET-LORA === */
         tc->conflict_count = 0;
         memset(tc->conflicting_channels, 0,
                sizeof(tc->conflicting_channels));
-        /* === END FIX CONFLICT-ARRAY-RESET-LORA === */
 
         const cJSON *cf = cJSON_GetObjectItemCaseSensitive(t, "cf");
         if (cJSON_IsArray(cf)) {
@@ -1813,6 +1872,8 @@ bool config_load_lora_json(const char *json, size_t len)
             tmp->traffic.sequence[i] = tmp->traffic.stages[i].id;
         tmp->traffic.sequence_count = tmp->traffic.stage_count;
     }
+
+    validate_insert_seq_against_sequence(&tmp->traffic);
 
     validate_phase_timings(&tmp->traffic);
 

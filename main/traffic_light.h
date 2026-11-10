@@ -192,6 +192,7 @@ bool      traffic_light_is_manual_override(void);
 esp_err_t traffic_light_priority_extend(uint32_t ms);
 esp_err_t traffic_light_priority_shorten(uint32_t ms);
 /* === END FIX GOST-PRIORITY-GREEN === */
+void traffic_light_request_pedestrian_ex(bool from_remote);
 
 #ifdef __cplusplus
 }

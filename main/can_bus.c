@@ -1,3 +1,14 @@
+/* ============================================================
+   can_bus.c — TWAI (CAN) драйвер.
+
+   === FIX CAN-STATE-CALLBACK ===
+       on_state_change_cb теперь заполняет s_stats.last_state и
+       инкрементирует bus_off_count / error_passive_count при
+       ПЕРЕХОДЕ состояния, а не каждые 500 мс в polling.
+       Раньше error_passive_count рос на каждый опрос в PASSIVE
+       (120 за минуту вместо 1 при реальном переходе).
+   ============================================================ */
+
 #include "can_bus.h"
 #include "board_pins.h"
 #include "shift_register.h"
@@ -28,6 +39,12 @@ static SemaphoreHandle_t  s_stats_mutex = NULL;
 static uint32_t s_recovery_backoff_ms = 0;
 static uint32_t s_last_recovery_ms    = 0;
 
+/* === FIX CAN-STATE-CALLBACK ===
+   Кэш последнего состояния — чтобы инкрементировать счётчики
+   только при ПЕРЕХОДЕ. */
+static volatile uint32_t s_last_known_state = 0xFFFFFFFF;
+/* === END FIX CAN-STATE-CALLBACK === */
+
 typedef struct { uint32_t id; uint8_t dlc; uint8_t extd; uint8_t data[8]; } can_frame_t;
 #define CAN_RX_QUEUE_LEN  32
 #define CAN_RX_TASK_STACK 4096
@@ -52,9 +69,41 @@ static bool IRAM_ATTR on_rx_done_cb(twai_node_handle_t handle,
 static bool IRAM_ATTR on_error_cb(twai_node_handle_t handle,
                                    const twai_error_event_data_t *edata,
                                    void *user_ctx) { return false; }
+
+/* === FIX CAN-STATE-CALLBACK ===
+   Заполняем статистику при переходе состояния в ISR.
+   Используем portMUX spinlock (нельзя брать mutex из ISR). */
+static portMUX_TYPE s_state_mtx = portMUX_INITIALIZER_UNLOCKED;
+
 static bool IRAM_ATTR on_state_change_cb(twai_node_handle_t handle,
                                           const twai_state_change_event_data_t *edata,
-                                          void *user_ctx) { return false; }
+                                          void *user_ctx) {
+    twai_error_state_t new_state = edata->new_sta;
+
+    portENTER_CRITICAL_ISR(&s_state_mtx);
+    uint32_t prev = s_last_known_state;
+    s_last_known_state = (uint32_t)new_state;
+    s_stats.last_state = (uint32_t)new_state;
+
+    if ((uint32_t)new_state != prev) {
+        if (new_state == TWAI_ERROR_BUS_OFF) {
+            s_stats.bus_off_count++;
+        } else if (new_state == TWAI_ERROR_PASSIVE) {
+            s_stats.error_passive_count++;
+        }
+    }
+    portEXIT_CRITICAL_ISR(&s_state_mtx);
+
+    if ((uint32_t)new_state != prev) {
+        if (new_state == TWAI_ERROR_BUS_OFF) {
+            ESP_EARLY_LOGE(TAG, "state → BUS_OFF");
+        } else if (new_state == TWAI_ERROR_PASSIVE) {
+            ESP_EARLY_LOGW(TAG, "state → PASSIVE");
+        }
+    }
+    return false;
+}
+/* === END FIX CAN-STATE-CALLBACK === */
 
 esp_err_t can_bus_set_standby(bool standby) {
     sr_set_output(CAN_RS_SR_PIN, standby ? 1 : 0);
@@ -139,14 +188,14 @@ static void can_rx_task(void *arg) {
             can_rx_cb_t cb = s_rx_cb;
             if (cb) cb(frm.id, frm.data, frm.dlc, frm.extd != 0);
         }
+
+        /* === FIX CAN-STATE-CALLBACK ===
+           last_state / bus_off_count / error_passive_count теперь
+           обновляются в on_state_change_cb. Здесь только recovery
+           и backoff — по polling-таймауту. */
         if (s_node) {
             twai_node_status_t st;
             if (twai_node_get_info(s_node, &st, NULL) == ESP_OK) {
-                if (s_stats_mutex && xSemaphoreTake(s_stats_mutex, 0) == pdTRUE) {
-                    s_stats.last_state = (uint32_t)st.state;
-                    if (st.state == TWAI_ERROR_PASSIVE) s_stats.error_passive_count++;
-                    xSemaphoreGive(s_stats_mutex);
-                }
                 if (st.state == TWAI_ERROR_BUS_OFF) {
                     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
                     if (s_recovery_backoff_ms == 0) s_recovery_backoff_ms = 500;
@@ -156,7 +205,6 @@ static void can_rx_task(void *arg) {
                         twai_node_recover(s_node);
                         s_last_recovery_ms = now;
                         if (s_stats_mutex && xSemaphoreTake(s_stats_mutex, 0) == pdTRUE) {
-                            s_stats.bus_off_count++;
                             s_stats.recovery_count++;
                             xSemaphoreGive(s_stats_mutex);
                         }
@@ -168,6 +216,7 @@ static void can_rx_task(void *arg) {
                 }
             }
         }
+        /* === END FIX CAN-STATE-CALLBACK === */
     }
     ESP_LOGI(TAG, "CAN rx dispatcher stopped");
     s_rx_task = NULL;

@@ -24,7 +24,7 @@ static SemaphoreHandle_t s_spi_mutex = NULL;
 static volatile bool s_tx_active = false;
 /* === END FIX TX-BUSY === */
 
-#define LORA_FREQ_HZ        468525050
+#define LORA_FREQ_HZ        718525050
 #define LORA_TX_POWER_DBM   17
 #define LORA_SF             9
 #define LORA_BW_KHZ         250

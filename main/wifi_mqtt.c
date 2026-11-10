@@ -1,17 +1,20 @@
 /* ============================================================
    wifi_mqtt.c — публичный API + MQTT-клиент.
 
-   === FIX P1-5: MQTT_DOWN_RESTART_MS 90s → 5 мин.
-   === FIX P1-5: убран двойной modem_ppp_stop().
-   === FIX #7: URI с портом (esp-mqtt игнорирует broker.address.port)
-   === FIX MQTT-NO-IP:
-       - wifi_mqtt_init() проверяет modem_ppp_is_connected() перед
-         стартом. Без IP возвращает ESP_ERR_INVALID_STATE.
-       - wifi_mqtt_restart() тоже проверяет IP (защита от watchdog).
-       - mqtt_publish_task не публикует, если PPP нет.
-       - mqtt_watchdog_task при MQTT down сначала проверяет PPP,
-         и только потом force_restart_modem().
-   === END FIX MQTT-NO-IP ===
+   === FIX MQTT-BUFFER-8192 ===
+       buffer.size = 8192.
+   === FIX MQTT-EVENT-DATA-LOG ===
+   === FIX MQTT-SUBSCRIBED-LOG ===
+   === FIX MQTT-FAST-RETRY ===
+   === FIX P1-5: убран двойной modem_ppp_stop(). ===
+   === FIX #7: URI с портом ===
+   === FIX MQTT-NO-IP ===
+
+   === FIX MQTT-TASKS-ONCE ===
+       wifi_mqtt_init() защищён от повторного создания
+       mqtt_publish_task / mqtt_watchdog_task. Раньше on_got_ip
+       (IP_EVENT_PPP_GOT_IP) и modem_retry_task могли оба вызвать
+       wifi_mqtt_init → две задачи → двойная публикация.
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -52,9 +55,14 @@ int        s_publish_fail_count = 0;
 static bool       s_restart_in_progress = false;
 static SemaphoreHandle_t s_restart_mutex = NULL;
 
-/* === FIX P1-5: 90 с → 5 мин. === */
-#define MQTT_DOWN_RESTART_MS   (5 * 60 * 1000)
-/* === END FIX P1-5 === */
+/* === FIX MQTT-TASKS-ONCE === */
+static bool s_mqtt_tasks_started = false;
+/* === END FIX MQTT-TASKS-ONCE === */
+
+/* === FIX MQTT-FAST-RETRY === */
+#define MQTT_DOWN_RESTART_MS    (30 * 1000)
+#define MQTT_FORCE_MODEM_MS     (5 * 60 * 1000)
+/* === END FIX MQTT-FAST-RETRY === */
 
 static volatile uint32_t s_mqtt_last_connected_ms    = 0;
 static volatile uint32_t s_mqtt_last_disconnected_ms = 0;
@@ -193,13 +201,24 @@ static void build_topics(void)
 
 int wifi_mqtt_fault_priority_ex(traffic_fault_t f) { return mqtt_fault_priority(f); }
 traffic_fault_t wifi_mqtt_get_node_fault(void) { return mqtt_fault_get_node(); }
-void wifi_mqtt_publish_node_json(const char *json, size_t len) { mqtt_fault_publish_node_json(json, len); }
-void wifi_mqtt_publish_node_fault(const char *fault_str, size_t len) { mqtt_fault_publish_node(fault_str, len); }
-void wifi_mqtt_apply_remote_fault(const char *fault_str, size_t len) { mqtt_fault_apply_remote(fault_str, len); }
+void wifi_mqtt_publish_node_json(const char *json, size_t len) {
+    mqtt_fault_publish_node_json(json, len);
+}
+void wifi_mqtt_publish_node_fault(const char *fault_str, size_t len) {
+    mqtt_fault_publish_node(fault_str, len);
+}
+void wifi_mqtt_apply_remote_fault(const char *fault_str, size_t len) {
+    mqtt_fault_apply_remote(fault_str, len);
+}
 void wifi_mqtt_reset_node_fault_tracking(void) { mqtt_fault_reset_tracking(); }
 void wifi_mqtt_apply_config_runtime(void) { mqtt_apply_config_runtime(); }
-void wifi_mqtt_notify_phase(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms) { mqtt_notify_phase(phase, phase_ms, duration_ms); }
-void wifi_mqtt_set_phase_sync_enabled(bool en) { ESP_LOGI(TAG, "phase-sync flag=%d (ignored, sync: always on)", en); }
+void wifi_mqtt_notify_phase(uint8_t phase, uint32_t phase_ms,
+                            uint32_t duration_ms) {
+    mqtt_notify_phase(phase, phase_ms, duration_ms);
+}
+void wifi_mqtt_set_phase_sync_enabled(bool en) {
+    ESP_LOGI(TAG, "phase-sync flag=%d (ignored, sync: always on)", en);
+}
 const char *wifi_mqtt_last_node_fault(void) { return ""; }
 
 uint32_t wifi_mqtt_get_down_ms(void)
@@ -218,6 +237,9 @@ void wifi_mqtt_force_restart_modem(void)
     modem_ppp_stop();
 }
 
+/* ============================================================
+   mqtt_event_handler
+   ============================================================ */
 static void mqtt_event_handler(void *args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
@@ -235,6 +257,10 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
         esp_mqtt_client_subscribe(g_mqtt_client, s_sub_topic,  1);
         esp_mqtt_client_subscribe(g_mqtt_client, s_json_topic, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, s_kp_topic,   0);
+        break;
+
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT subscribed msg_id=%d", event->msg_id);
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -257,6 +283,12 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
 
     case MQTT_EVENT_DATA:
     {
+        ESP_LOGI(TAG, "MQTT_EVENT_DATA: topic='%.*s' data_len=%d "
+                      "total_data_len=%d offset=%d",
+                 event->topic_len, event->topic,
+                 event->data_len, event->total_data_len,
+                 event->current_data_offset);
+
         bool is_json_topic = (event->topic_len > 0 &&
                               event->topic_len <= (int)strlen(s_json_topic) &&
                               strncmp(event->topic, s_json_topic,
@@ -267,6 +299,9 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
                         ? event->total_data_len : event->data_len;
             bool done = mqtt_json_accum_feed(event->data, event->data_len,
                                              event->current_data_offset, total);
+            ESP_LOGI(TAG, "accum_feed: offset=%d len=%d total=%d done=%d",
+                     event->current_data_offset, event->data_len,
+                     total, (int)done);
             if (done) mqtt_json_accum_process();
             break;
         }
@@ -290,21 +325,13 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
     }
 }
 
-/* ============================================================
-   wifi_mqtt_restart
-
-   === FIX MQTT-NO-IP: не стартуем без PPP IP. Защита от watchdog,
-       который может вызвать restart до появления IP. ===
-   ============================================================ */
 void wifi_mqtt_restart(void)
 {
-    /* === FIX MQTT-NO-IP === */
     extern bool modem_ppp_is_connected(void);
     if (!modem_ppp_is_connected()) {
         ESP_LOGW(TAG, "wifi_mqtt_restart: no PPP IP → skip");
         return;
     }
-    /* === END FIX MQTT-NO-IP === */
 
     if (!s_restart_mutex) s_restart_mutex = xSemaphoreCreateMutex();
     if (!s_restart_mutex) return;
@@ -334,7 +361,7 @@ void wifi_mqtt_restart(void)
         .session.last_will.msg_len = strlen(g_mqtt_config.lwt_msg),
         .session.last_will.qos = 1,
         .session.last_will.retain = true,
-        .buffer.size     = 4096,
+        .buffer.size     = 8192,
         .buffer.out_size = 4096,
         .network.timeout_ms = 20000,
         .network.disable_auto_reconnect = false,
@@ -385,13 +412,6 @@ void wifi_mqtt_publish_now(void)
     free(json);
 }
 
-/* ============================================================
-   mqtt_publish_task
-
-   === FIX MQTT-NO-IP: не публикуем, если PPP нет. При PPP up —
-       публикуем (MQTT может быть ещё не подключён — publish вернёт
-       ESP_FAIL, это нормально).
-   ============================================================ */
 static void mqtt_publish_task(void *arg)
 {
     char *json = malloc(MQTT_JSON_BUFFER_SIZE);
@@ -410,7 +430,8 @@ static void mqtt_publish_task(void *arg)
                      g_config.role == DEVICE_ROLE_SLAVE ? "node" : "root",
                      ip,
                      ppp_up ? 1 : 0);
-            esp_mqtt_client_publish(g_mqtt_client, s_layer_topic, layer_ip, 0, 1, 0);
+            esp_mqtt_client_publish(g_mqtt_client, s_layer_topic,
+                                    layer_ip, 0, 1, 0);
             mqtt_build_json(json, MQTT_JSON_BUFFER_SIZE);
             if (wifi_mqtt_publish(json) == ESP_OK) {
                 s_publish_fail_count = 0;
@@ -428,13 +449,6 @@ static void mqtt_publish_task(void *arg)
 
 /* ============================================================
    mqtt_watchdog_task
-
-   === FIX P1-5: watchdog — не дёргает одновременно restart и force_modem.
-   === FIX MQTT-NO-IP: при MQTT down сначала проверяем PPP:
-       - PPP down → НЕ вызываем wifi_mqtt_restart() (нет IP);
-         force_restart_modem() только при down > 5 мин (modem_ppp_stop
-         сам поднимет PPP заново);
-       - PPP up, MQTT down → wifi_mqtt_restart().
    ============================================================ */
 static void mqtt_watchdog_task(void *arg)
 {
@@ -464,26 +478,31 @@ static void mqtt_watchdog_task(void *arg)
             uint32_t down_ms = wifi_mqtt_get_down_ms();
 
             if (!ppp_up) {
-                /* === FIX MQTT-NO-IP: без PPP MQTT restart бессмысленен. === */
-                if (down_ms > MQTT_DOWN_RESTART_MS) {
-                    ESP_LOGE(TAG, "MQTT down %lu ms + PPP down → force restart modem",
+                if (down_ms > MQTT_FORCE_MODEM_MS) {
+                    ESP_LOGE(TAG, "MQTT down %lu ms + PPP down → "
+                                  "force restart modem",
                              (unsigned long)down_ms);
                     wifi_mqtt_force_restart_modem();
                     mqtt_set_down_since((uint32_t)(esp_timer_get_time() / 1000));
                     s_last_event_time = xTaskGetTickCount();
                 } else {
-                    ESP_LOGD(TAG, "MQTT down %lu ms, PPP down → wait modem_retry",
-                             (unsigned long)down_ms);
+                    ESP_LOGD(TAG, "MQTT down %lu ms, PPP down → "
+                                  "wait modem_retry", (unsigned long)down_ms);
                 }
                 continue;
             }
 
-            /* PPP up — можно рестартовать MQTT */
-            if (down_ms > MQTT_DOWN_RESTART_MS) {
+            if (down_ms > MQTT_FORCE_MODEM_MS) {
                 ESP_LOGE(TAG, "MQTT down %lu ms (> %d) → force restart modem",
-                         (unsigned long)down_ms, MQTT_DOWN_RESTART_MS);
+                         (unsigned long)down_ms, MQTT_FORCE_MODEM_MS);
                 wifi_mqtt_force_restart_modem();
                 mqtt_set_down_since((uint32_t)(esp_timer_get_time() / 1000));
+                s_last_event_time = xTaskGetTickCount();
+            } else if (down_ms > MQTT_DOWN_RESTART_MS) {
+                ESP_LOGW(TAG, "MQTT down %lu ms (> %d) → "
+                              "wifi_mqtt_restart() (fast)",
+                         (unsigned long)down_ms, MQTT_DOWN_RESTART_MS);
+                wifi_mqtt_restart();
                 s_last_event_time = xTaskGetTickCount();
             } else if (since > MQTT_STUCK_TIMEOUT_MS) {
                 ESP_LOGW(TAG, "MQTT down %ld ms → wifi_mqtt_restart()",
@@ -494,15 +513,7 @@ static void mqtt_watchdog_task(void *arg)
         }
     }
 }
-/* === END FIX P1-5 / FIX MQTT-NO-IP === */
 
-/* ============================================================
-   wifi_mqtt_init
-
-   === FIX MQTT-NO-IP: не стартуем без PPP IP. Возвращаем
-       ESP_ERR_INVALID_STATE — вызывающий (connectivity.c) это
-       не считает ошибкой и повторит на следующей итерации.
-   ============================================================ */
 esp_err_t wifi_mqtt_init(void)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) {
@@ -510,19 +521,29 @@ esp_err_t wifi_mqtt_init(void)
         return ESP_OK;
     }
 
-    /* === FIX MQTT-NO-IP === */
     extern bool modem_ppp_is_connected(void);
     if (!modem_ppp_is_connected()) {
         ESP_LOGW(TAG, "wifi_mqtt_init: no PPP IP yet → defer");
         return ESP_ERR_INVALID_STATE;
     }
-    /* === END FIX MQTT-NO-IP === */
 
     wifi_mqtt_load_config();
     build_topics();
     wifi_mqtt_restart();
-    xTaskCreate(mqtt_publish_task, "mqtt_pub", 8192, NULL, 4, NULL);
-    xTaskCreate(mqtt_watchdog_task, "mqtt_wd", 4096, NULL, 3, NULL);
+
+    /* === FIX MQTT-TASKS-ONCE ===
+       on_got_ip и modem_retry_task могут оба вызвать wifi_mqtt_init.
+       Защита от двойного создания задач. */
+    if (!s_mqtt_tasks_started) {
+        s_mqtt_tasks_started = true;
+        xTaskCreate(mqtt_publish_task, "mqtt_pub", 8192, NULL, 4, NULL);
+        xTaskCreate(mqtt_watchdog_task, "mqtt_wd", 4096, NULL, 3, NULL);
+        ESP_LOGI(TAG, "wifi_mqtt: tasks created (mqtt_pub + mqtt_wd)");
+    } else {
+        ESP_LOGI(TAG, "wifi_mqtt: tasks already running, skip");
+    }
+    /* === END FIX MQTT-TASKS-ONCE === */
+
     return ESP_OK;
 }
 

@@ -22,6 +22,15 @@ pi4ioe5v6408_config_t expander_b = {
     .device_addr = 0x44, .clk_speed = 100000, .initialized = false,
 };
 
+/* === FIX I2C-EXPANDER-MUTEX ===
+   PI4IOE5V6408 set_pin_output = read-modify-write регистра
+   OUTPUT_PORT (2 I2C транзакции). Если две задачи (mux_task и
+   try_recovery) одновременно дёргают board_diag_en_set для
+   разных каналов на одном экспандере — одна установка теряется.
+   Защищаем board_diag_en_set мьютексом. */
+static SemaphoreHandle_t s_diag_en_mtx = NULL;
+/* === END FIX I2C-EXPANDER-MUTEX === */
+
 typedef struct { uint8_t expander; uint8_t pin; uint8_t channel; } diag_en_map_t;
 static const diag_en_map_t s_diag_en_map[] = {
     {0,0,11},{0,1,10},{0,2,7},{0,3,1},{0,4,2},{0,5,8},{0,6,5},{0,7,4},
@@ -34,7 +43,13 @@ esp_err_t board_diag_en_set(uint8_t channel, bool enable) {
         const diag_en_map_t *m = &s_diag_en_map[i];
         if (m->channel != channel) continue;
         pi4ioe5v6408_config_t *exp = (m->expander == 0) ? &expander_a : &expander_b;
-        return pi4ioe5v6408_set_pin_output(exp, m->pin, enable);
+
+        /* === FIX I2C-EXPANDER-MUTEX === */
+        if (s_diag_en_mtx) xSemaphoreTake(s_diag_en_mtx, portMAX_DELAY);
+        esp_err_t ret = pi4ioe5v6408_set_pin_output(exp, m->pin, enable);
+        if (s_diag_en_mtx) xSemaphoreGive(s_diag_en_mtx);
+        return ret;
+        /* === END FIX I2C-EXPANDER-MUTEX === */
     }
     return ESP_ERR_NOT_FOUND;
 }
@@ -43,7 +58,11 @@ void board_diag_en_all_off(void) {
     for (size_t i = 0; i < DIAG_EN_MAP_SIZE; i++) {
         const diag_en_map_t *m = &s_diag_en_map[i];
         pi4ioe5v6408_config_t *exp = (m->expander == 0) ? &expander_a : &expander_b;
+        /* === FIX I2C-EXPANDER-MUTEX === */
+        if (s_diag_en_mtx) xSemaphoreTake(s_diag_en_mtx, portMAX_DELAY);
         pi4ioe5v6408_set_pin_output(exp, m->pin, false);
+        if (s_diag_en_mtx) xSemaphoreGive(s_diag_en_mtx);
+        /* === END FIX I2C-EXPANDER-MUTEX === */
     }
 }
 
@@ -73,7 +92,10 @@ static imon_state_t classify_imon(int mv) {
     return IMON_STATE_OK;
 }
 
-/* Не берёт mux-мьютекс — вызывать ИЗ mux_task (или явно держать мьютекс). */
+/* Не берёт mux-мьютекс — вызывать ИЗ mux_task (или явно держать мьютекс).
+   === FIX DIAG-SETTLE-200 ===
+   esp_rom_delay_us(50) → 200 мкс: TPS27S100B t_DIAG_EN typ 10 мкс,
+   но с запасом на паразитную ёмкость. Некритично для цикла 1000 мс. */
 int board_read_iload_raw(uint8_t channel, imon_state_t *out_state, int *out_mv) {
     if (out_state) *out_state = IMON_STATE_UNKNOWN;
     if (out_mv)    *out_mv    = 0;
@@ -86,7 +108,7 @@ int board_read_iload_raw(uint8_t channel, imon_state_t *out_state, int *out_mv) 
     esp_err_t ret = board_diag_en_set(channel, true);
     if (ret == ESP_ERR_NOT_FOUND) { if (out_state) *out_state = IMON_STATE_NO_DIAG; return 0; }
     if (ret != ESP_OK) return -1;
-    esp_rom_delay_us(50);
+    esp_rom_delay_us(200);   /* === FIX DIAG-SETTLE-200 === */
 
     /* Вызывающий должен держать mux_get_mutex() */
     mux_select_channel(channel);
@@ -110,6 +132,11 @@ int board_read_iload_raw(uint8_t channel, imon_state_t *out_state, int *out_mv) 
 }
 
 esp_err_t board_hw_init(void) {
+    /* === FIX I2C-EXPANDER-MUTEX === */
+    if (!s_diag_en_mtx) s_diag_en_mtx = xSemaphoreCreateMutex();
+    if (!s_diag_en_mtx) return ESP_ERR_NO_MEM;
+    /* === END FIX I2C-EXPANDER-MUTEX === */
+
     if (i2c_bus_init() != ESP_OK) return ESP_FAIL;
     i2c_bus_scan();
     i2c_dump_all();

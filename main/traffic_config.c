@@ -10,9 +10,12 @@
    === FIX CONFLICT-LOG-ONCE ===
        Лог CONFLICT не спамит — не чаще 1 раза в 5 с на стадию.
 
-   Остальные FIX сохранены: GOST-RED-YELLOW-LIMIT,
-   GOST-CONFLICT-MATRIX, GOST-ALL-RED, PED-BLINK-MASK,
-   INSERT-NO-DOUBLE-SYNC.
+   === FIX ALL-RED-GREEN-ONLY ===
+       need_virtual_all_red: all-red нужен ТОЛЬКО между двумя
+       НАСТОЯЩИМИ DD_DUR_GREEN. GREEN_BLINK — часть зелёного,
+       RED_YELLOW — переходный. Раньше GREEN_BLINK считался
+       зелёным → ложный all-red 3→4 (GREEN→GREEN_BLINK),
+       NODE о нём не знал → рассинхрон.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -168,7 +171,13 @@ bool traffic_mask_has_conflict(uint16_t on_mask)
     return conflict;
 }
 
-/* === FIX GOST-ALL-RED === */
+/* === FIX ALL-RED-GREEN-ONLY ===
+   All-red нужен только между двумя НАСТОЯЩИМИ зелёными.
+   GREEN_BLINK — часть того же зелёного (мигание в конце),
+   RED_YELLOW — уже переходный (жёлтый присутствует).
+   Раньше GREEN_BLINK считался зелёным → для sequence
+   [3(GREEN),4(GREEN_BLINK)] вставлялся ложный all-red 2с,
+   о котором NODE не знал (ROOT не слал c: с on=0) → рассинхрон. */
 bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq)
 {
     if (from_seq == to_seq) return false;
@@ -179,10 +188,8 @@ bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq)
     const traffic_stage_dd_t *s2 = find_stage(g_config.traffic.sequence[to_seq]);
     if (!s1 || !s2) return false;
 
-    bool g1 = (s1->duration_kind == DD_DUR_GREEN ||
-               s1->duration_kind == DD_DUR_GREEN_BLINK);
-    bool g2 = (s2->duration_kind == DD_DUR_GREEN ||
-               s2->duration_kind == DD_DUR_GREEN_BLINK);
+    bool g1 = (s1->duration_kind == DD_DUR_GREEN);
+    bool g2 = (s2->duration_kind == DD_DUR_GREEN);
     if (!g1 || !g2) return false;
 
     int steps = (to_seq > from_seq)
@@ -202,18 +209,10 @@ bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq)
                   "(GOST Р 52289)", from_seq, to_seq);
     return true;
 }
+/* === END FIX ALL-RED-GREEN-ONLY === */
 
 /* ============================================================
    apply_stage_dd
-
-   === FIX APPLY-MASK-FOLLOW-ROOT ===
-       Для NODE в follow_root НЕ применяем маску по stage_dd —
-       только set_all_off. ROOT пришлёт sync: с маской.
-       Это защита от CONFLICT на NODE, даже если stage_dd
-       в конфиге противоречив (тестовый стенд MESH).
-
-   === FIX CONFLICT-LOG-ONCE ===
-       Лог CONFLICT не спамит — не чаще 1 раза в 5 с на стадию.
    ============================================================ */
 void apply_stage_dd(uint8_t seq_idx)
 {
@@ -224,9 +223,6 @@ void apply_stage_dd(uint8_t seq_idx)
         return;
     }
 
-    /* === FIX APPLY-MASK-FOLLOW-ROOT ===
-       NODE в follow_root не применяет stage_dd — ждёт sync: от ROOT.
-       Это защита от CONFLICT, даже если stage_dd в конфиге противоречив. */
     if (s_follow_root) {
         set_all_off();
         s_blink_mask = 0;
@@ -236,14 +232,12 @@ void apply_stage_dd(uint8_t seq_idx)
                       "(wait sync:)");
         return;
     }
-    /* === END FIX APPLY-MASK-FOLLOW-ROOT === */
 
     uint16_t will_be_on = 0;
     for (int i = 0; i < st->on_count; i++)
         will_be_on |= (1u << st->outputs_on[i]);
 
     if (traffic_mask_has_conflict(will_be_on)) {
-        /* === FIX CONFLICT-LOG-ONCE: не спамим === */
         static uint32_t s_last_conflict_warn_ms = 0;
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
         if (s_last_conflict_warn_ms == 0 ||
@@ -253,7 +247,6 @@ void apply_stage_dd(uint8_t seq_idx)
                           "→ forcing ALL_OFF (GOST Р 52289)",
                      st->id, seq_idx, (unsigned)will_be_on);
         }
-        /* === END FIX CONFLICT-LOG-ONCE === */
         set_all_off();
         s_blink_mask = 0;
         s_blink_on = false;
@@ -278,11 +271,9 @@ void apply_stage_dd(uint8_t seq_idx)
     }
     blink_mask &= ~on_mask;
 
-    /* === FIX PED-BLINK-MASK === */
     s_blink_mask = blink_mask;
     s_blink_on = false;
     s_blink_last_phase = 0;
-    /* === END FIX PED-BLINK-MASK === */
 
     uint32_t dur = stage_duration_ms(seq_idx);
     ESP_LOGD(TAG, "Stage → %u (%s) kind=%u dur=%lu on=0x%04X blink=0x%04X%s",
@@ -291,9 +282,7 @@ void apply_stage_dd(uint8_t seq_idx)
              (unsigned)on_mask, (unsigned)blink_mask,
              stage_is_pedestrian(seq_idx) ? " (PED)" : "");
 
-    /* === FIX INSERT-NO-DOUBLE-SYNC === */
     if (!s_follow_root && s_phase_change_cb && !s_in_force_phase) {
         s_phase_change_cb(seq_idx, dur);
     }
-    /* === END FIX INSERT-NO-DOUBLE-SYNC === */
 }

@@ -11,7 +11,7 @@ extern "C" {
 #endif
 
 #define MUX_DEFAULT_AVG_SAMPLES     8
-#define MUX_SETTLE_DELAY_US         50
+#define MUX_SETTLE_DELAY_US         200
 #define MUX_CHANNEL_COUNT           16
 
 #define MUX1_R_TOP                  100000.0f

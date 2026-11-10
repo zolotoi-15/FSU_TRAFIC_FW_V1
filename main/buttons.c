@@ -1,3 +1,13 @@
+/* ============================================================
+   buttons.c — BOOT (role), P7 (pedestrian), LED.
+
+   === FIX PED-NO-ECHO ===
+       ROOT шлёт pedestrian:request через traffic_light_request_pedestrian()
+       (внутри — transport_send_cmd). NODE — через transport_send_evt.
+       Двойной петли ROOT↔NODE больше нет благодаря _ex(true) в
+       node_proto.c и traffic_light.c.
+   ============================================================ */
+
 #include "buttons.h"
 #include "app_shared.h"
 #include "board_pins.h"
@@ -109,6 +119,14 @@ static bool p7_read_raw(void) {
     return (in & (1 << BTN_EXPANDER_B_PIN)) == 0;
 }
 
+/* ============================================================
+   button_p7_task
+   === FIX PED-NO-ECHO ===
+   На ROOT: traffic_light_request_pedestrian() сам шлёт
+   pedestrian:request в NODE (один раз).
+   На NODE: шлём pedestrian:request в ROOT через EVT (один раз).
+   ROOT применяет локально через _ex(true) — без эха обратно.
+   ============================================================ */
 static void button_p7_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(100));
     bool last_raw = false, stable = false;
@@ -137,12 +155,17 @@ static void button_p7_task(void *arg) {
                                  g_config.traffic.pedestrian.request_mode,
                                  g_config.traffic.hold.enabled);
 
+                        /* traffic_light_request_pedestrian() на ROOT
+                           сама отправит pedestrian:request в NODE (один раз).
+                           На NODE — только выставит локальный флаг
+                           (follow_root → delegate); отправку EVT делаем ниже. */
                         traffic_light_request_pedestrian();
 
                         if (g_config.role == DEVICE_ROLE_MASTER) {
-                            transport_send_cmd("pedestrian:request",
-                                               strlen("pedestrian:request"));
+                            /* ROOT: traffic_light_request_pedestrian()
+                               уже отправила CMD — дублировать не нужно. */
                         } else {
+                            /* NODE: сообщаем ROOT через EVT. */
                             transport_send_evt("pedestrian:request",
                                                strlen("pedestrian:request"));
                         }
