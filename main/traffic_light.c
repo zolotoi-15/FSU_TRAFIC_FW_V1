@@ -28,6 +28,29 @@
        s_mask_received. Иначе после traffic:stop/start NODE
        работал бы со старой маской в check_faults, пока не
        придёт новый c:.
+
+   === FIX NODE-BLINK-FOLLOW-ROOT ===
+       NODE в follow_root получает on+blink маску через c:.
+       on-каналы включаются в apply_mask, blink-каналы нужно
+       мигать локально — ROOT шлёт только маску, не тики
+       мигания.
+
+   === FIX APPLY-MASK-BLINK-RESET ===
+       При смене маски (новый c:) выключаем «залипшие»
+       blink-каналы предыдущей стадии, которых нет в новой
+       on|blink-маске.
+
+   === FIX BLINK-ALWAYS ===
+       Блок мигания blink-каналов вынесен в САМОЕ НАЧАЛО
+       traffic_task_loop (до всех continue). Раньше blink
+       выполнялся в конце цикла, после INSERT/HOLD/ALL_RED —
+       и во время insert ROOT блокировался на `continue`
+       (ожидание длительности стадии), из-за чего
+       green_blink/ped_blink на ROOT НЕ мигали, хотя NODE
+       (follow_root) мигал своим блоком до `continue`.
+       Теперь мигание не зависит от insert/hold/all_red —
+       работает и на ROOT, и на NODE, синхронно по
+       s_blink_mask + phase_blink_period_ms.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -120,6 +143,12 @@ static volatile bool    s_manual_override = false;
 static volatile uint8_t s_manual_seq = 0;
 
 static volatile bool     s_hold_pm_frozen = false;
+
+/* === FIX APPLY-MASK-BLINK-RESET ===
+   Кэш предыдущей маски для отслеживания «залипших» blink-каналов. */
+static uint16_t s_prev_blink_mask = 0;
+static uint16_t s_prev_on_mask    = 0;
+/* === END FIX APPLY-MASK-BLINK-RESET === */
 
 bool traffic_light_get_fault_blink_state(void) { return s_fault_blink_state; }
 
@@ -255,6 +284,8 @@ static uint32_t insert_duration_ms(uint8_t seq_idx)
 /* ============================================================
    traffic_task_loop
    === SIMPLIFIED-NO-CFG ===
+   === FIX NODE-BLINK-FOLLOW-ROOT ===
+   === FIX BLINK-ALWAYS ===
    ============================================================ */
 void traffic_task_loop(void *arg)
 {
@@ -274,6 +305,43 @@ void traffic_task_loop(void *arg)
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(20));
 
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+        /* ============================================================
+           === FIX BLINK-ALWAYS ===
+           Мигание blink-каналов выполняется В САМОМ НАЧАЛЕ цикла —
+           до всех continue. Раньше blink был в конце цикла (после
+           INSERT/HOLD/ALL_RED) и во время insert ROOT блокировался
+           на `continue` (ожидание длительности стадии), из-за чего
+           green_blink/ped_blink на ROOT НЕ мигали, хотя NODE
+           (follow_root) мигал своим блоком до `continue`.
+           Теперь:
+             - ROOT и NODE мигают одинаково;
+             - синхронно (s_blink_mask из apply_stage_dd/c:,
+               период phase_blink_period_ms);
+             - не зависит от insert/hold/all_red/ped_request.
+           Не мигаем, если:
+             - не RUNNING (STOPPED/PAUSED/NIGHT);
+             - fault != NONE (для YELLOW_BLINK — отдельный
+               fault_blink_yellow, ALL_OFF — все выключены);
+             - s_blink_mask == 0.
+           ============================================================ */
+        if (s_fault == TRAFFIC_FAULT_NONE &&
+            s_state == TRAFFIC_STATE_RUNNING &&
+            s_blink_mask != 0) {
+            uint16_t bm = s_blink_mask;
+            uint32_t per = phase_blink_period_ms();
+            if (now - s_blink_last_phase >= per) {
+                s_blink_last_phase = now;
+                s_blink_on = !s_blink_on;
+                for (int ch = 0; ch < 16; ch++) {
+                    if (bm & (1u << ch)) {
+                        if (s_blink_on) sr_output_on(ch);
+                        else            sr_output_off(ch);
+                    }
+                }
+            }
+        }
+        /* === END FIX BLINK-ALWAYS === */
 
         if (now - last_phase_log_ms >= 5000) {
             last_phase_log_ms = now;
@@ -296,6 +364,12 @@ void traffic_task_loop(void *arg)
         if (s_state != TRAFFIC_STATE_RUNNING &&
             s_state != TRAFFIC_STATE_NIGHT_YELLOW_BLINK) continue;
 
+        /* === FIX NODE-BLINK-FOLLOW-ROOT ===
+           NODE в follow_root: blink_mask уже мигает в начале цикла
+           (BLINK-ALWAYS). Здесь — только fault-мигание и `continue`,
+           чтобы NODE не крутил apply_stage_dd/insert/hold/
+           all_red (всё это делает ROOT, NODE получает готовые
+           маски через c:). */
         if (s_follow_root) {
             if (s_fault == TRAFFIC_FAULT_YELLOW_BLINK) {
                 uint32_t per = g_config.traffic.phases_ms.fault_blink_period;
@@ -308,6 +382,7 @@ void traffic_task_loop(void *arg)
             }
             continue;
         }
+        /* === END FIX NODE-BLINK-FOLLOW-ROOT === */
 
         /* stale ALL_OFF watchdog */
         if (s_state == TRAFFIC_STATE_RUNNING &&
@@ -666,18 +741,8 @@ void traffic_task_loop(void *arg)
             continue;
         }
 
-        uint16_t bm = s_blink_mask;
-        uint32_t per = phase_blink_period_ms();
-        if (bm && (now - s_blink_last_phase >= per)) {
-            s_blink_last_phase = now;
-            s_blink_on = !s_blink_on;
-            for (int ch = 0; ch < 16; ch++) {
-                if (bm & (1u << ch)) {
-                    if (s_blink_on) sr_output_on(ch);
-                    else            sr_output_off(ch);
-                }
-            }
-        }
+        /* === FIX BLINK-ALWAYS: старый блок blink удалён — он теперь
+           в начале цикла. === */
 
         bool need_fault = false;
         {
@@ -796,10 +861,7 @@ void traffic_task_loop(void *arg)
                      (unsigned long)ALL_RED_MIN_MS, next_phase);
 
             /* === FIX ALL-RED-NOTIFY ===
-               Явно сообщаем NODE: all-red, все каналы OFF.
-               После FIX ALL-RED-GREEN-ONLY в traffic_config.c
-               для sequence [3,4,5,1,2,6,7,1,2] all-red не
-               вставляется, но на будущее — оставляем. */
+               Явно сообщаем NODE: all-red, все каналы OFF. */
             send_all_off_to_node(ALL_RED_MIN_MS);
             /* === END FIX ALL-RED-NOTIFY === */
 
@@ -947,10 +1009,7 @@ esp_err_t traffic_light_start(void)
     s_night_mode = false;
     s_hold_pm_frozen = false;
 
-    /* === FIX MASK-RECEIVED-RESET ===
-       При старте NODE (follow_root) сбрасываем s_mask_received.
-       Иначе после traffic:start NODE работал бы со старой маской
-       в check_faults, пока не придёт новый c:. */
+    /* === FIX MASK-RECEIVED-RESET === */
     if (s_follow_root) {
         s_mask_received = false;
         s_expected_mask_from_root = 0;
@@ -1029,6 +1088,10 @@ esp_err_t traffic_light_stop(void)
     s_manual_override = false;
     s_expected_mask_from_root = 0;
     s_active_mask_from_root   = 0;
+    /* === FIX APPLY-MASK-BLINK-RESET: сброс кэша === */
+    s_prev_blink_mask = 0;
+    s_prev_on_mask    = 0;
+    /* === END FIX APPLY-MASK-BLINK-RESET === */
     xSemaphoreGive(s_mutex);
     set_all_off();
     ESP_LOGI(TAG, "STOP");
@@ -1108,6 +1171,10 @@ esp_err_t traffic_light_reset(void)
     s_manual_override = false;
     s_expected_mask_from_root = 0;
     s_active_mask_from_root   = 0;
+    /* === FIX APPLY-MASK-BLINK-RESET: сброс кэша === */
+    s_prev_blink_mask = 0;
+    s_prev_on_mask    = 0;
+    /* === END FIX APPLY-MASK-BLINK-RESET === */
     xSemaphoreGive(s_mutex);
     set_all_off();
     ESP_LOGI(TAG, "RESET");
@@ -1184,6 +1251,7 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
 
 /* ============================================================
    traffic_light_apply_mask
+   === FIX APPLY-MASK-BLINK-RESET ===
    ============================================================ */
 void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
                               uint8_t phase, uint32_t phase_ms,
@@ -1264,6 +1332,18 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
         ESP_LOGI(TAG, "APPLY MASK: first mask from ROOT → fault detection enabled");
         s_mask_received = true;
     }
+
+    /* === FIX APPLY-MASK-BLINK-RESET === */
+    if (blink_mask != s_prev_blink_mask || on_mask != s_prev_on_mask) {
+        uint16_t stale = s_prev_blink_mask & ~(on_mask | blink_mask);
+        for (int ch = 0; ch < 16; ch++) {
+            if (stale & (1u << ch)) sr_output_off(ch);
+        }
+        s_prev_blink_mask = blink_mask;
+        s_prev_on_mask    = on_mask;
+    }
+    /* === END FIX APPLY-MASK-BLINK-RESET === */
+
     xSemaphoreGive(s_mutex);
 
     for (int ch = 0; ch < 16; ch++) {

@@ -1,34 +1,48 @@
 /* ============================================================
-   sync_config.h — общие константы синхронизации ROOT/NODE.
+   time_sync.h — API синхронизации времени ROOT/NODE.
 
-   === FIX SYNC-LEAD-CONSISTENT ===
-   Раньше SYNC_LEAD_MS был разным в root_wd.c (500),
-   mqtt_apply.c (700) и node_proto.c (300). ROOT и NODE
-   применяли фазу с разной задержкой → рассинхрон светофоров.
-   Теперь единая константа для всех модулей.
-
-   === FIX SYNC-INTERVAL-1S ===
-   LORA_SYNC_INTERVAL_MS было 3000 → 1000. Окно несинхронности
-   при потере c: сокращается с 3 с до 1 с. Трафик: 29 байт/с
-   (ToA ~112 мс SF9/BW250) ≈ 11% эфира — приемлемо.
+   ROOT: SNTP (при получении IP) + DS1307 → time_sync_set()
+         NODE: получает time: от ROOT → time_sync_set()
+   Оба: time_sync_get() возвращает текущее UTC (sec + ms).
    ============================================================ */
 #pragma once
 
-/* Задержка между отправкой sync: и моментом применения фазы
-   на NODE. Должна покрывать: LoRa ToA (~112 мс SF9/BW250) +
-   FRAG_GAP_MS (250 мс) + запас на джиттер. */
-#define SYNC_LEAD_MS        250
+#include <stdint.h>
+#include <stdbool.h>
+#include "esp_err.h"
 
-/* Минимальный интервал между двумя sync: с одинаковой фазой
-   (защита от дублей). */
-#define SYNC_MIN_INTERVAL_MS  250
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-/* Период push time: (ROOT → NODE). */
-#define TIME_PUSH_PERIOD_MS   30000
+/* Инициализация. Читает DS1307 (если есть) в системные часы.
+   Вызывать один раз из app_main ПОСЛЕ rtc_init(). */
+esp_err_t time_sync_init(void);
 
-/* Период hold-resync (ROOT повторяет sync: пока NODE в hold). */
-#define HOLD_RESYNC_INTERVAL_MS  500
+/* Получить текущее UTC-время.
+   Возвращает false, если время ещё не установлено (нет RTC/SNTP/ROOT).
+   unix_sec — секунды с 1970, ms — миллисекунды [0..999]. */
+bool time_sync_get(uint32_t *unix_sec, uint16_t *ms);
 
-/* Период полного sync: (ROOT → NODE) в обычном режиме.
-   === FIX SYNC-INTERVAL-1S: 3000 → 1000 === */
-#define LORA_SYNC_INTERVAL_MS    1000
+/* Установить время. rtt_us — round-trip (для компенсации задержки). */
+void time_sync_set(uint32_t unix_sec, uint16_t ms, uint32_t rtt_us);
+
+/* SNTP (только ROOT). Запускается из on_got_ip после IP. */
+esp_err_t time_sync_start_sntp(void);
+
+/* ROOT: push time: на NODE.
+   _force — игнорировать период TIME_SYNC_PUSH_PERIOD_MS (30 с). */
+void time_sync_root_push(uint32_t rtt_us);
+void time_sync_root_push_force(uint32_t rtt_us);
+
+/* NODE: периодический отчёт time: в ROOT (каждые 5 с). */
+void time_sync_node_report(void);
+
+/* Диагностика: последняя дельта (root - local) и её «возраст». */
+void    time_sync_note_delta_ms(int32_t delta_ms);
+int32_t time_sync_get_delta_ms(void);
+uint32_t time_sync_get_delta_age_ms(void);
+
+#ifdef __cplusplus
+}
+#endif

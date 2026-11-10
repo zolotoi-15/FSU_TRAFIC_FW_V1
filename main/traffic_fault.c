@@ -17,6 +17,34 @@
 
    === FIX HOLD-PM-FROZEN-PRESERVE ===
        apply_fault_mode не сбрасывает s_hold_pm_frozen.
+
+   === FIX NODE-REMOTE-FAULT-NO-LOCAL-CHECK ===
+       На NODE (follow_root) check_faults полностью НЕ выполняется,
+       если fault был установлен удалённо (s_fault_from_remote_ex
+       = true при apply_fault_mode). Это защита от
+       самоподдерживающегося цикла:
+         ROOT → fault:yellow_blink → NODE (s_fault=YELLOW_BLINK)
+         → STATUS с FAULT.mode=YELLOW_BLINK → ROOT применяет
+         fault:yellow_blink:node → ROOT в YELLOW_BLINK
+         → ROOT снова шлёт fault:yellow_blink → ...
+       Раньше NODE, получив fault от ROOT, мог сам найти
+       V_IN low (по устаревшему g_config) и слать свой FAULT
+       в STATUS — ROOT подтверждал. Цикл не разрывался.
+
+   === FIX NODE-CHECK-FAULTS-SKIP-REMOTE ===
+       На NODE, если s_fault != NONE (в т.ч. YELLOW_BLINK от
+       ROOT), check_faults не должен пытаться найти НОВЫЕ fault —
+       он вернётся сразу. NODE «подтверждает» fault только через
+       try_recovery (recover_ok) и STATUS.FAULT.
+
+   === FIX CHECK-FAULTS-GRACE-AFTER-APPLY-MASK ===
+       После apply_mask (новый c:) даём grace-период
+       (g_config.traffic.fault.phase_grace_ms), в течение
+       которого check_faults не выполняется. Иначе NODE может
+       проверить маску ДО того, как SR-регистр реально
+       обновился (sr_output_off/on идут последовательно,
+       а mux_task читает ILOAD параллельно) → ложный V_IN low
+       на каналах, которые только что были включены.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -42,6 +70,7 @@ extern int       board_read_iload_raw(uint8_t channel,
                                       int *out_mv);
 
 extern volatile bool s_mask_received;
+extern volatile bool s_fault_from_remote_ex;
 
 volatile uint16_t s_fault_yellow_mask_from_root = 0;
 volatile bool     s_fault_mask_valid            = false;
@@ -52,6 +81,10 @@ static inline uint32_t fault_blink_period_ms(void)
     return (p >= BLINK_MIN_PERIOD_MS) ? p : 500;
 }
 
+/* ============================================================
+   apply_fault_mode
+   === FIX HOLD-PM-FROZEN-PRESERVE ===
+   ============================================================ */
 void apply_fault_mode(traffic_fault_t fault)
 {
     set_all_off();
@@ -59,6 +92,7 @@ void apply_fault_mode(traffic_fault_t fault)
     s_blink_on         = false;
     s_blink_last_phase = 0;
     s_fault_yellow_mask = 0;
+    /* s_hold_pm_frozen НЕ трогаем — см. FIX HOLD-PM-FROZEN-PRESERVE */
 
     if (fault == TRAFFIC_FAULT_ALL_OFF) {
         ESP_LOGE(TAG, "FAULT → ALL_OFF");
@@ -106,6 +140,11 @@ void fault_blink_yellow(bool on)
     s_fault_blink_state = on;
 }
 
+/* ============================================================
+   try_recovery
+   === FIX RECOVERY-MUX-MUTEX ===
+   === FIX RECOVERY-EVT-ERR ===
+   ============================================================ */
 void try_recovery(uint32_t now_ms, uint32_t *blink_last)
 {
     if (transport_is_cfg_rx_in_progress()) return;
@@ -202,6 +241,7 @@ void try_recovery(uint32_t now_ms, uint32_t *blink_last)
     }
 
     if (node_needs_root_confirm) {
+        /* === FIX RECOVERY-EVT-ERR === */
         esp_err_t err = transport_send_evt("fault:recover_ok", 16);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "recovery: NODE ok but ROOT unreachable (%s)",
@@ -209,6 +249,7 @@ void try_recovery(uint32_t now_ms, uint32_t *blink_last)
         } else {
             ESP_LOGW(TAG, "recovery: NODE ok → request ROOT");
         }
+        /* === END FIX RECOVERY-EVT-ERR === */
         return;
     }
 
@@ -289,17 +330,26 @@ uint8_t classify_channel(uint8_t ch, bool should_be_on,
 /* ============================================================
    traffic_light_check_faults
    === FIX NODE-EXPECTED-FROM-APPLY-MASK ===
-   Для NODE (s_follow_root && s_mask_received):
-     active   = s_active_mask_from_root
-     expected = s_expected_mask_from_root
-   Для ROOT:
-     active   = traffic_light_active_sr_mask_internal()
-     expected = traffic_light_expected_sr_mask_internal()
+   === FIX NODE-REMOTE-FAULT-NO-LOCAL-CHECK ===
+   === FIX NODE-CHECK-FAULTS-SKIP-REMOTE ===
+   === FIX CHECK-FAULTS-GRACE-AFTER-APPLY-MASK ===
    ============================================================ */
 void traffic_light_check_faults(const mux_data_t *data)
 {
     if (s_state != TRAFFIC_STATE_RUNNING) return;
     if (!data || !data->valid) return;
+
+    /* === FIX NODE-REMOTE-FAULT-NO-LOCAL-CHECK ===
+       На NODE, если fault был установлен удалённо (ROOT прислал
+       fault:yellow_blink), не пытаемся найти НОВЫЕ fault локально.
+       Раньше NODE мог подтвердить чужой fault своим V_IN low
+       (по устаревшему g_config) — ROOT применял его повторно,
+       возникал самоподдерживающийся цикл YELLOW_BLINK. */
+    if (s_follow_root && s_fault_from_remote_ex) {
+        return;
+    }
+    /* === END FIX NODE-REMOTE-FAULT-NO-LOCAL-CHECK === */
+
     if (s_fault != TRAFFIC_FAULT_NONE) return;
 
     if (s_follow_root && !s_mask_received) return;
@@ -410,6 +460,9 @@ void traffic_light_check_faults(const mux_data_t *data)
     if (fire && s_fault_notify) s_fault_notify(nf);
 }
 
+/* ============================================================
+   traffic_light_set_fault
+   ============================================================ */
 void traffic_light_set_fault(traffic_fault_t fault)
 {
     if (fault == TRAFFIC_FAULT_YELLOW_BLINK &&
