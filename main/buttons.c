@@ -1,16 +1,26 @@
 /* ============================================================
-   buttons.c — BOOT (role), P7 (pedestrian), LED.
+   buttons.c — BOOT (role / recover), P7 (pedestrian), LED.
 
-   === FIX PED-NO-ECHO ===
-       ROOT шлёт pedestrian:request через traffic_light_request_pedestrian()
-       (внутри — transport_send_cmd). NODE — через transport_send_evt.
-       Двойной петли ROOT↔NODE больше нет благодаря _ex(true) в
-       node_proto.c и traffic_light.c.
+   === FIX I2C-EXPANDER-MUTEX-P7 ===
+       p7_read_raw читает INPUT_STATUS expander_b без мьютекса,
+       а board_diag_en_set дёргает тот же expander_b — I2C-
+       транзакции пересекаются, read может вернуть мусор →
+       ложное «нажатие». Берём board_expander_mutex().
+
+   === FIX P7-DEBOUNCE ===
+       BTN_DEBOUNCE_COUNT 2 → 5 (50 мс при poll 10 мс). Плюс
+       минимальный интервал между нажатиями 1000 мс — защита
+       от двойного срабатывания.
+
+   === FIX P7-INVERT ===
+       P7 подключена к VCC (нажата = 1). Если у вас P7 к GND —
+       поменяйте `!= 0` на `== 0` в p7_read_raw.
    ============================================================ */
 
 #include "buttons.h"
 #include "app_shared.h"
 #include "board_pins.h"
+#include "board_hw.h"
 #include "config_manager.h"
 #include "pi4ioe5v6408.h"
 #include "traffic_light.h"
@@ -23,6 +33,7 @@
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 static const char *TAG = "buttons";
 
@@ -34,7 +45,10 @@ static const char *TAG = "buttons";
 #define LED_CONFIRM_PERIOD_MS 150
 #define BTN_EXPANDER_B_PIN    7
 #define BTN_POLL_MS           10
-#define BTN_DEBOUNCE_COUNT    2
+/* === FIX P7-DEBOUNCE === */
+#define BTN_DEBOUNCE_COUNT    5      /* 50 мс при poll 10 мс */
+#define P7_MIN_INTERVAL_MS    1000   /* не чаще 1 раза в секунду */
+/* === END FIX P7-DEBOUNCE === */
 #define BTN_IDLE_POLL_MS      50
 
 static volatile device_role_t s_role = DEVICE_ROLE_MASTER;
@@ -95,14 +109,28 @@ static void role_button_task(void *arg) {
                 esp_restart();
             }
         } else if (!raw && pressed) {
-            if (!long_fired && g_config.role == DEVICE_ROLE_MASTER) {
-                uint8_t mac[6];
-                esp_read_mac(mac, ESP_MAC_WIFI_STA);
-                char mac_str[18];
-                snprintf(mac_str, sizeof(mac_str),
-                         "%02X:%02X:%02X:%02X:%02X:%02X",
-                         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-                mqtt_app_publish_wrapper(mac_str);
+            if (!long_fired) {
+                /* Короткое нажатие BOOT: если ROOT в ALL_OFF —
+                   восстановление; иначе — публикация MAC. */
+                traffic_fault_t f = traffic_light_get_fault();
+                if (g_config.role == DEVICE_ROLE_MASTER &&
+                    f == TRAFFIC_FAULT_ALL_OFF) {
+                    ESP_LOGW(TAG, "BOOT short press → restore from ALL_OFF");
+                    traffic_light_stop();
+                    traffic_light_set_fault(TRAFFIC_FAULT_NONE);
+                    traffic_light_start_with_red();
+                    transport_send_cmd_noack("traffic:start",
+                                             strlen("traffic:start"));
+                    wifi_mqtt_publish_event("recover", "manual:boot", NULL, 0);
+                } else {
+                    uint8_t mac[6];
+                    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+                    char mac_str[18];
+                    snprintf(mac_str, sizeof(mac_str),
+                             "%02X:%02X:%02X:%02X:%02X:%02X",
+                             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+                    mqtt_app_publish_wrapper(mac_str);
+                }
             }
             pressed = false;
             s_role_changing = false;
@@ -112,25 +140,33 @@ static void role_button_task(void *arg) {
     }
 }
 
+/* === FIX I2C-EXPANDER-MUTEX-P7 ===
+   Читаем INPUT_STATUS expander_b под мьютексом, чтобы не
+   пересечься с board_diag_en_set (read-modify-write OUTPUT_PORT
+   того же dev_handle → read_register может вернуть мусор). */
 static bool p7_read_raw(void) {
     uint8_t in = 0;
+    SemaphoreHandle_t mtx = board_expander_mutex();
+    if (mtx) xSemaphoreTake(mtx, portMAX_DELAY);
     esp_err_t err = pi4ioe5v6408_read_register(&expander_b, REG_INPUT_STATUS, &in);
+    if (mtx) xSemaphoreGive(mtx);
     if (err != ESP_OK) return false;
-    return (in & (1 << BTN_EXPANDER_B_PIN)) == 0;
-}
 
-/* ============================================================
-   button_p7_task
-   === FIX PED-NO-ECHO ===
-   На ROOT: traffic_light_request_pedestrian() сам шлёт
-   pedestrian:request в NODE (один раз).
-   На NODE: шлём pedestrian:request в ROOT через EVT (один раз).
-   ROOT применяет локально через _ex(true) — без эха обратно.
-   ============================================================ */
+    /* === FIX P7-INVERT ===
+       P7 подключена к VCC (активный высокий): нажата = 1.
+       Если у вас P7 к GND — поменяйте на `== 0`. */
+    return (in & (1 << BTN_EXPANDER_B_PIN)) != 0;
+    /* === END FIX P7-INVERT === */
+}
+/* === END FIX I2C-EXPANDER-MUTEX-P7 === */
+
 static void button_p7_task(void *arg) {
     vTaskDelay(pdMS_TO_TICKS(100));
     bool last_raw = false, stable = false;
     int same_count = 0;
+    /* === FIX P7-DEBOUNCE === */
+    uint32_t s_p7_last_press_ms = 0;
+    /* === END FIX P7-DEBOUNCE === */
 
     while (1) {
         if (!traffic_light_ped_button_enabled()) {
@@ -144,32 +180,34 @@ static void button_p7_task(void *arg) {
             if (same_count == BTN_DEBOUNCE_COUNT && raw != stable) {
                 stable = raw;
                 if (stable == true) {
-                    if (s_cfg_pushing || transport_is_cfg_rx_in_progress()) {
+                    /* === FIX P7-DEBOUNCE === */
+                    uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                    if (now_ms - s_p7_last_press_ms < P7_MIN_INTERVAL_MS) {
+                        ESP_LOGW(TAG, "P7 ignored (interval %lu ms)",
+                                 now_ms - s_p7_last_press_ms);
+                    } else if (s_cfg_pushing || transport_is_cfg_rx_in_progress()) {
                         ESP_LOGW(TAG, "P7 ignored (CFG in progress)");
                     } else if (g_config.role == DEVICE_ROLE_SLAVE && s_comm_lost) {
                         ESP_LOGW(TAG, "P7 ignored (NODE comm lost)");
                     } else {
+                        s_p7_last_press_ms = now_ms;
                         ESP_LOGI(TAG, "P7 pressed (role=%s, request_mode=%u, hold=%d)",
                                  g_config.role == DEVICE_ROLE_MASTER
                                      ? "ROOT" : "NODE",
                                  g_config.traffic.pedestrian.request_mode,
                                  g_config.traffic.hold.enabled);
 
-                        /* traffic_light_request_pedestrian() на ROOT
-                           сама отправит pedestrian:request в NODE (один раз).
-                           На NODE — только выставит локальный флаг
-                           (follow_root → delegate); отправку EVT делаем ниже. */
                         traffic_light_request_pedestrian();
 
                         if (g_config.role == DEVICE_ROLE_MASTER) {
                             /* ROOT: traffic_light_request_pedestrian()
-                               уже отправила CMD — дублировать не нужно. */
+                               уже отправила CMD. */
                         } else {
-                            /* NODE: сообщаем ROOT через EVT. */
                             transport_send_evt("pedestrian:request",
                                                strlen("pedestrian:request"));
                         }
                     }
+                    /* === END FIX P7-DEBOUNCE === */
                 }
             }
         } else {

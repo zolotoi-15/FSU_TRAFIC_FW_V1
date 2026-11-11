@@ -128,6 +128,16 @@ bool time_sync_get(uint32_t *unix_sec, uint16_t *ms)
     return true;
 }
 
+/* === FIX UTC-SYNC === */
+uint64_t time_sync_get_utc_ms(void)
+{
+    uint32_t sec = 0;
+    uint16_t ms  = 0;
+    if (!time_sync_get(&sec, &ms)) return 0;
+    return ((uint64_t)sec * 1000ULL) + (uint64_t)ms;
+}
+/* === END FIX UTC-SYNC === */
+
 void time_sync_set(uint32_t unix_sec, uint16_t ms, uint32_t rtt_us)
 {
     set_base(unix_sec, ms, rtt_us);
@@ -174,14 +184,6 @@ esp_err_t time_sync_start_sntp(void)
     return ESP_OK;
 }
 
-/* ============================================================
-   time_sync_root_push_ex
-   === FIX TIME-NOACK ===
-       time: — идемпотентная команда, отправится повторно через
-       30 с при потере. ACK-таймаут (2 с) при занятом эфире
-       (STATUS NODE) ложно помечает передачу как FAILED.
-       Используем noack.
-   ============================================================ */
 static void time_sync_root_push_ex(uint32_t rtt_us, bool force)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) return;
@@ -206,14 +208,12 @@ static void time_sync_root_push_ex(uint32_t rtt_us, bool force)
                      (unsigned long)sec, (unsigned)ms,
                      (unsigned long)rtt_us);
     if (n > 0) {
-        /* === FIX TIME-NOACK === */
         esp_err_t err = transport_send_cmd_noack(cmd, n);
         if (err != ESP_OK) {
             ESP_LOGW(TAG, "time_sync_root_push: %s", esp_err_to_name(err));
         } else {
             ESP_LOGD(TAG, "→ node: %s", cmd);
         }
-        /* === END FIX TIME-NOACK === */
     }
 }
 

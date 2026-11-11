@@ -57,12 +57,11 @@ static const char *duration_kind_to_str(uint8_t kind);
 static const char *ped_request_mode_to_str(uint8_t m);
 static const char *hold_on_ped_to_str(uint8_t m);
 
-/* Forward declarations for validators */
 static bool validate_phase_timings(traffic_config_t *tc);
 static void validate_insert_seq_against_sequence(traffic_config_t *tc);
 
 /* ============================================================
-   set_defaults_to — не трогает глобальный g_config.
+   set_defaults_to
    ============================================================ */
 static void set_defaults_to(app_config_t *cfg)
 {
@@ -135,8 +134,11 @@ static void set_defaults_to(app_config_t *cfg)
     cfg->traffic.pins.cross_ped.axis_a  = (traffic_color_pins_t){0,1,2};
     cfg->traffic.pins.cross_ped.axis_a2 = (traffic_color_pins_t){3,4,5};
     cfg->traffic.pins.cross_ped.axis_a3 = (traffic_color_pins_t){6,7,8};
-    cfg->traffic.pins.cross_ped.ped_red = 9;
-    cfg->traffic.pins.cross_ped.ped_green = 10;
+    cfg->traffic.pins.cross_ped.ped_red     = 9;
+    cfg->traffic.pins.cross_ped.ped_green   = 10;
+    /* === FIX PED-DISPLAY === */
+    cfg->traffic.pins.cross_ped.ped_display = 11;
+    /* === END FIX PED-DISPLAY === */
 
     cfg->traffic.phases_ms.red          = 8000;
     cfg->traffic.phases_ms.red_yellow   = 2000;
@@ -190,13 +192,7 @@ static void set_defaults_to(app_config_t *cfg)
 static void set_defaults(void) { set_defaults_to(&g_config); }
 
 /* ============================================================
-   config_load — читает NVS и валидирует.
-
-   === FIX VALIDATE-ON-LOAD ===
-       После чтения NVS-blob применяем validate_phase_timings и
-       validate_insert_seq_against_sequence. Иначе старые NVS-конфиги
-       (до фикса валидации) содержат insert_sequence с несуществующими
-       id — insert «пропускает» шаги, safe_exit пуст.
+   config_load
    ============================================================ */
 void config_load(void)
 {
@@ -218,7 +214,6 @@ void config_load(void)
         set_defaults();
         config_save();
     } else {
-        /* === FIX VALIDATE-ON-LOAD === */
         bool timings_changed = !validate_phase_timings(&g_config.traffic);
         uint8_t ins_before = g_config.traffic.pedestrian.insert_count;
         uint8_t sex_before = g_config.traffic.pedestrian.safe_exit_count;
@@ -235,12 +230,11 @@ void config_load(void)
                      timings_changed ? 1 : 0, seq_changed ? 1 : 0);
             config_save();
         }
-        /* === END FIX VALIDATE-ON-LOAD === */
 
         ESP_LOGI(TAG, "Config loaded (version=%.2f, SSID='%s', traffic.mode=%u, "
                       "stages=%u, seq=%u, ped_mode=%u, hold=%d/%u, "
                       "insert_red_ms=%lu, insert_seq=%u, safe_exit=%u, "
-                      "conflicts=%u)",
+                      "conflicts=%u, ped_display=%u)",
                  g_config.version,
                  g_config.wifi_ssid, g_config.traffic.mode,
                  g_config.traffic.stage_count, g_config.traffic.sequence_count,
@@ -250,7 +244,8 @@ void config_load(void)
                  (unsigned long)g_config.traffic.pedestrian.insert_red_ms,
                  g_config.traffic.pedestrian.insert_count,
                  g_config.traffic.pedestrian.safe_exit_count,
-                 g_config.traffic.conflict_count);
+                 g_config.traffic.conflict_count,
+                 g_config.traffic.pins.cross_ped.ped_display);
     }
 }
 
@@ -269,14 +264,16 @@ void config_save(void)
         config_cache_invalidate();
         ESP_LOGI(TAG, "Config saved to NVS (version=%.2f, %u bytes, "
                       "ped_mode=%u, hold=%d, insert_red_ms=%lu, "
-                      "insert_seq=%u, safe_exit=%u, conflicts=%u)",
+                      "insert_seq=%u, safe_exit=%u, conflicts=%u, "
+                      "ped_display=%u)",
                  g_config.version, (unsigned)sizeof(g_config),
                  g_config.traffic.pedestrian.request_mode,
                  g_config.traffic.hold.enabled,
                  (unsigned long)g_config.traffic.pedestrian.insert_red_ms,
                  g_config.traffic.pedestrian.insert_count,
                  g_config.traffic.pedestrian.safe_exit_count,
-                 g_config.traffic.conflict_count);
+                 g_config.traffic.conflict_count,
+                 g_config.traffic.pins.cross_ped.ped_display);
     } else {
         ESP_LOGE(TAG, "nvs_set_blob failed: %s", esp_err_to_name(err));
     }
@@ -786,6 +783,10 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
             if (cJSON_IsObject(ped)) {
                 tc->pins.cross_ped.ped_red   = (uint8_t)json_get_int(ped, "red", 9);
                 tc->pins.cross_ped.ped_green = (uint8_t)json_get_int(ped, "green", 10);
+                /* === FIX PED-DISPLAY === */
+                tc->pins.cross_ped.ped_display =
+                    (uint8_t)json_get_int(ped, "display", 11);
+                /* === END FIX PED-DISPLAY === */
             }
         }
     }
@@ -842,34 +843,6 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
         }
     }
 
-     if (tc->sequence_count >= 2) {
-        int green_adjacent = 0;
-        for (int i = 0; i < tc->sequence_count; i++) {
-            int nxt = (i + 1) % tc->sequence_count;
-            const traffic_stage_dd_t *s1 = NULL, *s2 = NULL;
-            for (int j = 0; j < tc->stage_count; j++) {
-                if (tc->stages[j].id == tc->sequence[i])   s1 = &tc->stages[j];
-                if (tc->stages[j].id == tc->sequence[nxt]) s2 = &tc->stages[j];
-            }
-            if (!s1 || !s2) continue;
-            /* === FIX ALL-RED-GREEN-ONLY: синхронизировано с
-               need_virtual_all_red() в traffic_config.c === */
-            bool g1 = (s1->duration_kind == DD_DUR_GREEN);
-            bool g2 = (s2->duration_kind == DD_DUR_GREEN);
-            if (g1 && g2) {
-                ESP_LOGW(TAG, "sequence: green stage id=%u followed by "
-                              "green id=%u WITHOUT all-red — will insert "
-                              "virtual all-red in traffic_light.c "
-                              "(GOST Р 52289)",
-                         s1->id, s2->id);
-                green_adjacent++;
-            }
-        }
-        if (green_adjacent == 0) {
-            ESP_LOGI(TAG, "sequence: all-red between greens OK");
-        }
-    }
-
     tc->conflict_count = 0;
     memset(tc->conflicting_channels, 0,
            sizeof(tc->conflicting_channels));
@@ -898,7 +871,6 @@ static void parse_traffic(const cJSON *t, traffic_config_t *tc)
     }
 
     validate_insert_seq_against_sequence(tc);
-
     validate_phase_timings(tc);
 }
 
@@ -912,7 +884,7 @@ static void parse_control_sources(const cJSON *arr) { (void)arr; }
 static void parse_modules(const cJSON *m)          { (void)m; }
 
 /* ============================================================
-   config_load_json (FULL)
+   config_load_json
    ============================================================ */
 bool config_load_json(const char *json, size_t len)
 {
@@ -1046,7 +1018,7 @@ bool config_load_json(const char *json, size_t len)
 
     ESP_LOGI(TAG, "JSON loaded (version=%.2f, role=%s, traffic stages=%u seq=%u, "
                   "ped_mode=%u, hold=%d/%u, insert_seq=%u, insert_red_ms=%lu, "
-                  "conflicts=%u)",
+                  "conflicts=%u, ped_display=%u)",
              g_config.version,
              g_config.role == DEVICE_ROLE_SLAVE ? "slave" : "master",
              g_config.traffic.stage_count,
@@ -1056,7 +1028,8 @@ bool config_load_json(const char *json, size_t len)
              g_config.traffic.hold.stage_count,
              g_config.traffic.pedestrian.insert_count,
              (unsigned long)g_config.traffic.pedestrian.insert_red_ms,
-             g_config.traffic.conflict_count);
+             g_config.traffic.conflict_count,
+             g_config.traffic.pins.cross_ped.ped_display);
 
     cfg_load_unlock();
     return true;
@@ -1244,6 +1217,10 @@ bool config_export_json(char *buf, size_t *len)
                 if (ped2) {
                     cJSON_AddNumberToObject(ped2, "red",   g_config.traffic.pins.cross_ped.ped_red);
                     cJSON_AddNumberToObject(ped2, "green", g_config.traffic.pins.cross_ped.ped_green);
+                    /* === FIX PED-DISPLAY === */
+                    cJSON_AddNumberToObject(ped2, "display",
+                                            g_config.traffic.pins.cross_ped.ped_display);
+                    /* === END FIX PED-DISPLAY === */
                 }
             }
         }
@@ -1357,8 +1334,9 @@ bool config_export_json(char *buf, size_t *len)
     s_cfg_json_len = n;
     free(out);
 
-    ESP_LOGI(TAG, "config_export_json: OK (%u bytes, conflicts=%u)",
-             (unsigned)n, g_config.traffic.conflict_count);
+    ESP_LOGI(TAG, "config_export_json: OK (%u bytes, conflicts=%u, ped_display=%u)",
+             (unsigned)n, g_config.traffic.conflict_count,
+             g_config.traffic.pins.cross_ped.ped_display);
     return true;
 }
 
@@ -1416,6 +1394,9 @@ bool config_export_lora_json(char *buf, size_t *len)
             }
             cJSON_AddItemToArray(cp, cJSON_CreateNumber(g_config.traffic.pins.cross_ped.ped_red));
             cJSON_AddItemToArray(cp, cJSON_CreateNumber(g_config.traffic.pins.cross_ped.ped_green));
+            /* === FIX PED-DISPLAY === */
+            cJSON_AddItemToArray(cp, cJSON_CreateNumber(g_config.traffic.pins.cross_ped.ped_display));
+            /* === END FIX PED-DISPLAY === */
         }
 
         cJSON *ph = cJSON_AddArrayToObject(t, "ph");
@@ -1563,9 +1544,7 @@ bool config_export_lora_json(char *buf, size_t *len)
 }
 
 /* ============================================================
-   config_load_lora_json — парсинг "ped" + "cf"
-   === FIX CONFLICT-ARRAY-RESET-LORA ===
-   === FIX INSERT-SEQ-VALIDATE ===
+   config_load_lora_json
    ============================================================ */
 bool config_load_lora_json(const char *json, size_t len)
 {
@@ -1633,7 +1612,7 @@ bool config_load_lora_json(const char *json, size_t len)
                 }
             }
             const cJSON *cp = cJSON_GetObjectItemCaseSensitive(pins, "cross_ped");
-            if (cJSON_IsArray(cp) && cJSON_GetArraySize(cp) >= 5) {
+            if (cJSON_IsArray(cp) && cJSON_GetArraySize(cp) >= 6) {
                 traffic_color_pins_t *dst[] = {
                     &tc->pins.cross_ped.axis_a,
                     &tc->pins.cross_ped.axis_a2,
@@ -1649,6 +1628,10 @@ bool config_load_lora_json(const char *json, size_t len)
                 }
                 tc->pins.cross_ped.ped_red   = (uint8_t)cJSON_GetArrayItem(cp, 3)->valueint;
                 tc->pins.cross_ped.ped_green = (uint8_t)cJSON_GetArrayItem(cp, 4)->valueint;
+                /* === FIX PED-DISPLAY === */
+                tc->pins.cross_ped.ped_display =
+                    (uint8_t)cJSON_GetArrayItem(cp, 5)->valueint;
+                /* === END FIX PED-DISPLAY === */
             }
         }
 
@@ -1874,7 +1857,6 @@ bool config_load_lora_json(const char *json, size_t len)
     }
 
     validate_insert_seq_against_sequence(&tmp->traffic);
-
     validate_phase_timings(&tmp->traffic);
 
     g_config = *tmp;
@@ -1882,7 +1864,7 @@ bool config_load_lora_json(const char *json, size_t len)
 
     ESP_LOGI(TAG, "lora_json loaded (version=%.2f, stages=%u seq=%u, "
                   "ped_mode=%u, hold=%d/%u, insert_seq=%u, insert_red_ms=%lu, "
-                  "safe_exit=%u, conflicts=%u, %u bytes)",
+                  "safe_exit=%u, conflicts=%u, ped_display=%u, %u bytes)",
              g_config.version, g_config.traffic.stage_count,
              g_config.traffic.sequence_count,
              g_config.traffic.pedestrian.request_mode,
@@ -1892,6 +1874,7 @@ bool config_load_lora_json(const char *json, size_t len)
              (unsigned long)g_config.traffic.pedestrian.insert_red_ms,
              g_config.traffic.pedestrian.safe_exit_count,
              g_config.traffic.conflict_count,
+             g_config.traffic.pins.cross_ped.ped_display,
              (unsigned)len);
 
     cfg_load_unlock();

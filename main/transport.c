@@ -1,26 +1,37 @@
 /* ============================================================
-   transport.c — LoRa-транспорт.
+   transport.c — LoRa + BLE транспорт.
 
    === SIMPLIFIED-NO-CFG ===
-       Убрано: T_CFG, retry_worker, cfg:reset/cfg:ok/cfg:req,
-       parse_fault_yellow_mask, s_last_cfg_buf, cfg_queue.
+       T_CFG, retry_worker, cfg:reset/cfg:ok/cfg:req убраны.
 
    === FIX PKT-48 ===
-       PKT_MAX = 48 (было 32). c: (28-29 байт) влезает
-       в один пакет. STATUS (150 байт) — 4 фрагмента вместо 7.
+       PKT_MAX = 48, FRAG_DATA_MAX = 41.
 
    === FIX STATUS-NOACK-AGAIN ===
-       ACK на последнем фрагменте STATUS создавал коллизии:
-       ROOT шлёт c:/ping/time: одновременно с последним фрагментом
-       STATUS → NODE не получает ACK → retry 3× → FAIL лавиной.
-       STATUS периодический (5 с), потеря перекроется следующим.
-       ACK оставлен только для T_CMD.
+       STATUS/EVT/CHANNELS — noack. ACK только T_CMD на последнем
+       фрагменте.
+
+   === FIX T_CHANNELS ===
+       T_CHANNELS = 6 — снимок 16 каналов NODE (1.4 КБ → 35
+       фрагментов). noack.
+
+   === FIX BLE-TRANSPORT ===
+       Единая точка transport_handle_raw_rx для LoRa RX и BLE RX.
+       BLE-сервер (ble_transport.c) вызывает transport_handle_raw_rx
+       при Write в CFG/CMD — те же байты, что и по LoRa. Логика
+       фрагментации/ACK/accum — общая.
+
+       transport_send_raw — отправка одного пакета через BLE (если
+       подключён) или LoRa. Основной путь — lora_send_fragmented*
+       (LoRa), BLE используется для конфигурации (ble_transport.c
+       сам шлёт JSON в RESP, не через transport_send_raw).
    ============================================================ */
 
 #include "transport.h"
 #include "lora.h"
 #include "config_manager.h"
 #include "root_wd.h"
+#include "ble_transport.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -44,9 +55,7 @@ static const char *TAG = "transport";
 #endif
 
 #define PKT_MAGIC         0x4C
-/* === FIX PKT-48 === */
 #define PKT_MAX           48
-/* === END FIX PKT-48 === */
 #define FRAG_HDR_SIZE     3
 #define FRAG_DATA_MAX     (PKT_MAX - 4 - FRAG_HDR_SIZE)   /* 41 */
 
@@ -65,10 +74,11 @@ static const char *TAG = "transport";
 #define ACCUM_CMD_MAX     2048
 #define ACCUM_STATUS_MAX  4096
 #define ACCUM_EVT_MAX     1024
+#define ACCUM_CHANNELS_MAX 4096
 
 #define ACK_QUEUE_LEN     64
 
-enum { T_CMD = 1, T_CFG = 2, T_STATUS = 3, T_EVT = 4, T_ACK = 5 };
+enum { T_CMD = 1, T_CFG = 2, T_STATUS = 3, T_EVT = 4, T_ACK = 5, T_CHANNELS = 6 };
 
 /* ============================================================
    State
@@ -87,23 +97,26 @@ static volatile uint32_t s_last_rx_ms   = 0;
 static transport_rx_cb_t s_cmd_cb    = NULL;
 static transport_rx_cb_t s_status_cb = NULL;
 static transport_rx_cb_t s_evt_cb    = NULL;
+static transport_rx_cb_t s_channels_cb = NULL;
 static transport_ack_cb_t s_ack_cb   = NULL;
 
 static char   s_accum_cmd[ACCUM_CMD_MAX];
 static char   s_accum_status[ACCUM_STATUS_MAX];
 static char   s_accum_evt[ACCUM_EVT_MAX];
+static char   s_accum_channels[ACCUM_CHANNELS_MAX];
+static volatile size_t s_accum_channels_len = 0;
 
 static volatile size_t s_accum_cmd_len    = 0;
 static volatile size_t s_accum_status_len = 0;
 static volatile size_t s_accum_evt_len    = 0;
 
-static volatile uint8_t s_next_frag_idx[6] = {0, 0, 0, 0, 0, 0};
-static uint8_t s_last_done_seq[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static volatile uint8_t s_next_frag_idx[7] = {0, 0, 0, 0, 0, 0, 0};
+static uint8_t s_last_done_seq[7] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 extern volatile uint32_t s_last_node_msg_ms;
 
 /* ============================================================
-   === SIMPLIFIED-NO-CFG: stub-функции для совместимости ===
+   SIMPLIFIED-NO-CFG: stub-функции
    ============================================================ */
 void transport_reset_cfg_accum(void) { }
 void transport_clear_cfg_expected(void) { }
@@ -113,17 +126,17 @@ esp_err_t transport_send_retry_request(uint8_t type, uint8_t start_frag_idx)
     (void)type; (void)start_frag_idx;
     return ESP_ERR_NOT_SUPPORTED;
 }
-/* === END SIMPLIFIED-NO-CFG === */
 
 static const char *pkt_type_str(uint8_t t)
 {
     switch (t) {
-        case T_CMD:    return "CMD";
-        case T_CFG:    return "CFG";
-        case T_STATUS: return "STATUS";
-        case T_EVT:    return "EVT";
-        case T_ACK:    return "ACK";
-        default:       return "?";
+        case T_CMD:      return "CMD";
+        case T_CFG:      return "CFG";
+        case T_STATUS:   return "STATUS";
+        case T_EVT:      return "EVT";
+        case T_ACK:      return "ACK";
+        case T_CHANNELS: return "CHANNELS";
+        default:         return "?";
     }
 }
 
@@ -210,11 +223,10 @@ static void wait_tx_idle(void)
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    ESP_LOGD(TAG, "wait_tx_idle: guard timeout (RX still active)");
 }
 
 /* ============================================================
-   lora_send_packet_ack — один пакет (с ACK или без)
+   lora_send_packet_ack
    ============================================================ */
 static esp_err_t lora_send_packet_ack(uint8_t type, uint8_t seq,
                                       const uint8_t *payload, size_t len,
@@ -297,10 +309,6 @@ static esp_err_t lora_send_packet_ack(uint8_t type, uint8_t seq,
 
 /* ============================================================
    lora_send_fragmented
-   === FIX STATUS-NOACK-AGAIN ===
-   ACK только для T_CMD (последний фрагмент).
-   T_EVT и T_STATUS — всегда noack (периодические, потеря
-   перекроется следующим).
    ============================================================ */
 static esp_err_t lora_send_fragmented(uint8_t type, const char *data, size_t len)
 {
@@ -331,14 +339,12 @@ static esp_err_t lora_send_fragmented(uint8_t type, const char *data, size_t len
 
         size_t payload_len = FRAG_HDR_SIZE + chunk;
 
-        /* === FIX STATUS-NOACK-AGAIN === */
         bool need_ack;
-        if (type == T_EVT || type == T_STATUS) {
+        if (type == T_EVT || type == T_STATUS || type == T_CHANNELS) {
             need_ack = false;
         } else {
-            need_ack = (flag == 0x00);   /* T_CMD — ACK на последнем */
+            need_ack = (flag == 0x00);
         }
-        /* === END FIX STATUS-NOACK-AGAIN === */
 
         esp_err_t err = lora_send_packet_ack(type, seq, buf, payload_len, need_ack);
         if (err != ESP_OK) {
@@ -353,7 +359,7 @@ static esp_err_t lora_send_fragmented(uint8_t type, const char *data, size_t len
         frag_idx++;
         if (sent < len) {
             uint32_t gap = FRAG_GAP_MS;
-            if (type == T_STATUS) gap += FRAG_GAP_STATUS_EXTRA_MS;
+            if (type == T_STATUS || type == T_CHANNELS) gap += FRAG_GAP_STATUS_EXTRA_MS;
             vTaskDelay(pdMS_TO_TICKS(gap));
         }
     }
@@ -372,6 +378,10 @@ static esp_err_t lora_send_fragmented_noack(uint8_t type,
     size_t sent = 0;
     int frag_idx = 0;
     int frag_total = (len + FRAG_DATA_MAX - 1) / FRAG_DATA_MAX;
+     // Для больших пакетов (CHANNELS = 30 фрагментов) нужен больший gap
+    uint32_t base_gap = FRAG_GAP_MS;
+    if (frag_total >= 10) base_gap = 300;
+    if (frag_total >= 20) base_gap = 400;
 
     while (sent < len) {
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -401,7 +411,7 @@ static esp_err_t lora_send_fragmented_noack(uint8_t type,
         seq++;
         frag_idx++;
         if (sent < len) {
-            uint32_t gap = FRAG_GAP_MS;
+            uint32_t gap = base_gap;
             if (type == T_STATUS) gap += FRAG_GAP_STATUS_EXTRA_MS;
             vTaskDelay(pdMS_TO_TICKS(gap));
         }
@@ -410,10 +420,19 @@ static esp_err_t lora_send_fragmented_noack(uint8_t type,
 }
 
 /* ============================================================
-   lora_raw_handler — RX
-   === SIMPLIFIED-NO-CFG: убраны T_CFG, retry, cfg:reset
+   lora_raw_handler — RX (LoRa). Делегирует в общий
+   transport_handle_raw_rx.
    ============================================================ */
 static void lora_raw_handler(const uint8_t *data, size_t len)
+{
+    transport_handle_raw_rx(data, len);
+}
+
+/* ============================================================
+   transport_handle_raw_rx — общая обработка (LoRa + BLE)
+   === FIX BLE-TRANSPORT ===
+   ============================================================ */
+void transport_handle_raw_rx(const uint8_t *data, size_t len)
 {
     if (len < 4 || data[0] != PKT_MAGIC) {
 #if TRANSPORT_LOG_RX
@@ -437,7 +456,7 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
         return;
     }
 
-    if (type == T_STATUS || type == T_EVT) {
+    if (type == T_STATUS || type == T_EVT || type == T_CHANNELS) {
         if (g_config.role == DEVICE_ROLE_MASTER) {
             s_last_node_msg_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
         }
@@ -451,8 +470,13 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
         case T_CMD:    accum = s_accum_cmd;    accum_len = &s_accum_cmd_len;    max_len = sizeof(s_accum_cmd);    break;
         case T_STATUS: accum = s_accum_status; accum_len = &s_accum_status_len; max_len = sizeof(s_accum_status); break;
         case T_EVT:    accum = s_accum_evt;    accum_len = &s_accum_evt_len;    max_len = sizeof(s_accum_evt);    break;
+        case T_CHANNELS:
+            accum = s_accum_channels;
+            accum_len = &s_accum_channels_len;
+            max_len = sizeof(s_accum_channels);
+            break;
         default:
-            return;   /* T_CFG больше не поддерживается */
+            return;
     }
 
     if (len < 4 + FRAG_HDR_SIZE || plen < FRAG_HDR_SIZE) return;
@@ -470,7 +494,7 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
         s_last_done_seq[type] = seq;
     }
 
-    if ((type == T_CMD || type == T_EVT || type == T_STATUS) && flag == 0x00) {
+    if ((type == T_CMD || type == T_EVT || type == T_STATUS || type == T_CHANNELS) && flag == 0x00) {
         if (s_ack_queue) {
             if (xQueueSend(s_ack_queue, &seq, 0) != pdTRUE) {
                 ESP_LOGW(TAG, "ack_queue FULL (seq=%u), ACK dropped", seq);
@@ -540,7 +564,7 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
         s_next_frag_idx[type] = 0;
 
 #if TRANSPORT_LOG_RX
-        if (type == T_EVT) {
+        if (type == T_EVT || type == T_CHANNELS) {
             ESP_LOGI(TAG, "RX %s assembled: %u bytes (frags %u/%u)",
                      pkt_type_str(type), (unsigned)*accum_len,
                      frag_idx + 1, frag_total);
@@ -561,11 +585,47 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
             case T_EVT:
                 if (s_evt_cb) s_evt_cb(accum, *accum_len);
                 break;
+            case T_CHANNELS:
+                if (s_channels_cb) s_channels_cb(accum, *accum_len);
+                break;
             default: break;
         }
         *accum_len = 0;
     }
 }
+
+/* === FIX BLE-TRANSPORT ===
+   transport_send_raw — отправка одного пакета через BLE (если
+   подключён) или LoRa. Основной путь — lora_send_fragmented*,
+   эта функция для совместимости. */
+esp_err_t transport_send_raw(uint8_t type, const uint8_t *payload, size_t len)
+{
+    if (!payload || len == 0) return ESP_ERR_INVALID_ARG;
+    if (len > PKT_MAX - 4) return ESP_ERR_INVALID_SIZE;
+
+    uint8_t buf[PKT_MAX];
+    buf[0] = PKT_MAGIC;
+    buf[1] = type;
+    buf[2] = (uint8_t)(esp_timer_get_time() & 0xFF);
+    buf[3] = (uint8_t)len;
+    memcpy(&buf[4], payload, len);
+
+    if (transport_is_ble_active()) {
+        /* === FIX BLE-NAME-CLASH === */
+        if (fsu_ble_send_raw(buf, 4 + len)) return ESP_OK;
+        /* === END FIX BLE-NAME-CLASH === */
+    }
+
+    return lora_send_packet(buf, (uint8_t)(4 + len));
+}
+
+bool transport_is_ble_active(void)
+{
+    /* === FIX BLE-NAME-CLASH === */
+    return fsu_ble_is_connected();
+    /* === END FIX BLE-NAME-CLASH === */
+}
+/* === END FIX BLE-TRANSPORT === */
 
 /* ============================================================
    transport_init
@@ -598,9 +658,9 @@ esp_err_t transport_init(void)
         s_use_lora = true;
         xTaskCreate(lora_poll_task, "lora_poll", 24576, NULL, 3, NULL);
         xTaskCreate(ack_tx_task,    "ack_tx",    4096,  NULL, 5, NULL);
-        ESP_LOGI(TAG, "Transport = LoRa only, PKT_MAX=%d "
+        ESP_LOGI(TAG, "Transport = LoRa + BLE, PKT_MAX=%d "
                  "(frag data=%d, hdr=%d, gap=%d ms, "
-                 "STATUS-NOACK, T_CMD-ACK-ON-LAST)",
+                 "STATUS/CHANNELS-NOACK, T_CMD-ACK-ON-LAST)",
                  PKT_MAX, FRAG_DATA_MAX, FRAG_HDR_SIZE, FRAG_GAP_MS);
         return ESP_OK;
     }
@@ -631,23 +691,17 @@ esp_err_t transport_send_cmd_noack(const char *cmd, size_t len)
     return lora_send_fragmented_noack(T_CMD, cmd, len);
 }
 
-/* CFG больше не используется */
 esp_err_t transport_send_cfg(const char *json, size_t len)
 {
     (void)json; (void)len;
     return ESP_ERR_NOT_SUPPORTED;
 }
 
-/* === FIX STATUS-NOACK-AGAIN ===
-   STATUS периодический (5 с), ACK не нужен. Если фрагмент
-   потерян — следующий STATUS перекроет. Это избегает
-   лавины ACK-timeouts и коллизий с c:/ping/time:. */
 esp_err_t transport_send_status(const char *json, size_t len)
 {
     if (!s_use_lora) return ESP_ERR_INVALID_STATE;
     return lora_send_fragmented_noack(T_STATUS, json, len);
 }
-/* === END FIX STATUS-NOACK-AGAIN === */
 
 esp_err_t transport_send_status_noack(const char *json, size_t len)
 {
@@ -667,6 +721,12 @@ esp_err_t transport_send_evt_noack(const char *evt, size_t len)
     return lora_send_fragmented_noack(T_EVT, evt, len);
 }
 
+esp_err_t transport_send_channels(const char *json, size_t len)
+{
+    if (!s_use_lora) return ESP_ERR_INVALID_STATE;
+    return lora_send_fragmented_noack(T_CHANNELS, json, len);
+}
+
 /* ============================================================
    Регистрация callbacks
    ============================================================ */
@@ -675,6 +735,7 @@ void transport_set_cfg_cb(transport_rx_cb_t cb)    { (void)cb; }
 void transport_set_status_cb(transport_rx_cb_t cb) { s_status_cb = cb; }
 void transport_set_evt_cb(transport_rx_cb_t cb)    { s_evt_cb = cb; }
 void transport_set_ack_cb(transport_ack_cb_t cb)   { s_ack_cb = cb; }
+void transport_set_channels_cb(transport_rx_cb_t cb) { s_channels_cb = cb; }
 
 bool transport_is_tx_idle(void)
 {

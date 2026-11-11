@@ -7,7 +7,15 @@
 #include "rs485.h"
 #include "can_bus.h"
 #include "modem_ppp.h"
+/* === FIX LORA-LINK-STATS === */
+#include "lora.h"
+#include "node_proto.h"
+/* === END FIX LORA-LINK-STATS === */
+/* === FIX BLE-NAME-CLASH === */
+#include "ble_transport.h"
+/* === END FIX BLE-NAME-CLASH === */
 #include "esp_timer.h"
+#include "esp_log.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -79,6 +87,30 @@ int mqtt_build_json(char *json, size_t size) {
     }
     APPEND("]},");
 
+    /* === FIX LORA-LINK-STATS === */
+    {
+        lora_link_stats_t root_ls = {0};
+        bool have_root = lora_get_last_rx_stats(&root_ls);
+
+        APPEND("\"LINK\":{");
+        APPEND("\"root\":{\"rssi\":%.1f,\"snr\":%.1f,\"sig_rssi\":%.1f,"
+               "\"age_ms\":%lu,\"valid\":%d},",
+               have_root ? root_ls.rssi : 0.0f,
+               have_root ? root_ls.snr : 0.0f,
+               have_root ? root_ls.sig_rssi : 0.0f,
+               (unsigned long)(have_root ? root_ls.age_ms : 0),
+               have_root ? 1 : 0);
+        APPEND("\"node\":{\"rssi\":%.1f,\"snr\":%.1f,\"sig_rssi\":%.1f,"
+               "\"age_ms\":%lu,\"valid\":%d}",
+               s_node_link_valid ? s_node_link_rssi : 0.0f,
+               s_node_link_valid ? s_node_link_snr : 0.0f,
+               s_node_link_valid ? s_node_link_sig_rssi : 0.0f,
+               (unsigned long)(s_node_link_valid ? s_node_link_age_ms : 0),
+               s_node_link_valid ? 1 : 0);
+        APPEND("},");
+    }
+    /* === END FIX LORA-LINK-STATS === */
+
     APPEND("\"NODE\":null,");
     if (s_node_fault_json[0]) APPEND("\"NODE_FAULT\":%s,", s_node_fault_json);
     else                      APPEND("\"NODE_FAULT\":null,");
@@ -121,5 +153,16 @@ int mqtt_build_json(char *json, size_t size) {
                (chx < 15) ? "," : "");
     }
     APPEND("}");
+
+    /* === FIX BLE-NAME-CLASH ===
+       Если телефон подключён — дублируем JSON в STATUS (Notify).
+       Публикуется из mqtt_publish_task раз в MQTT_PUBLISH_PERIOD_MS. */
+    if (fsu_ble_is_connected()) {
+        fsu_ble_notify_status(json, strlen(json));
+    }
+    /* === END FIX BLE-NAME-CLASH === */
+
+    (void)TAG;
+
     return off;
 }

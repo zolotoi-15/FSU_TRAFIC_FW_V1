@@ -126,8 +126,6 @@ void mqtt_fault_apply_remote(const char *fault_str, size_t len) {
         do_apply = true;
     }
 
-    /* === FIX #5: снимаем ЛЮБОЙ fault (в т.ч. ALL_OFF) по fault:none,
-       если это не comm-lost lock === */
     if (nf == TRAFFIC_FAULT_NONE &&
         root_fault != TRAFFIC_FAULT_NONE &&
         !s_root_comm_lost_all_off) {
@@ -138,14 +136,12 @@ void mqtt_fault_apply_remote(const char *fault_str, size_t len) {
         to_apply = TRAFFIC_FAULT_NONE;
         do_apply = true;
     }
-    /* === END FIX #5 === */
 
     if (do_apply) apply_fault_from_remote(to_apply);
     mqtt_fault_publish_node(fault_str, len);
     wifi_mqtt_publish_now();
 }
 
-/* === FIX: возвращаем bool — если FAULT не найден, не публикуем === */
 static bool parse_node_json_fault(const char *json, traffic_fault_t *out_nf,
                                   char *out_mode, size_t mode_sz) {
     *out_nf = TRAFFIC_FAULT_NONE;
@@ -193,7 +189,6 @@ static bool parse_node_json_fault(const char *json, traffic_fault_t *out_nf,
     else if (strcmp(out_mode, "YELLOW_BLINK") == 0) *out_nf = TRAFFIC_FAULT_YELLOW_BLINK;
     return true;
 }
-/* === END FIX === */
 
 void mqtt_fault_publish_node_json(const char *json, size_t len) {
     if (!json || len == 0) return;
@@ -263,6 +258,25 @@ void mqtt_fault_publish_node_json(const char *json, size_t len) {
 
     if (do_apply) apply_fault_from_remote(to_apply);
 }
+
+/* === FIX T_CHANNELS === */
+void mqtt_fault_publish_node_channels(const char *json, size_t len)
+{
+    if (!json || len == 0) return;
+    if (!s_mqtt_connected || !g_mqtt_client) {
+        ESP_LOGW(TAG, "publish node channels: MQTT not connected");
+        return;
+    }
+    int id = esp_mqtt_client_publish(g_mqtt_client, s_node_channels_topic,
+                                     json, (int)len, 1, 1);
+    if (id < 0) {
+        ESP_LOGW(TAG, "publish node channels failed");
+    } else {
+        ESP_LOGI(TAG, "published node channels → %s (%u bytes)",
+                 s_node_channels_topic, (unsigned)len);
+    }
+}
+/* === END FIX T_CHANNELS === */
 
 void mqtt_fault_reset_tracking(void) {
     s_last_node_fault_str[0] = '\0';

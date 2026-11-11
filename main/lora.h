@@ -8,6 +8,13 @@
 extern "C" {
 #endif
 
+typedef struct {
+    float    rssi;
+    float    snr;
+    float    sig_rssi;
+    uint32_t age_ms;
+} lora_link_stats_t;
+
 esp_err_t lora_init(void);
 void      lora_receive(void);
 esp_err_t lora_send_packet(uint8_t *buf, uint8_t size);
@@ -23,6 +30,7 @@ void lora_poll(void);
    не станет false, прежде чем отправить ACK. === */
 bool lora_is_tx_active(void);
 /* === END FIX TX-BUSY === */
+bool lora_get_last_rx_stats(lora_link_stats_t *out);
 
 #ifdef __cplusplus
 }

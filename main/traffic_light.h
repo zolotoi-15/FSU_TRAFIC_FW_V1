@@ -10,6 +10,35 @@
 extern "C" {
 #endif
 
+typedef struct {
+    uint8_t red, yellow, green;
+} traffic_color_pins_t;
+
+typedef struct {
+    uint8_t pin_red, pin_yellow, pin_green;
+} traffic_pins_single_t;
+
+typedef struct {
+    uint8_t a_north_red,  a_north_yellow,  a_north_green;
+    uint8_t a_south_red,  a_south_yellow,  a_south_green;
+    uint8_t b_west_red,   b_west_yellow,   b_west_green;
+    uint8_t b_east_red,   b_east_yellow,   b_east_green;
+} traffic_pins_cross_t;
+
+typedef struct {
+    uint8_t axis_a_red,  axis_a_yellow,  axis_a_green;
+    uint8_t axis_a2_red, axis_a2_yellow, axis_a2_green;
+    uint8_t axis_a3_red, axis_a3_yellow, axis_a3_green;
+    uint8_t ped_red,     ped_green;
+    /* === FIX PED-DISPLAY ===
+       "ЖДИТЕ" — выход, включается сразу после нажатия кнопки
+       пешеходом (s_ped_request || s_insert_pending) на ROOT и NODE
+       одновременно (через c: от ROOT), выключается, когда текущая
+       стадия — ped_green или ped_blink (stage_is_ped_green_or_blink). */
+    uint8_t ped_display;
+    /* === END FIX PED-DISPLAY === */
+} traffic_pins_cross_ped_t;
+
 typedef enum {
     TRAFFIC_MODE_SINGLE    = 1,
     TRAFFIC_MODE_CROSS     = 2,
@@ -20,9 +49,8 @@ typedef enum {
     TRAFFIC_STATE_STOPPED = 0,
     TRAFFIC_STATE_RUNNING = 1,
     TRAFFIC_STATE_PAUSED  = 2,
-    /* === FIX GOST-NIGHT-MODE: штатный ночной режим (ГОСТ Р 52289 п.4.2.6) === */
     TRAFFIC_STATE_NIGHT_YELLOW_BLINK = 3,
-    /* === END FIX GOST-NIGHT-MODE === */
+    TRAFFIC_STATE_RECOVERING = 4,
 } traffic_state_t;
 
 typedef enum {
@@ -68,24 +96,6 @@ typedef struct {
 } traffic_fault_info_t;
 
 #define TRAFFIC_FAULT_MAX   16
-
-typedef struct {
-    uint8_t pin_red, pin_yellow, pin_green;
-} traffic_pins_single_t;
-
-typedef struct {
-    uint8_t a_north_red,  a_north_yellow,  a_north_green;
-    uint8_t a_south_red,  a_south_yellow,  a_south_green;
-    uint8_t b_west_red,   b_west_yellow,   b_west_green;
-    uint8_t b_east_red,   b_east_yellow,   b_east_green;
-} traffic_pins_cross_t;
-
-typedef struct {
-    uint8_t axis_a_red,  axis_a_yellow,  axis_a_green;
-    uint8_t axis_a2_red, axis_a2_yellow, axis_a2_green;
-    uint8_t axis_a3_red, axis_a3_yellow, axis_a3_green;
-    uint8_t ped_red,     ped_green;
-} traffic_pins_cross_ped_t;
 
 esp_err_t traffic_light_init(void);
 
@@ -164,35 +174,34 @@ uint32_t traffic_light_last_recovery_ok_ms(void);
 bool traffic_light_get_fault_blink_state(void);
 void traffic_light_apply_fault_blink(bool on);
 
-/* === FIX GOST-NIGHT-MODE ===
-   Штатный ночной режим: жёлтое мигание без аварии.
-   - set_night_mode(true): переход в NIGHT_YELLOW_BLINK.
-   - set_night_mode(false): возврат в STOPPED (ждём traffic:start).
-   Отличается от TRAFFIC_FAULT_YELLOW_BLINK: fault= NONE, STATUS
-   пир получит как «state":"NIGHT_YELLOW_BLINK"», а не «FAULT». */
 esp_err_t traffic_light_set_night_mode(bool enable);
 bool      traffic_light_is_night_mode(void);
-/* === END FIX GOST-NIGHT-MODE === */
 
-/* === FIX GOST-MANUAL-CONTROL ===
-   Ручное управление от поста ДПС (ГОСТ Р 52289 п.5.1).
-   manual_override(seq_idx) — включить фазу seq_idx вручную,
-   traffic_task_loop не переключает фазы до manual_release(). */
 esp_err_t traffic_light_manual_override(uint8_t seq_idx);
 esp_err_t traffic_light_manual_release(void);
 bool      traffic_light_is_manual_override(void);
-/* === END FIX GOST-MANUAL-CONTROL === */
 
-/* === FIX GOST-PRIORITY-GREEN ===
-   Приоритет общественного транспорта / «зелёная улица».
-   priority_extend(ms) продлевает ТЕКУЩУЮ зелёную фазу на ms
-   (в пределах 60 с абсолютного максимума). Работает только
-   если текущая фаза — транспортный зелёный.
-   priority_shorten(ms) сокращает текущую зелёную фазу. */
 esp_err_t traffic_light_priority_extend(uint32_t ms);
 esp_err_t traffic_light_priority_shorten(uint32_t ms);
-/* === END FIX GOST-PRIORITY-GREEN === */
+
 void traffic_light_request_pedestrian_ex(bool from_remote);
+
+void traffic_light_set_state_recovering(void);
+esp_err_t traffic_light_start_with_red(void);
+
+/* === FIX PED-DISPLAY ===
+   Прямое управление выходом «ЖДИТЕ» (g_config.traffic.pins.cross_ped.ped_display).
+   Обычно не вызывается напрямую — display управляется в traffic_task_loop
+   (ROOT) и через c: от ROOT (NODE). Но полезно для mqtt_cmd при
+   pedestrian:request, чтобы включить ЖДИТЕ мгновенно на ROOT. */
+void traffic_light_ped_display_set(bool on);
+
+/* === FIX PED-DISPLAY ===
+   Проверка «текущая стадия — ped_green или ped_blink» по duration_kind.
+   Используется для решения, показывать ли ЖДИТЕ (пока FALSE — показывать,
+   TRUE — скрыть). */
+bool stage_is_ped_green_or_blink(uint8_t seq_idx);
+/* === END FIX PED-DISPLAY === */
 
 #ifdef __cplusplus
 }

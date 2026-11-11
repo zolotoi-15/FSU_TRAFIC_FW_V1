@@ -6,6 +6,17 @@
        mqtt_apply_config_runtime() НЕ вызывает traffic_light_start()
        для NODE — NODE остаётся в STOPPED + ALL_OFF до traffic:start
        от ROOT. Для ROOT — ALL_OFF до cfg:ok от NODE.
+
+   === FIX PED-DISPLAY-MQTT ===
+       В traffic_pins_cross_ped_t НЕ копировался .ped_display!
+       Структура pp на стеке инициализировалась нулём (C99: пропущенные
+       поля = 0), а traffic_light_set_pins_cross_ped() записывал этот
+       0 в g_config.traffic.pins.cross_ped.ped_display.
+
+       Итог: после app_main → wifi_mqtt_apply_config_runtime()
+       ped_display = 0 → «ЖДИТЕ» включалось на ch00 (красный первой
+       полосы) вместо ch11. Маска конфликтов ломалась (ch0 + ch2 и
+       т.п.), фазы после нажатия кнопки шли неверно.
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -31,6 +42,7 @@ void mqtt_apply_config_runtime(void)
         .pin_green  = g_config.traffic.pins.single.green,
     };
     traffic_light_set_pins_single(&ps);
+
     traffic_pins_cross_t pc = {
         .a_north_red    = g_config.traffic.pins.cross.a_north.red,
         .a_north_yellow = g_config.traffic.pins.cross.a_north.yellow,
@@ -46,6 +58,11 @@ void mqtt_apply_config_runtime(void)
         .b_east_green   = g_config.traffic.pins.cross.b_east.green,
     };
     traffic_light_set_pins_cross(&pc);
+
+    /* === FIX PED-DISPLAY-MQTT ===
+       .ped_display ОБЯЗАТЕЛЬНО копируем. Иначе C99 инициализирует
+       пропущенное поле нулём, и traffic_light_set_pins_cross_ped()
+       запишет ped_display = 0 в g_config. */
     traffic_pins_cross_ped_t pp = {
         .axis_a_red     = g_config.traffic.pins.cross_ped.axis_a.red,
         .axis_a_yellow  = g_config.traffic.pins.cross_ped.axis_a.yellow,
@@ -58,8 +75,12 @@ void mqtt_apply_config_runtime(void)
         .axis_a3_green  = g_config.traffic.pins.cross_ped.axis_a3.green,
         .ped_red        = g_config.traffic.pins.cross_ped.ped_red,
         .ped_green      = g_config.traffic.pins.cross_ped.ped_green,
+        /* === FIX PED-DISPLAY-MQTT === */
+        .ped_display    = g_config.traffic.pins.cross_ped.ped_display,
+        /* === END FIX PED-DISPLAY-MQTT === */
     };
     traffic_light_set_pins_cross_ped(&pp);
+    /* === END FIX PED-DISPLAY-MQTT === */
 
     traffic_light_stop();
     esp_err_t mr = traffic_light_set_mode((traffic_mode_t)g_config.traffic.mode);

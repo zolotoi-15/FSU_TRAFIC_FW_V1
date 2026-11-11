@@ -6,6 +6,18 @@
        если в окне LINK_*_EXPECT_MS реально не было пакета.
        Раньше счётчик рос слепо по таймеру и ложно срабатывал
        (has_node=0 при живом NODE).
+
+   === FIX SYNC-DELAY-ZERO ===
+       blink_reset_rtt() вызывается при старте — s_sync_delay_us
+       = 0. ROOT не шлёт delay:<us>, NODE игнорирует (см.
+       node_proto.c). Без этого NODE мог ждать до 2 с перед
+       apply_mask → отставание от ROOT.
+
+   === FIX BLE-TRANSPORT ===
+       ble_transport_init() вызывается после transport_init().
+       GATT-сервер для конфигурации с телефона (config.get/set,
+       lora.get/set, traffic.start/stop, reboot).
+       BLE-имя: ROOT → "FSU_ROOT", NODE → "FSU_NODE_XXXX".
    ============================================================ */
 
 #include <stdio.h>
@@ -47,6 +59,7 @@
 #include "buttons.h"
 #include "root_wd.h"
 #include "app_shared.h"
+#include "ble_transport.h"
 
 extern const uint8_t config_json_start[] asm("_binary_config_json_start");
 extern const uint8_t config_json_end[]   asm("_binary_config_json_end");
@@ -58,8 +71,8 @@ static const char *TAG = "board";
 #define NVS_KEY_CHUNK    "chunk_%d"
 #define PENDING_CHUNK_SZ 4096
 
-#define LINK_ROOT_EXPECT_MS   15000
-#define LINK_NODE_EXPECT_MS   15000
+#define LINK_ROOT_EXPECT_MS   10000
+#define LINK_NODE_EXPECT_MS   10000
 
 #define CFG_LOAD_TASK_STACK   24576
 
@@ -88,7 +101,7 @@ void blink_reset_rtt(void)
     s_rtt_delay_us = 0;
     s_rtt_samples = 0;
     s_last_pong_ms = 0;
-    traffic_light_set_sync_delay_us(0);
+    traffic_light_set_sync_delay_us(0);   /* === FIX SYNC-DELAY-ZERO === */
 }
 
 /* ============================================================
@@ -127,7 +140,7 @@ static void link_monitor_task(void *arg)
                 /* === FIX LINK-LOSS-SMART:
                    Проверяем, был ли STATUS реально за окно.
                    s_last_node_msg_ms обновляется в transport.c
-                   на КАЖДЫЙ RX от NODE (STATUS/EVT). === */
+                   на КАЖДЫЙ RX от NODE (STATUS/EVT/T_CHANNELS). === */
                 bool got_status = false;
                 if (s_last_node_msg_ms != 0) {
                     uint32_t node_tick = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -501,6 +514,23 @@ void app_main(void)
     transport_init();
     node_proto_register_callbacks();
 
+    /* === FIX BLE-TRANSPORT ===
+       GATT-сервер для конфигурации с телефона. Имя:
+       ROOT → "FSU_ROOT", NODE → "FSU_NODE_XXXX".
+       Не блокирует LoRa — работает параллельно. */
+    esp_err_t ble_err = fsu_ble_init();          /* === FIX BLE-NAME-CLASH === */
+if (ble_err != ESP_OK) {
+    ESP_LOGW(TAG, "fsu_ble_init: %s", esp_err_to_name(ble_err));
+} else {
+    ESP_LOGI(TAG, "BLE transport initialized");
+}
+    /* === END FIX BLE-TRANSPORT === */
+
+    /* === FIX SYNC-DELAY-ZERO ===
+       s_sync_delay_us = 0. NODE не ждёт перед apply_mask. */
+    blink_reset_rtt();
+    /* === END FIX SYNC-DELAY-ZERO === */
+
     xTaskCreate(link_monitor_task, "link_mon", 3072, NULL, 3, NULL);
 
     esp_netif_init();
@@ -513,11 +543,11 @@ void app_main(void)
         connectivity_start_tasks();
         mux_app_task_start();
         node_proto_start_root_tasks();
-        ESP_LOGI(TAG, "ROOT ready: LoRa CFG → traffic → PPP → MQTT");
+        ESP_LOGI(TAG, "ROOT ready: LoRa CFG → traffic → PPP → MQTT + BLE");
     } else {
         ESP_LOGI(TAG, "=== NODE init (no Wi-Fi STA) ===");
         node_proto_start_tasks();
         mux_app_task_start();
-        ESP_LOGI(TAG, "NODE ready: LoRa only, waiting for CFG");
+        ESP_LOGI(TAG, "NODE ready: LoRa only, waiting for CFG + BLE config");
     }
 }

@@ -6,6 +6,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include "esp_err.h"
+#include "traffic_light.h"
 
 #define MAX_PWM_CHANNELS 3
 #define MAX_NAME_LEN     32
@@ -227,9 +228,8 @@ typedef struct {
 #define MAX_SEQUENCE        16
 #define MAX_OUTPUTS         16
 
-typedef struct {
-    uint8_t  red, yellow, green;
-} traffic_color_pins_t;
+/* traffic_color_pins_t и traffic_pins_cross_ped_t
+   определены в traffic_light.h — см. #include выше. */
 
 typedef struct {
     traffic_color_pins_t single;
@@ -239,6 +239,11 @@ typedef struct {
     struct {
         traffic_color_pins_t axis_a, axis_a2, axis_a3;
         uint8_t ped_red, ped_green;
+        /* === FIX PED-DISPLAY ===
+           "ЖДИТЕ" — выход, включается сразу после нажатия кнопки
+           пешеходом, выключается при ped_green/ped_blink. */
+        uint8_t ped_display;
+        /* === END FIX PED-DISPLAY === */
     } cross_ped;
 } traffic_pins_config_t;
 
@@ -291,14 +296,8 @@ typedef struct {
     uint32_t insert_red_ms;
     bool     return_to_hold;
 
-    /* === FIX-SAFE-EXIT-CFG: настраиваемая последовательность
-       безопасного завершения пешеходного зелёного перед
-       return_to_hold. ID стадий из stages_dd.
-       Пример: [1, 2] → red → red_yellow → hold.
-       Пусто → fallback [red, red_yellow] (если есть в stages_dd). */
     uint8_t  safe_exit_sequence[MAX_INSERT_SEQ];
     uint8_t  safe_exit_count;
-    /* === END FIX-SAFE-EXIT-CFG === */
 } pedestrian_button_config_t;
 
 typedef struct {
@@ -309,17 +308,12 @@ typedef struct {
     uint8_t  on_ped_request;
 } traffic_hold_config_t;
 
-/* === FIX GOST-CONFLICT-MATRIX ===
-   Таблица конфликтов каналов: пары (a, b), которые НЕ МОГУТ
-   гореть одновременно (ГОСТ Р 52289 п.7.4.1 — конфликтующие
-   направления). Максимум пар — 64. */
 #define MAX_CONFLICT_PAIRS  64
 
 typedef struct {
     uint8_t a;
     uint8_t b;
 } traffic_conflict_pair_t;
-/* === END FIX GOST-CONFLICT-MATRIX === */
 
 typedef struct {
     uint8_t  mode;
@@ -342,10 +336,8 @@ typedef struct {
     uint8_t                 sequence[MAX_SEQUENCE];
     uint8_t                 sequence_count;
 
-    /* === FIX GOST-CONFLICT-MATRIX === */
     traffic_conflict_pair_t conflicting_channels[MAX_CONFLICT_PAIRS];
     uint8_t                 conflict_count;
-    /* === END FIX GOST-CONFLICT-MATRIX === */
 } traffic_config_t;
 
 typedef struct {
@@ -415,24 +407,8 @@ bool config_role_is_locked(void);
 esp_err_t      config_save_role(device_role_t role);
 device_role_t  config_load_role(void);
 
-/* ============================================================
-   LoRa JSON (short) — формат "ped" (FIX INSERT-RED-SHORT + FIX-SAFE-EXIT-CFG):
-
-     [0]=button_enabled    [1]=request_mode
-     [2]=insert_timeout    [3]=min_recall_s
-     [4]=insert_lead_ms    [5]=return_to_hold
-     [6]=insert_red_ms     [7]=insert_count
-     [8..8+insert_count-1]=insert_sequence[]
-     [8+insert_count]=safe_exit_count
-     [9+insert_count ..]=safe_exit_sequence[]
-
-   Legacy NODE (без safe_exit): psz будет меньше — safe_exit_count = 0
-   → fallback [red, red_yellow] на NODE.
-   ============================================================ */
 bool config_export_lora_json(char *buf, size_t *len);
 bool config_load_lora_json(const char *json, size_t len);
-
-/* Полный JSON (FULL). */
 bool config_export_json(char *buf, size_t *len);
 
 #endif

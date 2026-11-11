@@ -45,7 +45,7 @@ int       board_read_iload_raw(uint8_t channel,
      ROOT: on_node_status_from_transport → link_monitor_note_status_rx()
      NODE: on_cmd_from_root            → link_monitor_note_ping_rx()
    ============================================================ */
-#define LINK_LOST_MISSED_PKTS   5
+#define LINK_LOST_MISSED_PKTS   5//5
 
 extern volatile uint8_t s_root_missed_status;  /* ROOT: пропущено STATUS */
 extern volatile uint8_t s_node_missed_ping;    /* NODE: пропущено CMD/ping */

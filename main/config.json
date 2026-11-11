@@ -2,7 +2,7 @@
   "meta": {
     "version": 1.0,
     "id": 5555,
-    "name": "Тестовая мастерская — 2 направления + дублёр + пешеход (MESH, плавные переходы)"
+    "name": "Тестовая мастерская — 2 направления + дублёр + пешеход (MESH, плавные переходы, старт с красного, ЖДИТЕ на ch11)"
   },
 
   "wifi": {
@@ -39,7 +39,7 @@
         "axis_a":  { "red": 0, "yellow": 1, "green": 2 },
         "axis_a2": { "red": 3, "yellow": 4, "green": 5 },
         "axis_a3": { "red": 6, "yellow": 7, "green": 8 },
-        "ped":     { "red": 9, "green": 10 }
+        "ped":     { "red": 9, "green": 10, "display": 11 }
       }
     },
 
@@ -53,7 +53,7 @@
       "ped_green": 15000,
       "ped_blink": 4000,
       "fault_blink_period": 500,
-      "phase_blink_period": 500
+      "phase_blink_period": 1000
     },
 
     "fault": {
@@ -68,7 +68,7 @@
     "hold": {
       "enabled": true,
       "stage_ids": [3],
-      "max_hold_ms": 0,
+      "max_hold_ms": 25000,
       "on_ped_request": "insert"
     },
 
@@ -143,13 +143,12 @@
       }
     ],
 
-    "sequence": [3, 4, 5, 1, 2, 6, 7, 1, 2],
+    "sequence": [1, 2, 3, 4, 5, 6, 7, 1, 2],
 
     "conflicting_channels": [
-      [2, 11],
-      [5, 11],
-      [8, 11],
-      [11, 10]
+      [2, 10],
+      [5, 10],
+      [8, 10]
     ],
 
     "transitions": [

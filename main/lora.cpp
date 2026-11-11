@@ -1,4 +1,5 @@
 #include "lora.h"
+#include "lora_nvs.h"
 #include "board_pins.h"
 #include "esp_log.h"
 #include "driver/spi_master.h"
@@ -6,6 +7,7 @@
 #include "esp_rom_sys.h"
 #include "sx126x.hpp"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "freertos/semphr.h"
 #include <memory>
 #include <span>
@@ -19,16 +21,28 @@ static std::unique_ptr<espp::Sx126x> s_radio;
 static lora_raw_rx_cb_t s_raw_cb = nullptr;
 static SemaphoreHandle_t s_spi_mutex = NULL;
 
-/* === FIX TX-BUSY: флаг «радио сейчас в TX» — чтобы ack_tx_task
-   не пытался отправить ACK прямо во время TX. === */
+/* === FIX TX-BUSY === */
 static volatile bool s_tx_active = false;
 /* === END FIX TX-BUSY === */
 
-#define LORA_FREQ_HZ        718525050
-#define LORA_TX_POWER_DBM   17
-#define LORA_SF             9
-#define LORA_BW_KHZ         250
-#define LORA_CR             5
+/* === FIX LORA-LINK-STATS === */
+static volatile float    s_last_rssi     = 0.0f;
+static volatile float    s_last_snr      = 0.0f;
+static volatile float    s_last_sig_rssi = 0.0f;
+static volatile uint32_t s_last_rx_ms    = 0;
+static volatile bool     s_have_rx_stats = false;
+/* === END FIX LORA-LINK-STATS === */
+
+/* === FIX LORA-PARAMS-SYNC ===
+   Параметры модуляции (fallback, если NVS пуст).
+   SF9 / BW250 / CR4/5 / 869.85 МГц / 13 dBm.
+   ============================================================ */
+#define LORA_FREQ_HZ        869850000   /* 869.85 МГц — g4, 100% скважности, 25 мВт */
+#define LORA_TX_POWER_DBM   13          /* 13 dBm = 20 мВт (в пределах 25 мВт g4) */
+#define LORA_SF             8           /* SF7..SF12 */
+#define LORA_BW_KHZ         250         /* 125/250/500 */
+#define LORA_CR             5           /* 5=4/5, 6=4/6, 7=4/7, 8=4/8 */
+
 #define LORA_SYNC_WORD      0x12
 #define LORA_PREAMBLE_LEN   12
 #define LORA_USE_DIO2_SWITCH true
@@ -36,12 +50,62 @@ static volatile bool s_tx_active = false;
 #define LORA_CRC_ON         true
 #define LORA_RX_BOOST_GAIN  true
 
+#if   LORA_SF == 7
+#define LORA_SF_ENUM   espp::Sx126x::SpreadingFactor::SF7
+#define LORA_SF_STR    "SF7"
+#elif LORA_SF == 8
+#define LORA_SF_ENUM   espp::Sx126x::SpreadingFactor::SF8
+#define LORA_SF_STR    "SF8"
+#elif LORA_SF == 9
+#define LORA_SF_ENUM   espp::Sx126x::SpreadingFactor::SF9
+#define LORA_SF_STR    "SF9"
+#elif LORA_SF == 10
+#define LORA_SF_ENUM   espp::Sx126x::SpreadingFactor::SF10
+#define LORA_SF_STR    "SF10"
+#elif LORA_SF == 11
+#define LORA_SF_ENUM   espp::Sx126x::SpreadingFactor::SF11
+#define LORA_SF_STR    "SF11"
+#elif LORA_SF == 12
+#define LORA_SF_ENUM   espp::Sx126x::SpreadingFactor::SF12
+#define LORA_SF_STR    "SF12"
+#else
+#error "LORA_SF must be 7..12"
+#endif
+
+#if   LORA_BW_KHZ == 125
+#define LORA_BW_ENUM   espp::Sx126x::Bandwidth::BW_125_KHZ
+#define LORA_BW_STR    "BW125"
+#elif LORA_BW_KHZ == 250
+#define LORA_BW_ENUM   espp::Sx126x::Bandwidth::BW_250_KHZ
+#define LORA_BW_STR    "BW250"
+#elif LORA_BW_KHZ == 500
+#define LORA_BW_ENUM   espp::Sx126x::Bandwidth::BW_500_KHZ
+#define LORA_BW_STR    "BW500"
+#else
+#error "LORA_BW_KHZ must be 125, 250 or 500"
+#endif
+
+#if   LORA_CR == 5
+#define LORA_CR_ENUM   espp::Sx126x::CodingRate::CR_4_5
+#define LORA_CR_STR    "CR4/5"
+#elif LORA_CR == 6
+#define LORA_CR_ENUM   espp::Sx126x::CodingRate::CR_4_6
+#define LORA_CR_STR    "CR4/6"
+#elif LORA_CR == 7
+#define LORA_CR_ENUM   espp::Sx126x::CodingRate::CR_4_7
+#define LORA_CR_STR    "CR4/7"
+#elif LORA_CR == 8
+#define LORA_CR_ENUM   espp::Sx126x::CodingRate::CR_4_8
+#define LORA_CR_STR    "CR4/8"
+#else
+#error "LORA_CR must be 5..8"
+#endif
+/* === END FIX LORA-PARAMS-SYNC === */
+
 #define LORA_SPI_TX_TIMEOUT_MS  3000
 #define LORA_SPI_POLL_TIMEOUT_MS 200
 
-/* === FIX TX-RX-GAP: короткая пауза после TX перед start_receive,
-   чтобы радио успело переключиться и не потерять ACK от пира,
-   приходящий в первые миллисекунды после окончания нашего TX. === */
+/* === FIX TX-RX-GAP === */
 #define LORA_TX_RX_GAP_MS       5
 /* === END FIX TX-RX-GAP === */
 
@@ -75,10 +139,17 @@ static bool is_busy() { return gpio_get_level(LORA_BUSY) != 0; }
 static void reset(bool level) { gpio_set_level(LORA_RST, level ? 1 : 0); }
 
 static void on_rx_packet(const espp::Sx126x::RxPacket &pkt) {
-    /* === FIX TX-BUSY: если пришёл RX, значит радио уже не в TX —
-       сбрасываем флаг. Это позволяет ack_tx_task отправлять ACK. === */
+    /* === FIX TX-BUSY === */
     s_tx_active = false;
     /* === END FIX TX-BUSY === */
+
+    /* === FIX LORA-LINK-STATS === */
+    s_last_rssi     = pkt.status.rssi;
+    s_last_snr      = pkt.status.snr;
+    s_last_sig_rssi = pkt.status.signal_rssi;
+    s_last_rx_ms    = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    s_have_rx_stats = true;
+    /* === END FIX LORA-LINK-STATS === */
 
     ESP_LOGI(TAG, "on_rx_packet: %d bytes, rssi=%.1f, snr=%.1f, sig_rssi=%.1f",
              (int)pkt.data.size(), pkt.status.rssi, pkt.status.snr,
@@ -88,13 +159,14 @@ static void on_rx_packet(const espp::Sx126x::RxPacket &pkt) {
     }
 }
 
-static void log_lora_config(void) {
+static void log_lora_config(uint32_t freq_hz, int8_t pwr, uint8_t sf,
+                            uint16_t bw_khz, uint8_t cr) {
     ESP_LOGI(TAG, "LoRa config:");
-    ESP_LOGI(TAG, "  freq      = %lu Hz", (unsigned long)LORA_FREQ_HZ);
-    ESP_LOGI(TAG, "  tx_power  = %d dBm", LORA_TX_POWER_DBM);
-    ESP_LOGI(TAG, "  SF        = SF%d", LORA_SF);
-    ESP_LOGI(TAG, "  BW        = %d kHz", LORA_BW_KHZ);
-    ESP_LOGI(TAG, "  CR        = 4/%d", LORA_CR);
+    ESP_LOGI(TAG, "  freq      = %lu Hz", (unsigned long)freq_hz);
+    ESP_LOGI(TAG, "  tx_power  = %d dBm", pwr);
+    ESP_LOGI(TAG, "  SF        = SF%u", sf);
+    ESP_LOGI(TAG, "  BW        = BW%u (%u kHz)", bw_khz, bw_khz);
+    ESP_LOGI(TAG, "  CR        = 4/%u", cr);
     ESP_LOGI(TAG, "  sync_word = 0x%02X", LORA_SYNC_WORD);
     ESP_LOGI(TAG, "  preamble  = %d", LORA_PREAMBLE_LEN);
     ESP_LOGI(TAG, "  crc       = %s", LORA_CRC_ON ? "ON" : "OFF");
@@ -135,6 +207,55 @@ extern "C" esp_err_t lora_init(void) {
     gpio_set_direction(LORA_BUSY, GPIO_MODE_INPUT);
     gpio_set_direction(LORA_DIO0, GPIO_MODE_INPUT);
 
+    /* === FIX LORA-NVS-CONFIG ===
+       Читаем сохранённые параметры из NVS (устанавливаются через
+       BLE lora.set). Если нет — fallback на define-значения. */
+    uint32_t freq_hz = LORA_FREQ_HZ;
+    uint8_t  sf      = LORA_SF;
+    uint16_t bw_khz  = LORA_BW_KHZ;
+    uint8_t  cr      = LORA_CR;
+    int8_t   pwr     = LORA_TX_POWER_DBM;
+
+    lora_cfg_nvs_t saved;
+    if (lora_nvs_load(&saved)) {
+        freq_hz = saved.freq_hz;
+        sf      = saved.sf;
+        bw_khz  = saved.bw_khz;
+        cr      = saved.cr;
+        pwr     = saved.tx_power_dbm;
+        ESP_LOGI(TAG, "LoRa params from NVS: freq=%lu sf=%u bw=%u cr=%u pwr=%d",
+                 (unsigned long)freq_hz, sf, bw_khz, cr, pwr);
+    } else {
+        ESP_LOGI(TAG, "LoRa params from defines (NVS empty)");
+    }
+
+    espp::Sx126x::SpreadingFactor sf_enum;
+    switch (sf) {
+    case 7: sf_enum = espp::Sx126x::SpreadingFactor::SF7; break;
+    case 8: sf_enum = espp::Sx126x::SpreadingFactor::SF8; break;
+    case 9: sf_enum = espp::Sx126x::SpreadingFactor::SF9; break;
+    case 10: sf_enum = espp::Sx126x::SpreadingFactor::SF10; break;
+    case 11: sf_enum = espp::Sx126x::SpreadingFactor::SF11; break;
+    case 12: sf_enum = espp::Sx126x::SpreadingFactor::SF12; break;
+    default: sf_enum = espp::Sx126x::SpreadingFactor::SF9; break;
+    }
+    espp::Sx126x::Bandwidth bw_enum;
+    switch (bw_khz) {
+    case 125: bw_enum = espp::Sx126x::Bandwidth::BW_125_KHZ; break;
+    case 250: bw_enum = espp::Sx126x::Bandwidth::BW_250_KHZ; break;
+    case 500: bw_enum = espp::Sx126x::Bandwidth::BW_500_KHZ; break;
+    default:  bw_enum = espp::Sx126x::Bandwidth::BW_250_KHZ; break;
+    }
+    espp::Sx126x::CodingRate cr_enum;
+    switch (cr) {
+    case 5: cr_enum = espp::Sx126x::CodingRate::CR_4_5; break;
+    case 6: cr_enum = espp::Sx126x::CodingRate::CR_4_6; break;
+    case 7: cr_enum = espp::Sx126x::CodingRate::CR_4_7; break;
+    case 8: cr_enum = espp::Sx126x::CodingRate::CR_4_8; break;
+    default: cr_enum = espp::Sx126x::CodingRate::CR_4_5; break;
+    }
+    /* === END FIX LORA-NVS-CONFIG === */
+
     espp::Sx126x::Config cfg;
     cfg.variant = espp::Sx126x::Variant::LLCC68;
     cfg.write = spi_write;
@@ -146,11 +267,11 @@ extern "C" esp_err_t lora_init(void) {
     cfg.use_dcdc_regulator = LORA_USE_DCDC;
     cfg.auto_init = false;
 
-    cfg.radio_config.frequency_hz       = LORA_FREQ_HZ;
-    cfg.radio_config.tx_power_dbm       = LORA_TX_POWER_DBM;
-    cfg.radio_config.spreading_factor   = espp::Sx126x::SpreadingFactor::SF9;
-    cfg.radio_config.bandwidth          = espp::Sx126x::Bandwidth::BW_250_KHZ;
-    cfg.radio_config.coding_rate        = espp::Sx126x::CodingRate::CR_4_5;
+    cfg.radio_config.frequency_hz       = freq_hz;
+    cfg.radio_config.tx_power_dbm       = pwr;
+    cfg.radio_config.spreading_factor   = sf_enum;
+    cfg.radio_config.bandwidth          = bw_enum;
+    cfg.radio_config.coding_rate        = cr_enum;
     cfg.radio_config.sync_word          = LORA_SYNC_WORD;
     cfg.radio_config.preamble_length    = LORA_PREAMBLE_LEN;
     cfg.radio_config.crc_enabled        = LORA_CRC_ON;
@@ -171,16 +292,16 @@ extern "C" esp_err_t lora_init(void) {
         return ESP_FAIL;
     }
 
-    log_lora_config();
+    log_lora_config(freq_hz, pwr, sf, bw_khz, cr);
 
     auto toa_64 = s_radio->time_on_air(64);
     auto toa_25 = s_radio->time_on_air(25);
     ESP_LOGI(TAG, "ToA: 25B=%lld ms, 64B=%lld ms",
              (long long)toa_25.count(), (long long)toa_64.count());
 
-    ESP_LOGI(TAG, "LoRa ready (LLCC68, %lu MHz, SF%d/BW%d, %d dBm)",
-             (unsigned long)(LORA_FREQ_HZ / 1000000),
-             LORA_SF, LORA_BW_KHZ, LORA_TX_POWER_DBM);
+    ESP_LOGI(TAG, "LoRa ready (LLCC68, %lu MHz, SF%u/BW%u/CR4/%u, %d dBm)",
+             (unsigned long)(freq_hz / 1000000),
+             sf, bw_khz, cr, pwr);
 
     s_radio->start_receive(ec);
     if (ec) ESP_LOGE(TAG, "start_receive failed: %s", ec.message().c_str());
@@ -214,10 +335,7 @@ extern "C" esp_err_t lora_send_packet(uint8_t *buf, uint8_t size) {
         return ESP_ERR_TIMEOUT;
     }
 
-    /* === FIX TX-BUSY: помечаем «в TX», чтобы ack_tx_task не дёргал
-       lora_send_packet параллельно. === */
     s_tx_active = true;
-    /* === END FIX TX-BUSY === */
 
     std::error_code ec;
     bool ok = s_radio->transmit(std::span<const uint8_t>(buf, size),
@@ -225,23 +343,15 @@ extern "C" esp_err_t lora_send_packet(uint8_t *buf, uint8_t size) {
     ESP_LOGI(TAG, "tx ok=%d size=%u ec=%s", (int)ok, (unsigned)size,
              ec.message().c_str());
 
-    /* === FIX TX-RX-GAP: даём радио паузу после TX, чтобы пир успел
-       прислать ACK, и мы не потеряли его, если он придёт в первые
-       миллисекунды после окончания нашего TX. === */
     if (ok) {
         vTaskDelay(pdMS_TO_TICKS(LORA_TX_RX_GAP_MS));
     }
-    /* === END FIX TX-RX-GAP === */
 
     std::error_code ec2;
     s_radio->start_receive(ec2);
     if (ec2) ESP_LOGW(TAG, "start_receive after tx: %s", ec2.message().c_str());
 
-    /* === FIX TX-BUSY: сбрасываем флаг. Если за это время пришёл RX —
-       on_rx_packet уже сбросил его, но повторная установка в false
-       безопасна. === */
     s_tx_active = false;
-    /* === END FIX TX-BUSY === */
 
     if (s_spi_mutex) xSemaphoreGiveRecursive(s_spi_mutex);
 
@@ -257,9 +367,27 @@ extern "C" uint8_t lora_receive_packet(uint8_t *buf, uint8_t size) {
 extern "C" void lora_set_rx_callback(lora_raw_rx_cb_t cb) { s_raw_cb = cb; }
 extern "C" bool lora_is_ready(void) { return (bool)s_radio; }
 
-/* === FIX TX-BUSY: публичный геттер для ack_tx_task === */
 extern "C" bool lora_is_tx_active(void) { return s_tx_active; }
-/* === END FIX TX-BUSY === */
+
+/* === FIX LORA-LINK-STATS === */
+extern "C" bool lora_get_last_rx_stats(lora_link_stats_t *out)
+{
+    if (!out) return false;
+    if (!s_have_rx_stats) {
+        out->rssi = 0.0f;
+        out->snr = 0.0f;
+        out->sig_rssi = 0.0f;
+        out->age_ms = 0;
+        return false;
+    }
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    out->rssi     = s_last_rssi;
+    out->snr      = s_last_snr;
+    out->sig_rssi = s_last_sig_rssi;
+    out->age_ms   = (now >= s_last_rx_ms) ? (now - s_last_rx_ms) : 0;
+    return true;
+}
+/* === END FIX LORA-LINK-STATS === */
 
 extern "C" void lora_poll(void) {
     if (!s_radio) return;

@@ -11,7 +11,7 @@ idf_component_register(
         "connectivity.c"
         "i2c_bus.c"
         "pi4ioe5v6408.c"
-        "lora.cpp"        
+        "lora.cpp"
         "transport.c"
         "mux.c"
         "shift_register.c"
@@ -24,7 +24,10 @@ idf_component_register(
         "rs485.c"
         "can_bus.c"
         "time_sync.c"
-        #"wifi_ap_stub.c"
+        "lora_nvs.c"
+        "ble_transport.c"
+        "ble_config.c"
+        
     INCLUDE_DIRS "." "include"
     REQUIRES
         driver esp_driver_gpio esp_driver_uart esp_driver_spi freertos
@@ -32,7 +35,8 @@ idf_component_register(
         esp_adc esp_wifi esp_event esp_http_server lwip nvs_flash
         espressif__esp_modem
         espp__sx126x
-        # espressif__cjson  ← УДАЛЕНО (в IDF 6.x cJSON — managed component)
+        bt
+        cjson
 )
 
 target_add_binary_data(${COMPONENT_LIB} "config.json" TEXT)

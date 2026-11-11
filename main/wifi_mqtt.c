@@ -1,22 +1,3 @@
-/* ============================================================
-   wifi_mqtt.c — публичный API + MQTT-клиент.
-
-   === FIX MQTT-BUFFER-8192 ===
-       buffer.size = 8192.
-   === FIX MQTT-EVENT-DATA-LOG ===
-   === FIX MQTT-SUBSCRIBED-LOG ===
-   === FIX MQTT-FAST-RETRY ===
-   === FIX P1-5: убран двойной modem_ppp_stop(). ===
-   === FIX #7: URI с портом ===
-   === FIX MQTT-NO-IP ===
-
-   === FIX MQTT-TASKS-ONCE ===
-       wifi_mqtt_init() защищён от повторного создания
-       mqtt_publish_task / mqtt_watchdog_task. Раньше on_got_ip
-       (IP_EVENT_PPP_GOT_IP) и modem_retry_task могли оба вызвать
-       wifi_mqtt_init → две задачи → двойная публикация.
-   ============================================================ */
-
 #include "mqtt_internal.h"
 #include "config_manager.h"
 #include "wifi_ap.h"
@@ -34,6 +15,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "time_sync.h" 
 
 static const char *TAG = "wifi_mqtt";
 
@@ -48,6 +30,9 @@ char       s_json_topic[192];
 char       s_layer_topic[192];
 char       s_kp_topic[192];
 char       s_node_json_topic[192];
+/* === FIX T_CHANNELS === */
+char       s_node_channels_topic[192];
+/* === END FIX T_CHANNELS === */
 
 TickType_t s_last_event_time = 0;
 int        s_publish_fail_count = 0;
@@ -55,18 +40,20 @@ int        s_publish_fail_count = 0;
 static bool       s_restart_in_progress = false;
 static SemaphoreHandle_t s_restart_mutex = NULL;
 
-/* === FIX MQTT-TASKS-ONCE === */
 static bool s_mqtt_tasks_started = false;
-/* === END FIX MQTT-TASKS-ONCE === */
 
-/* === FIX MQTT-FAST-RETRY === */
 #define MQTT_DOWN_RESTART_MS    (30 * 1000)
 #define MQTT_FORCE_MODEM_MS     (5 * 60 * 1000)
-/* === END FIX MQTT-FAST-RETRY === */
 
 static volatile uint32_t s_mqtt_last_connected_ms    = 0;
 static volatile uint32_t s_mqtt_last_disconnected_ms = 0;
 static volatile uint32_t s_mqtt_down_since_ms        = 0;
+
+char       s_node_json_topic[192];
+/* === FIX MQTT-EVENTS === */
+char       s_events_topic[192];
+/* === END FIX MQTT-EVENTS === */
+char       s_node_channels_topic[192];
 
 static portMUX_TYPE s_mqtt_state_mtx = portMUX_INITIALIZER_UNLOCKED;
 
@@ -85,6 +72,50 @@ static inline uint32_t mqtt_get_down_since(void)
     portEXIT_CRITICAL(&s_mqtt_state_mtx);
     return v;
 }
+
+/* === FIX MQTT-EVENTS ===
+   Публикует событие аварии/восстановления в <base>/Events.
+   Формат: {"ts":"2026-11-10T12:34:56.789Z","type":"fault",
+            "detail":"short to GND (SR=1, V_IN=0, I=0)","role":"root"} */
+void wifi_mqtt_publish_event(const char *type, const char *detail,
+                             const void *data, size_t data_len)
+{
+    if (!s_mqtt_connected || !g_mqtt_client) return;
+    if (!type) return;
+
+    uint32_t sec = 0; uint16_t ms = 0;
+    char ts[40] = "1970-01-01T00:00:00.000Z";
+    if (time_sync_get(&sec, &ms)) {
+        time_t t = (time_t)sec;
+        struct tm tm_utc;
+        gmtime_r(&t, &tm_utc);
+        char date[24] = {0};
+        strftime(date, sizeof(date), "%Y-%m-%dT%H:%M:%S", &tm_utc);
+        snprintf(ts, sizeof(ts), "%s.%03uZ", date, (unsigned)(ms % 1000));
+    }
+
+    char buf[512];
+    int n;
+    if (data && data_len > 0 && data_len < 256) {
+        n = snprintf(buf, sizeof(buf),
+                     "{\"ts\":\"%s\",\"type\":\"%s\",\"detail\":\"%s\","
+                     "\"data\":\"%.*s\",\"role\":\"%s\"}",
+                     ts, type, detail ? detail : "",
+                     (int)data_len, (const char *)data,
+                     g_config.role == DEVICE_ROLE_MASTER ? "root" : "node");
+    } else {
+        n = snprintf(buf, sizeof(buf),
+                     "{\"ts\":\"%s\",\"type\":\"%s\",\"detail\":\"%s\","
+                     "\"role\":\"%s\"}",
+                     ts, type, detail ? detail : "",
+                     g_config.role == DEVICE_ROLE_MASTER ? "root" : "node");
+    }
+    if (n > 0) {
+        esp_mqtt_client_publish(g_mqtt_client, s_events_topic, buf, n, 1, 1);
+        ESP_LOGI(TAG, "EVENT → %s: %s", s_events_topic, buf);
+    }
+}
+/* === END FIX MQTT-EVENTS === */
 
 #define NVS_NS_MQTT "mqtt_cfg"
 
@@ -141,7 +172,6 @@ void wifi_mqtt_save_config(void)
     }
 }
 
-/* === FIX #7: собираем URI с портом вручную === */
 static void build_broker_uri(char *out, size_t out_len)
 {
     const char *uri = g_mqtt_config.broker_url;
@@ -192,11 +222,18 @@ static void build_topics(void)
     snprintf(s_layer_topic, sizeof(s_layer_topic), "%s/Layer",     s_topic);
     snprintf(s_kp_topic,    sizeof(s_kp_topic),    "%s/key_pressed", s_topic);
     snprintf(s_node_json_topic, sizeof(s_node_json_topic), "%s/Node", s_topic);
+    /* === FIX T_CHANNELS === */
+    snprintf(s_node_channels_topic, sizeof(s_node_channels_topic),
+             "%s/Node/Channels", s_topic);
+    /* === END FIX T_CHANNELS === */
 
     ESP_LOGI(TAG, "Topic:      %s", s_topic);
     ESP_LOGI(TAG, "Subscribe:  %s", s_sub_topic);
     ESP_LOGI(TAG, "JSON in:    %s", s_json_topic);
     ESP_LOGI(TAG, "Node JSON:  %s", s_node_json_topic);
+    /* === FIX T_CHANNELS === */
+    ESP_LOGI(TAG, "NodeChannels: %s", s_node_channels_topic);
+    /* === END FIX T_CHANNELS === */
 }
 
 int wifi_mqtt_fault_priority_ex(traffic_fault_t f) { return mqtt_fault_priority(f); }
@@ -221,6 +258,12 @@ void wifi_mqtt_set_phase_sync_enabled(bool en) {
 }
 const char *wifi_mqtt_last_node_fault(void) { return ""; }
 
+/* === FIX T_CHANNELS === */
+void wifi_mqtt_publish_node_channels(const char *json, size_t len) {
+    mqtt_fault_publish_node_channels(json, len);
+}
+/* === END FIX T_CHANNELS === */
+
 uint32_t wifi_mqtt_get_down_ms(void)
 {
     if (s_mqtt_connected) return 0;
@@ -237,9 +280,6 @@ void wifi_mqtt_force_restart_modem(void)
     modem_ppp_stop();
 }
 
-/* ============================================================
-   mqtt_event_handler
-   ============================================================ */
 static void mqtt_event_handler(void *args, esp_event_base_t base,
                                int32_t event_id, void *event_data)
 {
@@ -447,9 +487,6 @@ static void mqtt_publish_task(void *arg)
     }
 }
 
-/* ============================================================
-   mqtt_watchdog_task
-   ============================================================ */
 static void mqtt_watchdog_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(30000));
@@ -531,9 +568,6 @@ esp_err_t wifi_mqtt_init(void)
     build_topics();
     wifi_mqtt_restart();
 
-    /* === FIX MQTT-TASKS-ONCE ===
-       on_got_ip и modem_retry_task могут оба вызвать wifi_mqtt_init.
-       Защита от двойного создания задач. */
     if (!s_mqtt_tasks_started) {
         s_mqtt_tasks_started = true;
         xTaskCreate(mqtt_publish_task, "mqtt_pub", 8192, NULL, 4, NULL);
@@ -542,7 +576,6 @@ esp_err_t wifi_mqtt_init(void)
     } else {
         ESP_LOGI(TAG, "wifi_mqtt: tasks already running, skip");
     }
-    /* === END FIX MQTT-TASKS-ONCE === */
 
     return ESP_OK;
 }
@@ -556,6 +589,43 @@ void wifi_mqtt_stop(void)
     }
     s_mqtt_connected = false;
     mqtt_json_accum_reset();
+}
+
+void wifi_mqtt_publish_comm_lost(uint32_t lost_ms)
+{
+    if (!s_mqtt_connected || !g_mqtt_client) {
+        ESP_LOGW(TAG, "publish_comm_lost: MQTT not connected");
+        return;
+    }
+    char msg[256];
+    int n = snprintf(msg, sizeof(msg),
+        "{\"error\":\"comm_lost\","
+        "\"role\":\"%s\","
+        "\"lost_ms\":%lu,"
+        "\"channels\":\"ALL_OFF\","
+        "\"action\":\"recovering\"}",
+        g_config.role == DEVICE_ROLE_MASTER ? "root" : "node",
+        (unsigned long)lost_ms);
+    if (n > 0) {
+        int id = esp_mqtt_client_publish(g_mqtt_client, s_topic,
+                                         msg, n, 1, 0);
+        ESP_LOGW(TAG, "COMM_LOST published (id=%d): %s", id, msg);
+    }
+}
+
+void wifi_mqtt_publish_comm_restored(void)
+{
+    if (!s_mqtt_connected || !g_mqtt_client) return;
+    char msg[192];
+    int n = snprintf(msg, sizeof(msg),
+        "{\"status\":\"comm_restored\","
+        "\"role\":\"%s\","
+        "\"action\":\"start_with_red\"}",
+        g_config.role == DEVICE_ROLE_MASTER ? "root" : "node");
+    if (n > 0) {
+        esp_mqtt_client_publish(g_mqtt_client, s_topic, msg, n, 1, 0);
+        ESP_LOGI(TAG, "COMM_RESTORED published: %s", msg);
+    }
 }
 
 bool wifi_mqtt_is_connected(void) { return s_mqtt_connected; }

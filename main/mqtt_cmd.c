@@ -364,10 +364,24 @@ void mqtt_handle_command(const char *data, int data_len)
         goto publish;
     }
     if (strcmp(cmd, "traffic:start") == 0) {
+    /* === FIX ALL-OFF-MANUAL-ONLY ===
+       Если ROOT в ALL_OFF — сначала снять fault, потом
+       start_with_red (восстановление с красного). Иначе — обычный
+       traffic_light_start(). */
+    if (traffic_light_get_fault() == TRAFFIC_FAULT_ALL_OFF) {
+        ESP_LOGW(TAG, "traffic:start → recover from ALL_OFF");
+        traffic_light_stop();
+        traffic_light_set_fault(TRAFFIC_FAULT_NONE);
+        traffic_light_start_with_red();
+        transport_send_cmd_noack("traffic:start", strlen("traffic:start"));
+        wifi_mqtt_publish_event("recover", "manual:traffic_start", NULL, 0);
+    } else {
         traffic_light_start();
-        changed = true;
-        goto publish;
     }
+    /* === END FIX ALL-OFF-MANUAL-ONLY === */
+    changed = true;
+    goto publish;
+}
 
     /* === SIMPLIFIED-NO-CFG: без сброса cfg-трекинга === */
     if (strcmp(cmd, "traffic:stop") == 0) {
