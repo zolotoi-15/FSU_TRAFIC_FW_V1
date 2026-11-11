@@ -1,22 +1,37 @@
 /* ============================================================
    node_proto.c — NODE/ROOT протокол.
 
-   (Сохранены: SIMPLIFIED-NO-CFG, NO-FIRST-C-WD, SYNC-BY-STATUS,
-    TRAFFIC-START-KEEP-C-TIMER, COMM-LOST-ALL-OFF,
-    CMD-RESETS-REMOTE-FLAG, UTC-SYNC, LORA-LINK-STATS, T_CHANNELS,
-    TRAFFIC-START-INFINITE-RETRY.)
+   === FIX C-BUFFER-BEFORE-START ===
+       Если c: приходит раньше, чем NODE перешёл в RUNNING
+       (s_node_running == false), сохраняем его в s_pending_c_*
+       и применяем сразу после traffic:start. Раньше c:
+       игнорировался → NODE терял первую маску и стартовал
+       с пустым состоянием (все каналы OFF).
 
-   === FIX UTC-SYNC-DISABLE ===
-       При |delta| > UTC_DELTA_MAX_MS (500) — end_utc_ms
-       игнорируется, fallback на pm из c:.
+   === FIX UTC-DELTA-MAX ===
+       UTC_DELTA_MAX_MS 500 → 3000, SYNC_MAX_DRIFT_MS 250 → 500.
+       При LoRa ToA ~112 мс и TIME_PUSH_PERIOD_MS=10000 дрейф
+       кварца легко выходит за 500 мс → pm_utc никогда не
+       применялся → рассинхрон накапливался.
 
-   === FIX SYNC-DELAY-ZERO ===
-       delay:<us> от ROOT игнорируется — он даёт 2 с задержки
-       перед apply_mask.
+   === FIX APPLY-MASK-PM-UTC ===
+       При c: с валидным end_utc применяем pm_utc, НЕ pm из c:.
+       pm в c: — момент snprintf на ROOT, он устаревает на
+       LoRa ToA (~150 мс). pm_utc от end_utc_ms — актуален на
+       момент apply_mask.
 
-   === FIX LORA-CFG-RELAY ===
-       lora.cfg:<freq>:<sf>:<bw>:<cr>:<pwr> от ROOT — сохранение
-       в NVS + reboot.
+   === FIX SYNC-HANDSHAKE ===
+       on_cmd_from_root:
+         - "sync:probe" — ack.
+         - "sync:lock:..." — применяем маску + pong.
+         - "sync:done" — IDLE (если в ALIGNED).
+         - "sync:ack" — PROBE → TIME.
+       on_evt_from_node (ROOT): передаёт sync:probe в
+       sync_handshake_root_on_rx.
+
+   === FIX T_CHANNELS ===
+       NODE раз в 60 с шлёт T_CHANNELS с 16 каналами. ROOT
+       публикует в <base>/Node/Channels.
    ============================================================ */
 
 #include "node_proto.h"
@@ -32,6 +47,7 @@
 #include "can_bus.h"
 #include "mux_data.h"
 #include "root_wd.h"
+#include "sync_handshake.h"
 #include "lora.h"
 #include "lora_nvs.h"
 #include "esp_log.h"
@@ -63,11 +79,20 @@ volatile bool s_node_channels_valid = false;
 static uint32_t s_last_channels_ms = 0;
 /* === END FIX T_CHANNELS === */
 
-#define NODE_STATUS_PERIOD_MS 5000
-#define NODE_STATUS_FAULT_MS  1000
-#define STATUS_FORCE_MS       5000
+#define NODE_STATUS_PERIOD_MS      5000
+#define NODE_STATUS_FAULT_MS       1000
+#define NODE_STATUS_SYNC_MS        500
+#define STATUS_FORCE_MS            5000
 
-#define NODE_ROOT_LOST_MS     10000
+#define NODE_ROOT_LOST_MS          6000
+
+/* === FIX UTC-DELTA-MAX === */
+#define UTC_DELTA_MAX_MS_LOCAL     3000
+/* === END FIX UTC-DELTA-MAX === */
+
+/* === FIX SYNC-MAX-DRIFT === */
+#define SYNC_MAX_DRIFT_MS_LOCAL    500
+/* === END FIX SYNC-MAX-DRIFT === */
 
 volatile bool s_fault_from_remote_ex = false;
 volatile bool s_node_running = false;
@@ -80,6 +105,19 @@ static volatile uint32_t s_last_root_data_ms = 0;
 
 static volatile bool s_root_lost_flag = false;
 static volatile bool s_c_received_since_start = false;
+
+/* === FIX C-BUFFER-BEFORE-START ===
+   Если c: приходит раньше traffic:start, сохраняем его здесь
+   и применяем после перехода в RUNNING. Иначе NODE теряет
+   первую маску и стартует с пустым состоянием. */
+static volatile bool     s_pending_c_valid = false;
+static volatile uint8_t  s_pending_c_phase = 0;
+static volatile uint32_t s_pending_c_pm    = 0;
+static volatile uint16_t s_pending_c_on    = 0;
+static volatile uint16_t s_pending_c_blink = 0;
+static volatile uint32_t s_pending_c_dur   = 0;
+static volatile uint64_t s_pending_c_end   = 0;
+/* === END FIX C-BUFFER-BEFORE-START === */
 
 #define SET_REMOTE_FLAG(v) do { s_fault_from_remote_ex = (v); } while (0)
 
@@ -100,6 +138,63 @@ static inline void node_note_root_data(void)
 }
 
 /* ============================================================
+   Применить c: (общая функция для on_cmd и для pending после
+   traffic:start).
+   === FIX APPLY-MASK-PM-UTC ===
+   ============================================================ */
+static void node_apply_c_mask(uint8_t ph,
+                              uint32_t pm,
+                              uint16_t on16,
+                              uint16_t blink16,
+                              uint32_t dur,
+                              uint64_t end_utc_ms,
+                              bool has_utc_field)
+{
+    uint32_t apply_pm = pm;
+    bool used_utc = false;
+
+    if (has_utc_field && end_utc_ms != 0) {
+        uint64_t now_utc = time_sync_get_utc_ms();
+        int32_t  delta   = time_sync_get_delta_ms();
+        int32_t  abs_delta = delta < 0 ? -delta : delta;
+
+        if (now_utc == 0) {
+            ESP_LOGD(TAG, "c: UTC skipped (now_utc=0)");
+        } else if (abs_delta > UTC_DELTA_MAX_MS_LOCAL) {
+            ESP_LOGW(TAG, "c: UTC skipped (delta=%ld ms > %d) → pm=%lu",
+                     (long)delta, UTC_DELTA_MAX_MS_LOCAL,
+                     (unsigned long)pm);
+        } else {
+            int64_t remain = (int64_t)end_utc_ms - (int64_t)now_utc;
+            if (remain < 0) remain = 0;
+            if ((uint64_t)remain > (uint64_t)dur) remain = (int64_t)dur;
+            uint32_t pm_utc = (uint32_t)((uint64_t)dur - (uint64_t)remain);
+
+            int32_t drift = (int32_t)pm_utc - (int32_t)pm;
+            if (drift < 0) drift = -drift;
+
+            if (drift > SYNC_MAX_DRIFT_MS_LOCAL) {
+                ESP_LOGW(TAG, "c: UTC drift=%ld ms (> %d) → hard pm=%lu",
+                         (long)drift, SYNC_MAX_DRIFT_MS_LOCAL,
+                         (unsigned long)pm);
+                apply_pm = pm;
+                used_utc = false;
+            } else {
+                apply_pm = pm_utc;
+                used_utc = true;
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "c: ph=%u pm=%lu→%lu on=0x%04X blink=0x%04X dur=%lu%s",
+             ph, (unsigned long)pm, (unsigned long)apply_pm,
+             on16, blink16, (unsigned long)dur,
+             used_utc ? " [utc]" : "");
+
+    traffic_light_apply_mask(on16, blink16, ph, apply_pm, dur);
+}
+
+/* ============================================================
    on_cmd_from_root
    ============================================================ */
 static void on_cmd_from_root(const char *cmd, size_t len)
@@ -111,6 +206,16 @@ static void on_cmd_from_root(const char *cmd, size_t len)
     size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
     memcpy(buf, cmd, n);
     buf[n] = '\0';
+
+    /* === FIX SYNC-HANDSHAKE === */
+    if (len >= 5 && strncmp(buf, "sync:", 5) == 0) {
+        sync_handshake_node_on_rx(buf, n);
+        if (strncmp(buf, "sync:probe", 10) == 0) return;
+        if (strncmp(buf, "sync:lock:", 10) == 0) return;
+        if (strncmp(buf, "sync:done", 9) == 0) return;
+        if (strncmp(buf, "sync:ack", 8) == 0) return;
+    }
+    /* === END FIX SYNC-HANDSHAKE === */
 
     if (buf[0] == 'c' && buf[1] == ':') {
         unsigned int ph = 0;
@@ -129,8 +234,21 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         }
 
         if (!s_node_running) {
-            ESP_LOGW(TAG, "c: ignored - NODE not RUNNING (ph=%u)", ph);
+            /* === FIX C-BUFFER-BEFORE-START ===
+               NODE ещё не перешёл в RUNNING — сохраняем c: и
+               применим после traffic:start. Иначе теряем первую
+               маску и стартуем с пустым состоянием. */
+            ESP_LOGW(TAG, "c: NODE not RUNNING → stash for later "
+                          "(ph=%u)", ph);
+            s_pending_c_phase = (uint8_t)ph;
+            s_pending_c_pm    = (uint32_t)pm;
+            s_pending_c_on    = (uint16_t)on_mask;
+            s_pending_c_blink = (uint16_t)blink_mask;
+            s_pending_c_dur   = (uint32_t)dur;
+            s_pending_c_end   = (uint64_t)end_utc_ms;
+            s_pending_c_valid = true;
             return;
+            /* === END FIX C-BUFFER-BEFORE-START === */
         }
 
         s_c_received_since_start = true;
@@ -145,56 +263,10 @@ static void on_cmd_from_root(const char *cmd, size_t len)
 
         s_fault_from_remote_ex = false;
 
-        /* === FIX UTC-SYNC-DISABLE === */
-        uint32_t apply_pm = (uint32_t)pm;
-        bool used_utc = false;
-        if (matched >= 6 && end_utc_ms != 0) {
-            uint64_t now_utc = time_sync_get_utc_ms();
-            int32_t  delta   = time_sync_get_delta_ms();
-            int32_t  abs_delta = delta < 0 ? -delta : delta;
-
-            if (now_utc == 0) {
-                ESP_LOGD(TAG, "c: UTC skipped (now_utc=0)");
-            } else if (abs_delta > UTC_DELTA_MAX_MS) {
-                ESP_LOGW(TAG, "c: UTC skipped (delta=%ld ms > %d) → pm=%lu",
-                         (long)delta, UTC_DELTA_MAX_MS, (unsigned long)pm);
-            } else {
-                int64_t remain = (int64_t)end_utc_ms - (int64_t)now_utc;
-                if (remain < 0) remain = 0;
-                if ((uint64_t)remain > (uint64_t)dur) remain = (int64_t)dur;
-                uint32_t pm_utc = (uint32_t)((uint64_t)dur - (uint64_t)remain);
-
-                int32_t drift = (int32_t)pm_utc - (int32_t)pm;
-                if (drift < 0) drift = -drift;
-
-                if (drift > SYNC_MAX_DRIFT_MS) {
-                    ESP_LOGW(TAG, "c: UTC drift=%ld ms (> %d) → hard pm=%lu",
-                             (long)drift, SYNC_MAX_DRIFT_MS,
-                             (unsigned long)pm);
-                    apply_pm = (uint32_t)pm;
-                    used_utc = false;
-                } else {
-                    apply_pm = pm_utc;
-                    used_utc = true;
-                    if (drift > 20) {
-                        ESP_LOGD(TAG, "c: UTC pm=%lu (ROOT pm=%lu drift=%ld ms)",
-                                 (unsigned long)pm_utc,
-                                 (unsigned long)pm, (long)drift);
-                    }
-                }
-            }
-        }
-        /* === END FIX UTC-SYNC-DISABLE === */
-
-        uint16_t on16    = (uint16_t)on_mask;
-        uint16_t blink16 = (uint16_t)blink_mask;
-
-        ESP_LOGI(TAG, "c: ph=%u pm=%lu→%lu on=0x%04X blink=0x%04X dur=%lu%s",
-                 ph, pm, (unsigned long)apply_pm, on16, blink16, dur,
-                 used_utc ? " [utc]" : "");
-
-        traffic_light_apply_mask(on16, blink16, (uint8_t)ph,
-                                 apply_pm, (uint32_t)dur);
+        node_apply_c_mask((uint8_t)ph, (uint32_t)pm,
+                          (uint16_t)on_mask, (uint16_t)blink_mask,
+                          (uint32_t)dur, (uint64_t)end_utc_ms,
+                          matched >= 6);
         return;
     }
 
@@ -309,9 +381,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         return;
     }
 
-    /* === FIX SYNC-DELAY-ZERO ===
-       delay:<us> от ROOT игнорируется — он даёт до 2 с задержки
-       перед apply_mask (NODE отстаёт). sync_delay должен быть 0. */
     if (strncmp(buf, "delay:", 6) == 0) {
         unsigned int d = 0;
         if (sscanf(buf + 6, "%u", &d) == 1) {
@@ -319,17 +388,12 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         }
         return;
     }
-    /* === END FIX SYNC-DELAY-ZERO === */
 
     if (strcmp(buf, "pedestrian:request") == 0) {
         ESP_LOGD(TAG, "pedestrian:request from ROOT (follow_root - no-op)");
         return;
     }
 
-    /* === FIX LORA-CFG-RELAY ===
-       ROOT шлёт lora.cfg:<freq>:<sf>:<bw>:<cr>:<pwr> после
-       BLE lora.set с relay=true. NODE сохраняет в NVS и
-       перезагружается — обе стороны стартуют на новой частоте. */
     if (strncmp(buf, "lora.cfg:", 9) == 0) {
         unsigned long freq = 0;
         unsigned int sf = 0, bw = 0, cr = 0;
@@ -348,7 +412,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         }
         return;
     }
-    /* === END FIX LORA-CFG-RELAY === */
 
     if (strncmp(buf, "rs485:", 6) == 0 || strncmp(buf, "can:", 4) == 0) {
         node_handle_local_cmd(buf);
@@ -385,6 +448,25 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         s_node_running = true;
         node_note_root_data();
         node_send_status_for_ms(STATUS_FORCE_MS);
+
+        /* === FIX C-BUFFER-BEFORE-START ===
+           Если c: пришёл раньше traffic:start — применяем его
+           СЕЙЧАС. end_utc пересчитывается от now_utc, чтобы
+           pm был актуальным. */
+        if (s_pending_c_valid) {
+            ESP_LOGI(TAG, "traffic:start → apply stashed c: ph=%u",
+                     s_pending_c_phase);
+            node_apply_c_mask(s_pending_c_phase,
+                              s_pending_c_pm,
+                              s_pending_c_on,
+                              s_pending_c_blink,
+                              s_pending_c_dur,
+                              s_pending_c_end,
+                              s_pending_c_end != 0);
+            s_pending_c_valid = false;
+            s_c_received_since_start = true;
+        }
+        /* === END FIX C-BUFFER-BEFORE-START === */
         return;
     }
     if (strcmp(buf, "traffic:stop") == 0) {
@@ -392,6 +474,7 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         s_node_running = false;
         s_root_lost_flag = false;
         s_c_received_since_start = false;
+        s_pending_c_valid = false;   /* === FIX C-BUFFER-BEFORE-START === */
         return;
     }
     if (strcmp(buf, "traffic:pause")  == 0) { traffic_light_pause();  return; }
@@ -511,7 +594,6 @@ static void on_node_status_from_transport(const char *json, size_t len)
 
     if (g_config.role != DEVICE_ROLE_MASTER || !json || len == 0) return;
 
-    /* === FIX LORA-LINK-STATS === */
     {
         const char *lk = (const char *)memmem(json, len, "\"LINK\":{", 8);
         if (lk) {
@@ -529,7 +611,8 @@ static void on_node_status_from_transport(const char *json, size_t len)
             }
         }
     }
-    /* === END FIX LORA-LINK-STATS === */
+
+    sync_handshake_root_on_rx(json, len);
 
     if (memmem(json, len, "\"TRAFFIC\":", 10) == NULL) {
         ESP_LOGW(TAG, "STATUS incomplete (no TRAFFIC section) - "
@@ -573,7 +656,7 @@ static void on_node_status_from_transport(const char *json, size_t len)
                                       "root ph=%u pm=%lu → force c:",
                                  node_phase, node_pm, root_phase, root_pm);
                         send_sync_to_node_async_ex(
-                            root_phase, root_pm,
+                            root_phase, UINT32_MAX,
                             traffic_light_get_phase_duration_ms(),
                             true, NULL);
                     }
@@ -631,6 +714,28 @@ static void on_evt_from_node(const char *evt, size_t len)
     size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
     memcpy(buf, evt, n);
     buf[n] = '\0';
+
+    /* === FIX SYNC-HANDSHAKE === */
+    if (len >= 5 && strncmp(buf, "sync:", 5) == 0) {
+        if (strncmp(buf, "sync:probe", 10) == 0) {
+            sync_state_t rst = sync_handshake_root_state();
+            if (rst == SYNC_STATE_ALIGNED) {
+                transport_send_cmd_noack("sync:ack", 8);
+                return;
+            }
+            if (rst == SYNC_STATE_IDLE) {
+                ESP_LOGW(TAG, "ROOT: got sync:probe while IDLE → start PROBE");
+                sync_handshake_root_start();
+                transport_send_cmd_noack("sync:ack", 8);
+            } else {
+                transport_send_cmd_noack("sync:ack", 8);
+            }
+            return;
+        }
+        sync_handshake_root_on_rx(buf, n);
+        return;
+    }
+    /* === END FIX SYNC-HANDSHAKE === */
 
     if (len > 5 && strncmp(buf, "pong:", 5) == 0) return;
     if (len > 5 && strncmp(buf, "time:", 5) == 0) return;
@@ -700,7 +805,8 @@ static void node_send_task(void *arg)
                                     "\"V_IMON\":%d,\"STATE\":\"%s\","
                                     "\"SR\":%d,\"DIAG\":%d}",
                                     (ch == 0) ? "" : ",",
-                                    ch, md.v_in[ch], md.i_load[ch], md.imon_mv[ch],
+                                    ch, md.v_in[ch], md.i_load[ch],
+                                    md.imon_mv[ch],
                                     imon_state_str((imon_state_t)md.imon_state[ch]),
                                     md.sr_state[ch], md.diag_en[ch]);
                 }
@@ -721,13 +827,19 @@ static void node_send_task(void *arg)
         lora_link_stats_t ls = {0};
         bool have_ls = lora_get_last_rx_stats(&ls);
 
+        uint8_t disp_ch = g_config.traffic.pins.cross_ped.ped_display;
+        if (disp_ch >= 16) disp_ch = SYNC_DISPLAY_CH;
+        int disp_bit = sr_get_output(disp_ch) ? 1 : 0;
+
         int off = snprintf(json, 2048,
                            "{\"role\":\"node\",\"SR\":{\"state\":%u},"
                            "\"TRAFFIC\":{\"state\":\"%s\",\"mode\":%d,\"phase\":%d,"
                            "\"phase_ms\":%lu,\"duration_ms\":%lu},"
                            "\"FAULT\":{\"mode\":\"%s\",\"count\":%u},"
                            "\"LINK\":{\"rssi\":%.1f,\"snr\":%.1f,"
-                           "\"sig_rssi\":%.1f,\"age_ms\":%lu}}",
+                           "\"sig_rssi\":%.1f,\"age_ms\":%lu},"
+                           "\"disp\":%d"
+                           "}",
                            sr,
                            state_str,
                            traffic_light_get_mode(),
@@ -739,7 +851,8 @@ static void node_send_task(void *arg)
                            have_ls ? ls.rssi : 0.0f,
                            have_ls ? ls.snr : 0.0f,
                            have_ls ? ls.sig_rssi : 0.0f,
-                           (unsigned long)(have_ls ? ls.age_ms : 0));
+                           (unsigned long)(have_ls ? ls.age_ms : 0),
+                           disp_bit);
 
         bool force = s_status_now ||
                      (s_status_force_until_ms != 0 &&
@@ -762,9 +875,10 @@ static void node_send_task(void *arg)
         }
 
         uint32_t period;
-        if (force) period = 200;
-        else if (cur_fault != TRAFFIC_FAULT_NONE) period = NODE_STATUS_FAULT_MS;
-        else period = NODE_STATUS_PERIOD_MS;
+        if (force)                                     period = 200;
+        else if (sync_handshake_node_is_syncing())     period = NODE_STATUS_SYNC_MS;
+        else if (cur_fault != TRAFFIC_FAULT_NONE)      period = NODE_STATUS_FAULT_MS;
+        else                                           period = NODE_STATUS_PERIOD_MS;
         vTaskDelay(pdMS_TO_TICKS(period));
     }
 }
@@ -781,6 +895,12 @@ static void node_link_watchdog_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(1000));
         if (g_config.role != DEVICE_ROLE_SLAVE) continue;
 
+        uint32_t now_tick = (uint32_t)(esp_timer_get_time() / 1000);
+        sync_handshake_node_tick(now_tick);
+        if (sync_handshake_node_is_syncing()) {
+            continue;
+        }
+
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
 
         if (!s_node_running) continue;
@@ -790,7 +910,7 @@ static void node_link_watchdog_task(void *arg)
                 (now - s_last_root_data_ms) >= (uint32_t)NODE_ROOT_LOST_MS &&
                 !s_root_lost_flag) {
                 ESP_LOGE(TAG, "NODE RUNNING but no c: for %lu ms "
-                              "-> ALL_OFF + RECOVERING (fail-safe)",
+                              "-> ALL_OFF + RECOVERING + sync_handshake",
                          (unsigned long)(now - s_last_root_data_ms));
                 s_root_lost_flag = true;
                 SET_REMOTE_FLAG(true);
@@ -798,6 +918,7 @@ static void node_link_watchdog_task(void *arg)
                 SET_REMOTE_FLAG(false);
                 traffic_light_set_state_recovering();
                 s_node_running = false;
+                sync_handshake_node_start();
             }
             continue;
         }
@@ -807,7 +928,8 @@ static void node_link_watchdog_task(void *arg)
         uint32_t silence = now - s_last_root_data_ms;
 
         if (silence >= NODE_ROOT_LOST_MS && !s_root_lost_flag) {
-            ESP_LOGE(TAG, "ROOT silent %lu ms -> ALL_OFF + RECOVERING",
+            ESP_LOGE(TAG, "ROOT silent %lu ms -> ALL_OFF + RECOVERING "
+                          "+ sync_handshake",
                      (unsigned long)silence);
             s_root_lost_flag = true;
             SET_REMOTE_FLAG(true);
@@ -815,6 +937,7 @@ static void node_link_watchdog_task(void *arg)
             SET_REMOTE_FLAG(false);
             traffic_light_set_state_recovering();
             s_node_running = false;
+            sync_handshake_node_start();
         }
     }
 }

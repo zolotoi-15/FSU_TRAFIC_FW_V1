@@ -25,6 +25,17 @@
        подключён) или LoRa. Основной путь — lora_send_fragmented*
        (LoRa), BLE используется для конфигурации (ble_transport.c
        сам шлёт JSON в RESP, не через transport_send_raw).
+
+   === FIX RX-TYPE-RANGE-GUARD ===
+       s_last_done_seq[] и s_next_frag_idx[] имеют размер 7 и
+       индексируются по type (1..6). Битый пакет с type=0 или
+       type>6 приводил к записи за границы массива (UB). Проверка
+       типа — ДО любых обращений к массивам.
+
+   === FIX SEND-RAW-SIZE-GUARD ===
+       transport_send_raw не фрагментирует — при len > PKT_MAX-4
+       уходит только первый кусок (memcpy переполняет buf). Явный
+       лог + ESP_ERR_INVALID_SIZE.
    ============================================================ */
 
 #include "transport.h"
@@ -378,7 +389,7 @@ static esp_err_t lora_send_fragmented_noack(uint8_t type,
     size_t sent = 0;
     int frag_idx = 0;
     int frag_total = (len + FRAG_DATA_MAX - 1) / FRAG_DATA_MAX;
-     // Для больших пакетов (CHANNELS = 30 фрагментов) нужен больший gap
+    /* Для больших пакетов (CHANNELS = 30 фрагментов) нужен больший gap */
     uint32_t base_gap = FRAG_GAP_MS;
     if (frag_total >= 10) base_gap = 300;
     if (frag_total >= 20) base_gap = 400;
@@ -431,6 +442,7 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
 /* ============================================================
    transport_handle_raw_rx — общая обработка (LoRa + BLE)
    === FIX BLE-TRANSPORT ===
+   === FIX RX-TYPE-RANGE-GUARD ===
    ============================================================ */
 void transport_handle_raw_rx(const uint8_t *data, size_t len)
 {
@@ -455,6 +467,21 @@ void transport_handle_raw_rx(const uint8_t *data, size_t len)
         if (s_ack_cb) s_ack_cb(seq, T_ACK);
         return;
     }
+
+    /* === FIX RX-TYPE-RANGE-GUARD ===
+       s_last_done_seq[] и s_next_frag_idx[] имеют размер 7 и
+       индексируются по type (1..6). Если пришёл битый пакет с
+       type=0 или type>6 — раньше мы писали за границы массива
+       (UB → corrupt соседних переменных). Проверяем ДО любых
+       обращений. */
+    if (type < T_CMD || type > T_CHANNELS) {
+#if TRANSPORT_LOG_RX
+        ESP_LOGW(TAG, "RX unknown type=%u (len=%u) → drop",
+                 type, (unsigned)len);
+#endif
+        return;
+    }
+    /* === END FIX RX-TYPE-RANGE-GUARD === */
 
     if (type == T_STATUS || type == T_EVT || type == T_CHANNELS) {
         if (g_config.role == DEVICE_ROLE_MASTER) {
@@ -601,7 +628,20 @@ void transport_handle_raw_rx(const uint8_t *data, size_t len)
 esp_err_t transport_send_raw(uint8_t type, const uint8_t *payload, size_t len)
 {
     if (!payload || len == 0) return ESP_ERR_INVALID_ARG;
-    if (len > PKT_MAX - 4) return ESP_ERR_INVALID_SIZE;
+    if (type < T_CMD || type > T_CHANNELS) return ESP_ERR_INVALID_ARG;
+
+    /* === FIX SEND-RAW-SIZE-GUARD ===
+       transport_send_raw не делает фрагментации — если len >
+       PKT_MAX-4, уйдёт только первый кусок (memcpy переполнит
+       buf). Явный лог + ошибка, чтобы было видно, что пакет
+       слишком большой. */
+    if (len > PKT_MAX - 4) {
+        ESP_LOGW(TAG, "transport_send_raw: len=%u > PKT_MAX-4=%u "
+                      "(no fragmentation), drop",
+                 (unsigned)len, (unsigned)(PKT_MAX - 4));
+        return ESP_ERR_INVALID_SIZE;
+    }
+    /* === END FIX SEND-RAW-SIZE-GUARD === */
 
     uint8_t buf[PKT_MAX];
     buf[0] = PKT_MAGIC;

@@ -1,39 +1,37 @@
 /* ============================================================
    traffic_config.c — data-driven helpers.
 
-   === FIX APPLY-MASK-FOLLOW-ROOT ===
-       apply_stage_dd для NODE в follow_root НЕ применяет маску
-       по stage_dd — только set_all_off. ROOT пришлёт c: с
-       маской.
+   === FIX APPLY-STAGE-DD-NODE-FOLLOW-ROOT ===
+   NODE в follow_root НЕ применяет маску по stage_dd — только
+   set_all_off. ROOT пришлёт c: с маской. Иначе NODE сам зажжёт
+   on_mask своего stage_dd, а ROOT пришлёт другой on_mask —
+   двойное состояние и мигание расходится.
+
+   === FIX BLINK-CLEAR-BEFORE-APPLY ===
+   apply_stage_dd сбрасывает s_blink_on перед новой маской,
+   чтобы при смене стадии мигающие каналы не остались в
+   включённом состоянии.
+
+   === FIX APPLY-MASK-ATOMIC ===
+   s_phase_start_ms в apply_mask — единственный источник blink-
+   фазы на NODE. Значит apply_stage_dd на NODE не трогает
+   s_phase_start_ms (его выставит apply_mask из pm).
 
    === FIX CONFLICT-LOG-ONCE ===
-       Лог CONFLICT не спамит — не чаще 1 раза в 5 с на стадию.
+   Лог CONFLICT не спамит — не чаще 1 раза в 5 с на стадию.
 
    === FIX ALL-RED-GREEN-ONLY ===
-       need_virtual_all_red: all-red нужен ТОЛЬКО между двумя
-       НАСТОЯЩИМИ DD_DUR_GREEN. GREEN_BLINK — часть зелёного,
-       RED_YELLOW — переходный.
-
-   === FIX APPLY-STAGE-DD-KEEP-BLINK-PHASE ===
-       apply_stage_dd НЕ сбрасывает s_blink_on / s_blink_last_phase
-       при смене стадии. Фаза мигания теперь вычисляется из
-       (now - s_phase_start_ms) в traffic_task_loop
-       (FIX BLINK-SYNC-FROM-PM). Сброс этих полей ломал
-       синхронизацию ROOT↔NODE.
+   need_virtual_all_red: all-red нужен ТОЛЬКО между двумя
+   НАСТОЯЩИМИ DD_DUR_GREEN. GREEN_BLINK — часть зелёного,
+   RED_YELLOW — переходный.
 
    === FIX PED-DISPLAY-CONFLICT-SKIP ===
-       display-канал (g_config.traffic.pins.cross_ped.ped_display,
-       по умолчанию ch11) — НЕ светосигнал. Он не должен
-       участвовать в проверке конфликтов:
-         - исключаем его из check_mask (маска для проверки);
-         - пропускаем целиком любые пары, где один из каналов =
-           display.
-       Без этого on_mask с display (например 0x0B24 в stage 3:
-       green [2,5,8] + red [9] + display [11]) находил конфликт
-       по парам [2,11], [5,11], [8,11] и NODE уходил в
-       set_all_off() на всю фазу зелёного.
-       Фикс работает и для старых «грязных» конфигов, где пары
-       с ch11 уже лежат в NVS.
+   display-канал (ch11) — НЕ светосигнал. Он не должен
+   участвовать в проверке конфликтов.
+
+   === FIX BLINK-PERIOD-MIN ===
+   phase_blink_period_ms ≥ BLINK_MIN_PERIOD_MS (50 мс), иначе
+   blink «не виден» (включён всегда или выключен всегда).
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -67,10 +65,6 @@ bool stage_is_pedestrian(uint8_t seq_idx)
     return false;
 }
 
-/* === FIX PED-DISPLAY ===
-   TRUE, если стадия seq_idx — ped_green или ped_blink (по duration_kind).
-   Используется для решения, показывать ли ЖДИТЕ (ped.display):
-   пока FALSE — показывать, TRUE — скрыть. */
 bool stage_is_ped_green_or_blink(uint8_t seq_idx)
 {
     if (seq_idx >= g_config.traffic.sequence_count) return false;
@@ -79,7 +73,6 @@ bool stage_is_ped_green_or_blink(uint8_t seq_idx)
     return (st->duration_kind == DD_DUR_PED_GREEN ||
             st->duration_kind == DD_DUR_PED_BLINK);
 }
-/* === END FIX PED-DISPLAY === */
 
 bool stage_is_transport_green(uint8_t seq_idx)
 {
@@ -107,7 +100,6 @@ uint8_t next_phase_smooth_ped(uint8_t cur_seq)
     return (cur_seq + 1) % g_config.traffic.sequence_count;
 }
 
-/* === FIX GOST-RED-YELLOW-LIMIT === */
 uint32_t stage_duration_ms(uint8_t seq_idx)
 {
     if (seq_idx >= g_config.traffic.sequence_count) return 1000;
@@ -188,20 +180,7 @@ void set_all_off(void)
 
 /* ============================================================
    === FIX PED-DISPLAY-CONFLICT-SKIP ===
-
-   display-канал (g_config.traffic.pins.cross_ped.ped_display,
-   по умолчанию ch11) — НЕ светосигнал. Он не должен участвовать
-   в проверке конфликтов:
-     - исключаем его из check_mask (маска для проверки);
-     - пропускаем целиком любые пары, где один из каналов = display.
-
-   Без этого on_mask с display (например 0x0B24 в stage 3:
-   green [2,5,8] + red [9] + display [11]) находил конфликт
-   по парам [2,11], [5,11], [8,11] и NODE уходил в set_all_off()
-   на всю фазу зелёного.
-
-   Фикс работает и для старых «грязных» конфигов, где пары с ch11
-   уже лежат в NVS: они просто игнорируются при проверке.
+   display-канал не участвует в проверке конфликтов.
    ============================================================ */
 bool traffic_mask_has_conflict(uint16_t on_mask)
 {
@@ -209,7 +188,6 @@ bool traffic_mask_has_conflict(uint16_t on_mask)
 
     uint8_t disp_ch = g_config.traffic.pins.cross_ped.ped_display;
 
-    /* Маска для проверки: без display-бита */
     uint16_t check_mask = on_mask;
     if (disp_ch < 16) {
         check_mask &= ~(1u << disp_ch);
@@ -220,7 +198,6 @@ bool traffic_mask_has_conflict(uint16_t on_mask)
         uint8_t a = g_config.traffic.conflicting_channels[i].a;
         uint8_t b = g_config.traffic.conflicting_channels[i].b;
 
-        /* Пары, где один из каналов — display, не участвуют в проверке */
         if (disp_ch < 16 && (a == disp_ch || b == disp_ch)) {
             continue;
         }
@@ -235,7 +212,6 @@ bool traffic_mask_has_conflict(uint16_t on_mask)
 }
 /* === END FIX PED-DISPLAY-CONFLICT-SKIP === */
 
-/* === FIX ALL-RED-GREEN-ONLY === */
 bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq)
 {
     if (from_seq == to_seq) return false;
@@ -267,11 +243,19 @@ bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq)
                   "(GOST Р 52289)", from_seq, to_seq);
     return true;
 }
-/* === END FIX ALL-RED-GREEN-ONLY === */
 
 /* ============================================================
    apply_stage_dd
-   === FIX APPLY-STAGE-DD-KEEP-BLINK-PHASE ===
+   === FIX APPLY-STAGE-DD-NODE-FOLLOW-ROOT ===
+   NODE в follow_root НЕ применяет маску по stage_dd — только
+   set_all_off. ROOT пришлёт c: с маской. Иначе NODE сам зажжёт
+   on_mask своего stage_dd, а ROOT пришлёт другой on_mask —
+   двойное состояние и мигание расходится.
+
+   === FIX BLINK-CLEAR-BEFORE-APPLY ===
+   На ROOT при смене стадии сбрасываем s_blink_on, чтобы
+   мигающие каналы стартовали с чистого состояния. На NODE
+   этого делать нельзя — s_blink_on управляется apply_mask.
    ============================================================ */
 void apply_stage_dd(uint8_t seq_idx)
 {
@@ -282,15 +266,20 @@ void apply_stage_dd(uint8_t seq_idx)
         return;
     }
 
+    /* === FIX APPLY-STAGE-DD-NODE-FOLLOW-ROOT ===
+       NODE в follow_root НЕ применяет маску — ждёт c: от ROOT.
+       s_blink_mask сброшен в 0, чтобы не мигать по устаревшей маске
+       между apply_stage_dd и приходом c:. */
     if (s_follow_root) {
         set_all_off();
         s_blink_mask = 0;
-        s_blink_on = false;
-        s_blink_last_phase = 0;
+        /* s_blink_on / s_blink_last_phase НЕ трогаем —
+           ими управляет apply_mask. */
         ESP_LOGD(TAG, "apply_stage_dd: NODE follow_root → all off "
-                      "(wait sync:)");
+                      "(wait c: from ROOT)");
         return;
     }
+    /* === END FIX APPLY-STAGE-DD-NODE-FOLLOW-ROOT === */
 
     uint16_t will_be_on = 0;
     for (int i = 0; i < st->on_count; i++)
@@ -313,17 +302,20 @@ void apply_stage_dd(uint8_t seq_idx)
         return;
     }
 
+    /* Гасим активные каналы предыдущей стадии */
     uint16_t active = traffic_light_active_sr_mask_internal();
     for (int ch = 0; ch < 16; ch++) {
         if (active & (1u << ch)) sr_output_off(ch);
     }
 
+    /* Включаем on_mask */
     uint16_t on_mask = 0;
     for (int i = 0; i < st->on_count; i++) {
         on_mask |= (1u << st->outputs_on[i]);
         sr_output_on(st->outputs_on[i]);
     }
 
+    /* blink_mask — для ROOT, мигание будет по s_phase_start_ms */
     uint16_t blink_mask = 0;
     for (int i = 0; i < st->blink_count; i++) {
         blink_mask |= (1u << st->outputs_blink[i]);
@@ -332,13 +324,13 @@ void apply_stage_dd(uint8_t seq_idx)
 
     s_blink_mask = blink_mask;
 
-    /* === FIX APPLY-STAGE-DD-KEEP-BLINK-PHASE ===
-       НЕ сбрасываем s_blink_on / s_blink_last_phase: фаза мигания
-       вычисляется из (now - s_phase_start_ms) в traffic_task_loop.
-       Сброс при каждой смене стадии ломал синхронизацию с NODE
-       (NODE тоже перестал сбрасывать в apply_mask — FIX
-       APPLY-MASK-KEEP-BLINK-PHASE). */
-    /* === END FIX APPLY-STAGE-DD-KEEP-BLINK-PHASE === */
+    /* === FIX BLINK-CLEAR-BEFORE-APPLY (ROOT only) ===
+       Сбрасываем s_blink_on, чтобы в первом же тике task blink
+       стартовал с чистого состояния. На NODE этот блок
+       недостижим (return выше). */
+    s_blink_on = false;
+    s_blink_last_phase = 0;
+    /* === END FIX BLINK-CLEAR-BEFORE-APPLY === */
 
     uint32_t dur = stage_duration_ms(seq_idx);
     ESP_LOGD(TAG, "Stage → %u (%s) kind=%u dur=%lu on=0x%04X blink=0x%04X%s",

@@ -27,6 +27,8 @@ idf_component_register(
         "lora_nvs.c"
         "ble_transport.c"
         "ble_config.c"
+        "sync_handshake.c"
+        "sync_config.c"
         
     INCLUDE_DIRS "." "include"
     REQUIRES

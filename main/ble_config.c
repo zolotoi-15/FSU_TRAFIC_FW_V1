@@ -1,5 +1,19 @@
 /* ============================================================
    ble_config.c — парсинг JSON-команд из BLE.
+
+   === FIX BLE-RESP-DOUBLE-SEND ===
+       Раньше fsu_ble_notify_response вызывался ДВА раза:
+       безусловно и повторно внутри if (fsu_ble_is_connected()).
+       Телефон получал дублированный ответ. Оставлен только
+       один вызов — внутри if.
+
+   === FIX BLE-LORA-SET-TYPECHECK ===
+       Явная проверка cJSON_IsNumber для каждого поля lora.set.
+
+   === FIX LEAD-MS-RUNTIME ===
+       sync.get / sync.set — runtime-настройка задержки ROOT
+       между отправкой c: и локальным apply_stage_dd
+       (g_sync_lead_ms, валидация [50..1000] мс).
    ============================================================ */
 
 #include "ble_config.h"
@@ -8,6 +22,7 @@
 #include "traffic_light.h"
 #include "transport.h"
 #include "lora_nvs.h"
+#include "sync_config.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
@@ -31,16 +46,51 @@ static void ble_send_resp(const char *type, const char *rid,
     cJSON_Delete(root);
     if (!out) return;
 
-    /* === FIX BLE-NAME-CLASH === */
-    fsu_ble_notify_response(out, strlen(out));
-    /* === END FIX BLE-NAME-CLASH === */
-   if (fsu_ble_is_connected()) {
+    /* === FIX BLE-RESP-DOUBLE-SEND ===
+       Один вызов внутри if. Если не подключён — просто лог. */
+    if (fsu_ble_is_connected()) {
         fsu_ble_notify_response(out, strlen(out));
     } else {
         ESP_LOGW(TAG, "resp dropped (not connected): %s", out);
     }
+    /* === END FIX BLE-RESP-DOUBLE-SEND === */
     free(out);
 }
+
+/* === FIX BLE-LORA-SET-TYPECHECK === */
+static bool json_get_u32_checked(const cJSON *root, const char *key,
+                                 uint32_t *out)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsNumber(item)) return false;
+    *out = (uint32_t)item->valuedouble;
+    return true;
+}
+static bool json_get_u8_checked(const cJSON *root, const char *key,
+                                uint8_t *out)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsNumber(item)) return false;
+    *out = (uint8_t)item->valueint;
+    return true;
+}
+static bool json_get_u16_checked(const cJSON *root, const char *key,
+                                 uint16_t *out)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsNumber(item)) return false;
+    *out = (uint16_t)item->valueint;
+    return true;
+}
+static bool json_get_i8_checked(const cJSON *root, const char *key,
+                                int8_t *out)
+{
+    const cJSON *item = cJSON_GetObjectItemCaseSensitive(root, key);
+    if (!cJSON_IsNumber(item)) return false;
+    *out = (int8_t)item->valueint;
+    return true;
+}
+/* === END FIX BLE-LORA-SET-TYPECHECK === */
 
 void ble_config_handle_cmd(const char *json, size_t len)
 {
@@ -74,7 +124,8 @@ void ble_config_handle_cmd(const char *json, size_t len)
         if (str) {
             if (config_load_json(str, strlen(str))) {
                 ble_send_resp("config.set.ok", rid, NULL, NULL);
-                ESP_LOGI(TAG, "config.set applied via BLE");
+                ESP_LOGI(TAG, "config.set applied via BLE "
+                              "(runtime: config:reload or reboot)");
             } else {
                 ble_send_resp("error", rid, "config_parse_fail", NULL);
             }
@@ -96,17 +147,22 @@ void ble_config_handle_cmd(const char *json, size_t len)
         }
     }
     else if (strcmp(type, "lora.set") == 0) {
-        uint32_t freq = (uint32_t)cJSON_GetNumberValue(
-                            cJSON_GetObjectItem(root, "freq_hz"));
-        uint8_t sf    = (uint8_t)cJSON_GetNumberValue(
-                            cJSON_GetObjectItem(root, "sf"));
-        uint16_t bw   = (uint16_t)cJSON_GetNumberValue(
-                            cJSON_GetObjectItem(root, "bw_khz"));
-        uint8_t cr    = (uint8_t)cJSON_GetNumberValue(
-                            cJSON_GetObjectItem(root, "cr"));
-        int8_t  pwr   = (int8_t)cJSON_GetNumberValue(
-                            cJSON_GetObjectItem(root, "tx_power_dbm"));
-        bool relay    = cJSON_IsTrue(cJSON_GetObjectItem(root, "relay"));
+        /* === FIX BLE-LORA-SET-TYPECHECK === */
+        uint32_t freq = 0;
+        uint8_t  sf = 0, cr = 0;
+        uint16_t bw = 0;
+        int8_t   pwr = 0;
+        if (!json_get_u32_checked(root, "freq_hz", &freq) ||
+            !json_get_u8_checked(root, "sf", &sf) ||
+            !json_get_u16_checked(root, "bw_khz", &bw) ||
+            !json_get_u8_checked(root, "cr", &cr) ||
+            !json_get_i8_checked(root, "tx_power_dbm", &pwr)) {
+            ble_send_resp("error", rid, "missing_or_bad_field", NULL);
+            cJSON_Delete(root);
+            return;
+        }
+        bool relay = cJSON_IsTrue(cJSON_GetObjectItem(root, "relay"));
+        /* === END FIX BLE-LORA-SET-TYPECHECK === */
 
         if (freq < 150000000 || freq > 960000000 ||
             sf < 7 || sf > 12 ||
@@ -141,6 +197,30 @@ void ble_config_handle_cmd(const char *json, size_t len)
         vTaskDelay(pdMS_TO_TICKS(2000));
         esp_restart();
     }
+    /* === FIX LEAD-MS-RUNTIME === */
+    else if (strcmp(type, "sync.get") == 0) {
+        cJSON *j = cJSON_CreateObject();
+        cJSON_AddNumberToObject(j, "lead_ms", sync_config_get_lead_ms());
+        cJSON_AddNumberToObject(j, "min", SYNC_LEAD_MS_MIN);
+        cJSON_AddNumberToObject(j, "max", SYNC_LEAD_MS_MAX);
+        ble_send_resp("sync.get.ok", rid, NULL, j);
+    }
+    else if (strcmp(type, "sync.set") == 0) {
+        uint32_t ms = 0;
+        if (!json_get_u32_checked(root, "lead_ms", &ms)) {
+            ble_send_resp("error", rid, "missing_or_bad_field", NULL);
+        } else if (sync_config_set_lead_ms(ms) != ESP_OK) {
+            cJSON *j = cJSON_CreateObject();
+            cJSON_AddNumberToObject(j, "min", SYNC_LEAD_MS_MIN);
+            cJSON_AddNumberToObject(j, "max", SYNC_LEAD_MS_MAX);
+            ble_send_resp("error", rid, "out_of_range", j);
+        } else {
+            cJSON *j = cJSON_CreateObject();
+            cJSON_AddNumberToObject(j, "lead_ms", sync_config_get_lead_ms());
+            ble_send_resp("sync.set.ok", rid, NULL, j);
+        }
+    }
+    /* === END FIX LEAD-MS-RUNTIME === */
     else if (strcmp(type, "traffic.start") == 0) {
         traffic_light_start();
         ble_send_resp("traffic.start.ok", rid, NULL, NULL);

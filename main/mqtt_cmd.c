@@ -14,6 +14,12 @@
      FIX ACCUM-USE-REAL-LEN
      FIX TRAFFIC-STOP-RESET-CFG
      FIX TRAFFIC-MODE-RESET-CFG
+
+   === FIX LEAD-MS-RUNTIME ===
+       Команды "sync_lead" (get) и "sync_lead:<ms>" (set) —
+       меняют g_sync_lead_ms (задержка ROOT между отправкой c:
+       и локальным apply_stage_dd). Валидация [50..1000] мс
+       в sync_config_set_lead_ms().
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -24,6 +30,7 @@
 #include "rs485.h"
 #include "can_bus.h"
 #include "shift_register.h"
+#include "sync_config.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
@@ -293,6 +300,8 @@ static bool parse_hex(const char *p, uint8_t *buf, size_t max, size_t *out_n)
    === SIMPLIFIED-NO-CFG ===
    - config:reload: только локальное обновление, без transport_send_cfg
    - traffic:stop / traffic:mode: без сброса cfg-трекинга (его больше нет)
+   === FIX LEAD-MS-RUNTIME ===
+   - sync_lead / sync_lead:<ms>
    ============================================================ */
 void mqtt_handle_command(const char *data, int data_len)
 {
@@ -308,6 +317,7 @@ void mqtt_handle_command(const char *data, int data_len)
         strncmp(cmd, "role:", 5) != 0 &&
         strncmp(cmd, "config:reload", 13) != 0 &&
         strncmp(cmd, "sync:", 5) != 0 &&
+        strncmp(cmd, "sync_lead", 9) != 0 &&
         strncmp(cmd, "fault:", 6) != 0) {
         transport_send_cmd(cmd, strlen(cmd));
     }
@@ -537,6 +547,40 @@ void mqtt_handle_command(const char *data, int data_len)
         extern void blink_reset_rtt(void);
         blink_reset_rtt(); changed = true; goto publish;
     }
+
+    /* === FIX LEAD-MS-RUNTIME ===
+       sync_lead:<ms> — изменить задержку ROOT между отправкой c:
+       и локальным apply_stage_dd.
+       sync_lead     — прочитать текущее значение (в лог).
+       Локальная команда (не транслируется на NODE). */
+    {
+        unsigned int lead = 0;
+        if (sscanf(cmd, "sync_lead:%u", &lead) == 1) {
+            int r = sync_config_set_lead_ms((uint32_t)lead);
+            if (r != ESP_OK) {
+                if (s_mqtt_connected && g_mqtt_client) {
+                    char err[96];
+                    int en = snprintf(err, sizeof(err),
+                        "{\"error\":\"sync_lead_range\","
+                        "\"min\":%u,\"max\":%u}",
+                        (unsigned)SYNC_LEAD_MS_MIN,
+                        (unsigned)SYNC_LEAD_MS_MAX);
+                    if (en > 0)
+                        esp_mqtt_client_publish(g_mqtt_client, s_topic,
+                                                err, en, 1, 0);
+                }
+            }
+            changed = true;
+            goto publish;
+        }
+        if (strcmp(cmd, "sync_lead") == 0) {
+            ESP_LOGI(TAG, "sync_lead=%lu ms",
+                     (unsigned long)sync_config_get_lead_ms());
+            changed = true;
+            goto publish;
+        }
+    }
+    /* === END FIX LEAD-MS-RUNTIME === */
 
     /* === SIMPLIFIED-NO-CFG ===
        config:reload — только локальное обновление ROOT.

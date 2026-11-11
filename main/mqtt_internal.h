@@ -22,6 +22,7 @@ extern char       s_json_topic[192];
 extern char       s_layer_topic[192];
 extern char       s_kp_topic[192];
 extern char       s_node_json_topic[192];
+extern char       s_events_topic[192];
 
 /* === FIX T_CHANNELS === */
 extern char       s_node_channels_topic[192];

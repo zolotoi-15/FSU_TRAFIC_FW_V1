@@ -4,20 +4,19 @@
    === FIX LINK-LOSS-SMART ===
        link_monitor_task: счётчик пропусков инкрементится ТОЛЬКО
        если в окне LINK_*_EXPECT_MS реально не было пакета.
-       Раньше счётчик рос слепо по таймеру и ложно срабатывал
-       (has_node=0 при живом NODE).
 
    === FIX SYNC-DELAY-ZERO ===
-       blink_reset_rtt() вызывается при старте — s_sync_delay_us
-       = 0. ROOT не шлёт delay:<us>, NODE игнорирует (см.
-       node_proto.c). Без этого NODE мог ждать до 2 с перед
-       apply_mask → отставание от ROOT.
+       blink_reset_rtt() вызывается при старте.
 
    === FIX BLE-TRANSPORT ===
-       ble_transport_init() вызывается после transport_init().
-       GATT-сервер для конфигурации с телефона (config.get/set,
-       lora.get/set, traffic.start/stop, reboot).
-       BLE-имя: ROOT → "FSU_ROOT", NODE → "FSU_NODE_XXXX".
+       fsu_ble_init() после transport_init().
+
+   === FIX FAST-LINK-MONITOR + SYNC-HANDSHAKE ===
+       LINK_ROOT_EXPECT_MS 10000 → 3000 (NODE STATUS раз в 5 с).
+       LINK_NODE_EXPECT_MS 10000 → 2000 (ROOT ping раз в 2 с).
+       При 3 пропусках подряд → sync_handshake_root_start() /
+       sync_handshake_node_start(). Это ускоряет восстановление
+       связи с 50 с до 6-9 с + сам ритуал синхронизации.
    ============================================================ */
 
 #include <stdio.h>
@@ -58,6 +57,7 @@
 #include "fault_handler.h"
 #include "buttons.h"
 #include "root_wd.h"
+#include "sync_handshake.h"     /* === FIX SYNC-HANDSHAKE === */
 #include "app_shared.h"
 #include "ble_transport.h"
 
@@ -71,8 +71,15 @@ static const char *TAG = "board";
 #define NVS_KEY_CHUNK    "chunk_%d"
 #define PENDING_CHUNK_SZ 4096
 
-#define LINK_ROOT_EXPECT_MS   10000
-#define LINK_NODE_EXPECT_MS   10000
+/* === FIX FAST-LINK-MONITOR ===
+   ROOT ждёт STATUS от NODE (NODE_STATUS_PERIOD_MS = 5000 мс),
+   NODE ждёт CMD/ping/sync от ROOT (HEARTBEAT_INTERVAL_MS = 2000 мс).
+
+   LINK_*_EXPECT_MS — окно опроса счётчиков. LINK_LOST_MISSED_PKTS=3.
+   Детект потери: ROOT 3×3=9 с, NODE 3×2=6 с. */
+#define LINK_ROOT_EXPECT_MS   3000
+#define LINK_NODE_EXPECT_MS   2000
+/* === END FIX FAST-LINK-MONITOR === */
 
 #define CFG_LOAD_TASK_STACK   24576
 
@@ -115,7 +122,7 @@ bool link_monitor_node_lost(void) { return s_node_missed_ping   >= LINK_LOST_MIS
 
 /* ============================================================
    link_monitor_task
-   === FIX LINK-LOSS-SMART ===
+   === FIX LINK-LOSS-SMART + FAST-LINK-MONITOR + SYNC-HANDSHAKE ===
    ============================================================ */
 static void link_monitor_task(void *arg)
 {
@@ -137,10 +144,6 @@ static void link_monitor_task(void *arg)
             if (now - last_root_ms >= LINK_ROOT_EXPECT_MS) {
                 last_root_ms = now;
 
-                /* === FIX LINK-LOSS-SMART:
-                   Проверяем, был ли STATUS реально за окно.
-                   s_last_node_msg_ms обновляется в transport.c
-                   на КАЖДЫЙ RX от NODE (STATUS/EVT/T_CHANNELS). === */
                 bool got_status = false;
                 if (s_last_node_msg_ms != 0) {
                     uint32_t node_tick = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -154,12 +157,16 @@ static void link_monitor_task(void *arg)
                     if (s_root_missed_status < LINK_LOST_MISSED_PKTS + 1)
                         s_root_missed_status++;
                     if (s_root_missed_status == LINK_LOST_MISSED_PKTS) {
-                        ESP_LOGE(TAG, "ROOT: %u missed STATUS → link LOST",
+                        ESP_LOGE(TAG, "ROOT: %u missed STATUS → link LOST "
+                                      "→ sync_handshake",
                                  LINK_LOST_MISSED_PKTS);
+                        /* === FIX SYNC-HANDSHAKE ===
+                           Сразу запускаем ритуал восстановления —
+                           без ожидания watchdog-таски. */
+                        sync_handshake_root_start();
+                        /* === END FIX SYNC-HANDSHAKE === */
                     }
                 } else {
-                    /* Был пакет — сбрасываем счётчик (на случай
-                       гонки с link_monitor_note_status_rx). */
                     s_root_missed_status = 0;
                 }
             }
@@ -180,8 +187,12 @@ static void link_monitor_task(void *arg)
                     if (s_node_missed_ping < LINK_LOST_MISSED_PKTS + 1)
                         s_node_missed_ping++;
                     if (s_node_missed_ping == LINK_LOST_MISSED_PKTS) {
-                        ESP_LOGE(TAG, "NODE: %u missed ping/CMD → link LOST",
+                        ESP_LOGE(TAG, "NODE: %u missed ping/CMD → link LOST "
+                                      "→ sync_handshake",
                                  LINK_LOST_MISSED_PKTS);
+                        /* === FIX SYNC-HANDSHAKE === */
+                        sync_handshake_node_start();
+                        /* === END FIX SYNC-HANDSHAKE === */
                     }
                 } else {
                     s_node_missed_ping = 0;
@@ -409,7 +420,8 @@ static void rtc_init(void)
 
     esp_err_t probe = i2c_master_probe(g_i2c_bus, DS1307_ADDRESS, 50);
     if (probe != ESP_OK) {
-        ESP_LOGW(TAG, "DS1307 not found on I2C bus (0x%02X) — RTC disabled",
+        ESP_LOGW(TAG, "DS1307 not found on I2C bus (0x%02X) — "
+                      "using RTC-ESP32S3 + SNTP/LoRa only",
                  DS1307_ADDRESS);
         rtc_handle = NULL;
         return;
@@ -426,7 +438,7 @@ static void rtc_init(void)
 
     esp_err_t err = ds1307_init(g_i2c_bus, &rtc_cfg, &rtc_handle);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "ds1307_init failed (%s) — RTC disabled",
+        ESP_LOGW(TAG, "ds1307_init failed (%s) — using RTC-ESP32S3 only",
                  esp_err_to_name(err));
         rtc_handle = NULL;
     } else {
@@ -470,7 +482,8 @@ static void ensure_valid_cfg(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Board bring-up (ROOT/NODE) — NO WIFI, LoRa only");
+    ESP_LOGI(TAG, "Board bring-up (ROOT/NODE) — NO WIFI, LoRa only, "
+                  "FAST-LINK-MONITOR + SYNC-HANDSHAKE");
 
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -514,20 +527,16 @@ void app_main(void)
     transport_init();
     node_proto_register_callbacks();
 
-    /* === FIX BLE-TRANSPORT ===
-       GATT-сервер для конфигурации с телефона. Имя:
-       ROOT → "FSU_ROOT", NODE → "FSU_NODE_XXXX".
-       Не блокирует LoRa — работает параллельно. */
-    esp_err_t ble_err = fsu_ble_init();          /* === FIX BLE-NAME-CLASH === */
-if (ble_err != ESP_OK) {
-    ESP_LOGW(TAG, "fsu_ble_init: %s", esp_err_to_name(ble_err));
-} else {
-    ESP_LOGI(TAG, "BLE transport initialized");
-}
+    /* === FIX BLE-TRANSPORT === */
+    esp_err_t ble_err = fsu_ble_init();
+    if (ble_err != ESP_OK) {
+        ESP_LOGW(TAG, "fsu_ble_init: %s", esp_err_to_name(ble_err));
+    } else {
+        ESP_LOGI(TAG, "BLE transport initialized");
+    }
     /* === END FIX BLE-TRANSPORT === */
 
-    /* === FIX SYNC-DELAY-ZERO ===
-       s_sync_delay_us = 0. NODE не ждёт перед apply_mask. */
+    /* === FIX SYNC-DELAY-ZERO === */
     blink_reset_rtt();
     /* === END FIX SYNC-DELAY-ZERO === */
 

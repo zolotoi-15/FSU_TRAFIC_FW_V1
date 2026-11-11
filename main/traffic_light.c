@@ -1,28 +1,50 @@
 /* ============================================================
    traffic_light.c — основной цикл traffic_task + force_phase.
 
-   Все FIX-блоки сохранены:
-   FIX EXPECTED-FROM-APPLY-MASK, FIX NO-DOUBLE-SYNC-FORCE,
-   FIX STALE-ALL-OFF-WATCHDOG, FIX MASK-RECEIVED-RESET,
-   FIX NODE-BLINK-FOLLOW-ROOT, FIX APPLY-MASK-BLINK-RESET,
-   FIX BLINK-SYNC-FROM-PM, FIX APPLY-MASK-KEEP-BLINK-PHASE,
-   FIX RECOVERING-STATE, FIX RECOVER-START-RED,
-   FIX APPLY-MASK-ATOMIC, FIX YELLOW-BLINK-PAUSE-AFTER-ALL-OFF.
+   === FIX BLINK-NODE-VIA-MASK ===
+   NODE в follow_root КРУТИТ blink_mask из c: (зелёный мигающий,
+   ped_blink ch10). Блок blink — ДО continue для follow_root.
 
-   === FIX PED-DISPLAY ===
-       Выход «ЖДИТЕ» (ped_display, ch11). Включается сразу после
-       нажатия кнопки пешеходом (s_ped_request || s_insert_pending)
-       на ROOT и NODE одновременно (через c: от ROOT). Выключается,
-       когда текущая стадия — ped_green или ped_blink
-       (stage_is_ped_green_or_blink).
+   === FIX NO-DOUBLE-BLINK ===
+   ROOT в RUNNING (follow_root=false) крутит blink сам, NODE — по
+   маске.
 
-   === FIX PED-DISPLAY-CLEAR-BEFORE-RETURN-HOLD ===
-       В insert-ветке return_to_hold сбрасываем s_insert_pending
-       ДО send_sync_to_node_async_ex. Иначе send_channels_to_node
-       собирал маску с ch11 (s_insert_pending ещё true) и ROOT
-       отправлял c: с display → NODE CONFLICT → ALL_OFF. После
-       сброса маска уходит без ch11, ЖДИТЕ гаснет вместе с
-       переходом на hold-стадию.
+   === FIX BLINK-FROM-PM ===
+   Обе стороны считают blink как ((now - s_phase_start_ms)/period)&1.
+   s_phase_start_ms на NODE выставляется в apply_mask из pm,
+   пришедшего в c: (или из pm_utc — приоритет).
+
+   === FIX APPLY-MASK-ATOMIC ===
+   s_phase_start_ms и s_blink_mask выставляются под одним мьютексом.
+
+   === FIX APPLY-MASK-CLEAR-STALE-BLINK ===
+   При смене маски гасятся каналы, которые были в blink_mask,
+   но не вошли в новый on|blink.
+
+   === FIX INSERT-WATCHDOG ===
+   Если s_insert_pending висит с s_insert_idx == 0 дольше
+   insert_timeout_ms + 2 с — сбрасываем.
+
+   === FIX NODE-PED-DISPLAY-CLEAR ===
+   NODE не включает "ЖДИТЕ" сам — display приходит в on_mask от
+   ROOT. Но при ручном применении маски без display — гасим.
+
+   === FIX ROOT-SEND-FIRST ===
+   ROOT при смене фазы СНАЧАЛА отправляет c: на NODE,
+   ждёт lead_ms (runtime, g_sync_lead_ms, дефолт 150 мс ≈
+   LoRa ToA + обработка NODE), и только потом применяет маску
+   у себя. Каналы ROOT и NODE зажигаются одновременно.
+
+   === FIX LEAD-MS-RUNTIME ===
+   Задержка читается через sync_config_get_lead_ms(), меняется
+   на лету из MQTT (sync_lead:<ms>) или BLE (sync.set). Валидация
+   [50..1000] мс выполняется в sync_config_set_lead_ms().
+
+   === FIX APPLY-MASK-NO-BACKWARD-PM (новое) ===
+   apply_mask на NODE больше НЕ откатывает s_phase_start_ms назад,
+   если pm из c: меньше текущего pm. Раньше периодический refresh
+   от ROOT (pm≈300, растёт) заставлял NODE сдвигать начало фазы
+   назад каждые 300 мс → blink замирал на pos~0 (всегда ON).
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -34,6 +56,8 @@
 #include "time_sync.h"
 #include "transport.h"
 #include "root_wd.h"
+#include "sync_config.h"
+#include "sync_handshake.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
@@ -98,7 +122,6 @@ volatile uint32_t        s_insert_request_ms = 0;
 
 volatile bool            s_ped_display_done  = false;
 
-
 volatile uint16_t        s_expected_mask_from_root = 0;
 volatile uint16_t        s_active_mask_from_root   = 0;
 
@@ -140,7 +163,6 @@ void traffic_light_set_follow_root(bool en)
     ESP_LOGD(TAG, "follow_root=%d", en);
 }
 
-/* === FIX PED-DISPLAY === */
 void traffic_light_ped_display_set(bool on)
 {
     uint8_t ch = g_config.traffic.pins.cross_ped.ped_display;
@@ -148,17 +170,66 @@ void traffic_light_ped_display_set(bool on)
     if (on) sr_output_on(ch);
     else    sr_output_off(ch);
 }
-/* === END FIX PED-DISPLAY === */
+
+static inline void traffic_display_force_off(void)
+{
+    uint8_t ch = g_config.traffic.pins.cross_ped.ped_display;
+    if (ch < 16) sr_output_off(ch);
+}
+
+/* ============================================================
+   Прямое применение blink-бита для всех каналов из s_blink_mask
+   ============================================================ */
+static inline void apply_blink_bit(uint16_t mask, bool on)
+{
+    for (int ch = 0; ch < 16; ch++) {
+        if (mask & (1u << ch)) {
+            if (on) sr_output_on(ch);
+            else    sr_output_off(ch);
+        }
+    }
+}
+
+/* ============================================================
+   === FIX ROOT-SEND-FIRST ===
+   === FIX LEAD-MS-RUNTIME ===
+
+   ROOT: отправить маску на NODE → подождать lead_ms (runtime,
+   g_sync_lead_ms) → применить у себя. Вызывается БЕЗ s_mutex.
+
+   Для NODE (или если transport не LoRa) — просто apply_stage_dd().
+
+   pm передаём = 0: helper вызывается сразу после обновления
+   s_phase_start_ms вызывающим кодом, значит ROOT стартует
+   фазу с pm=0, и NODE должен тоже с pm=0.
+   ============================================================ */
+static void root_apply_stage_sync_first(uint8_t seq_idx, uint32_t dur_ms)
+{
+    if (g_config.role != DEVICE_ROLE_MASTER || !transport_is_lora()) {
+        apply_stage_dd(seq_idx);
+        return;
+    }
+
+    if (dur_ms == 0) {
+        dur_ms = effective_stage_duration_ms(seq_idx);
+    }
+
+    /* 1. Отправляем c: на NODE (pm=0, force=true) */
+    send_sync_to_node_async_ex(seq_idx, 0, dur_ms, true, NULL);
+
+    /* 2. Ждём, пока NODE примет c: и включит каналы.
+       ROOT свои каналы пока НЕ трогает — они в старой маске.
+       lead_ms читаем через геттер — меняется на лету. */
+    uint32_t lead = sync_config_get_lead_ms();
+    vTaskDelay(pdMS_TO_TICKS(lead));
+
+    /* 3. Применяем маску локально — синхронно с NODE */
+    apply_stage_dd(seq_idx);
+}
+/* === END FIX ROOT-SEND-FIRST + LEAD-MS-RUNTIME === */
 
 /* ============================================================
    traffic_light_request_pedestrian_ex
-   === FIX PED-DISPLAY ===
-   При from_remote=true (NODE → ROOT через EVT) display на ROOT
-   НЕ включается здесь и НЕ форсируется c: — ROOT выставит
-   s_insert_pending / s_ped_request, а display включится в
-   следующем тике traffic_task_loop (или через phase_sync, когда
-   send_channels_to_node соберёт маску с ch11).
-   Это избегает двойного включения display при каждом EVT.
    ============================================================ */
 void traffic_light_request_pedestrian_ex(bool from_remote)
 {
@@ -214,9 +285,7 @@ void traffic_light_request_pedestrian_ex(bool from_remote)
         }
         s_insert_pending  = true;
         s_insert_request_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        /* === FIX PED-DISPLAY-AFTER-PED-GREEN === */
-s_ped_display_done = false;   /* новый insert — ЖДИТЕ снова нужно */
-/* === END FIX PED-DISPLAY-AFTER-PED-GREEN === */
+        s_ped_display_done = false;
         for (int i = 0; i < g_config.traffic.pedestrian.insert_count; i++)
             s_insert_queue[i] = g_config.traffic.pedestrian.insert_sequence[i];
         s_insert_count = g_config.traffic.pedestrian.insert_count;
@@ -230,8 +299,6 @@ s_ped_display_done = false;   /* новый insert — ЖДИТЕ снова н�
                  g_config.traffic.pedestrian.safe_exit_count);
 
         if (g_config.role == DEVICE_ROLE_MASTER && !from_remote) {
-            /* Локальное нажатие на ROOT: включаем ЖДИТЕ сразу
-               и форсируем c: (NODE включит ch11 одновременно). */
             uint8_t disp_ch = g_config.traffic.pins.cross_ped.ped_display;
             if (disp_ch < 16) {
                 sr_output_on(disp_ch);
@@ -243,10 +310,6 @@ s_ped_display_done = false;   /* новый insert — ЖДИТЕ снова н�
                                   traffic_light_get_phase_ms(),
                                   traffic_light_get_phase_duration_ms(),
                                   true);
-        } else {
-            /* from_remote=true: локальный traffic_task_loop включит
-               display на следующем тике (s_insert_pending=true). */
-            ESP_LOGD(TAG, "pedestrian request from remote: display via loop");
         }
         return;
     }
@@ -254,7 +317,7 @@ s_ped_display_done = false;   /* новый insert — ЖДИТЕ снова н�
     /* PED_REQUEST_MODE_STAGE */
     s_ped_request = true;
     s_ped_request_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-    s_ped_display_done = false;   /* === FIX PED-DISPLAY-AFTER-PED-GREEN === */
+    s_ped_display_done = false;
     ESP_LOGW(TAG, "pedestrian request: STAGE");
 
     if (g_config.role == DEVICE_ROLE_MASTER && !from_remote) {
@@ -278,8 +341,6 @@ bool traffic_light_ped_button_enabled(void) { return g_config.traffic.pedestrian
 void traffic_light_set_sync_delay_us(uint32_t delay_us)
 {
     s_sync_delay_us = delay_us;
-    ESP_LOGD(TAG, "sync_delay = %lu us (%.3f ms)",
-             (unsigned long)delay_us, delay_us / 1000.0);
 }
 uint32_t traffic_light_get_sync_delay_us(void) { return s_sync_delay_us; }
 void traffic_light_set_mux_reading(bool en) { s_mux_reading = en; }
@@ -309,12 +370,12 @@ static uint32_t insert_duration_ms(uint8_t seq_idx)
    ============================================================ */
 void traffic_task_loop(void *arg)
 {
-    ESP_LOGI(TAG, "Traffic task started (step=20ms, follow_root=%d)", s_follow_root);
+    ESP_LOGI(TAG, "Traffic task started (step=20ms, follow_root=%d)",
+             s_follow_root);
 
     uint8_t  last_min_green_phase  = 0xFF;
     uint8_t  last_min_recall_phase = 0xFF;
     uint32_t last_phase_log_ms = 0;
-
     uint32_t all_off_since_ms = 0;
 
     TickType_t last_wake = xTaskGetTickCount();
@@ -322,9 +383,20 @@ void traffic_task_loop(void *arg)
     while (1) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(20));
 
+        /* === FIX SYNC-HANDSHAKE === */
+        if (g_config.role == DEVICE_ROLE_MASTER &&
+            sync_handshake_root_is_syncing()) {
+            continue;
+        }
+        if (g_config.role == DEVICE_ROLE_SLAVE &&
+            sync_handshake_node_is_syncing()) {
+            continue;
+        }
+        /* === END FIX SYNC-HANDSHAKE === */
+
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        /* === FIX BLINK-SYNC-FROM-PM === */
+        /* === FIX BLINK-VIA-MASK (ROOT и NODE) === */
         if (s_fault == TRAFFIC_FAULT_NONE &&
             s_state == TRAFFIC_STATE_RUNNING &&
             s_blink_mask != 0) {
@@ -334,32 +406,21 @@ void traffic_task_loop(void *arg)
             bool want_on = ((pos / per) & 1) == 0;
             if (want_on != s_blink_on) {
                 s_blink_on = want_on;
-                for (int ch = 0; ch < 16; ch++) {
-                    if (bm & (1u << ch)) {
-                        if (s_blink_on) sr_output_on(ch);
-                        else            sr_output_off(ch);
-                    }
-                }
+                apply_blink_bit(bm, s_blink_on);
+                ESP_LOGD(TAG, "BLINK %s ch=0x%04X", want_on ? "ON" : "OFF", bm);
             }
         }
-        /* === END FIX BLINK-SYNC-FROM-PM === */
+        /* === END FIX BLINK-VIA-MASK === */
 
-        /* === FIX PED-DISPLAY: ROOT включает/выключает "ЖДИТЕ" ===
-           Пока s_ped_request || s_insert_pending и текущая стадия
-           НЕ ped_green/ped_blink — ch11 ON. Иначе — OFF.
-           После FIX PED-DISPLAY-CLEAR-BEFORE-RETURN-HOLD
-           s_insert_pending сбрасывается в return_to_hold, поэтому
-           display гаснет сразу при возврате на hold-стадию. */
+        /* === FIX PED-DISPLAY (ROOT only) === */
         if (g_config.role == DEVICE_ROLE_MASTER && !s_follow_root &&
             s_fault == TRAFFIC_FAULT_NONE &&
             s_state == TRAFFIC_STATE_RUNNING) {
             uint8_t disp_ch = g_config.traffic.pins.cross_ped.ped_display;
             if (disp_ch < 16) {
-                /* === FIX PED-DISPLAY-AFTER-PED-GREEN === */
-        bool need_display = (s_ped_request || s_insert_pending) &&
-                            !s_ped_display_done &&
-                            !stage_is_ped_green_or_blink(s_phase);
-        /* === END FIX PED-DISPLAY-AFTER-PED-GREEN === */
+                bool need_display = (s_ped_request || s_insert_pending) &&
+                                    !s_ped_display_done &&
+                                    !stage_is_ped_green_or_blink(s_phase);
                 bool cur = sr_get_output(disp_ch);
                 if (cur != need_display) {
                     if (need_display) sr_output_on(disp_ch);
@@ -381,35 +442,24 @@ void traffic_task_loop(void *arg)
                 else if (s_fault == TRAFFIC_FAULT_YELLOW_BLINK) fault_str = "YELLOW_BLINK";
 
                 ESP_LOGD(TAG, "PHASE: role=%s seq=%u state=%s fault=%s "
-                              "mask_recv=%d follow=%d hold=%d insert=%d "
-                              "ped=%d",
+                              "mask_recv=%d follow=%d blink=0x%04X blink_on=%d",
                          g_config.role == DEVICE_ROLE_MASTER ? "ROOT" : "NODE",
                          s_phase, traffic_light_state_str(), fault_str,
                          (int)s_mask_received, (int)s_follow_root,
-                         (int)s_hold_active,
-                         (int)s_insert_pending,
-                         (int)s_ped_request);
+                         s_blink_mask, (int)s_blink_on);
             }
         }
 
         if (s_state != TRAFFIC_STATE_RUNNING &&
             s_state != TRAFFIC_STATE_NIGHT_YELLOW_BLINK) continue;
 
+        /* === NODE (follow_root): NODE не решает фазу сам === */
         if (s_follow_root) {
-            if (s_fault == TRAFFIC_FAULT_YELLOW_BLINK) {
-                uint32_t per = g_config.traffic.phases_ms.fault_blink_period;
-                if (per < BLINK_MIN_PERIOD_MS) per = 500;
-                if (s_fault_blink_last_ms == 0 ||
-                    (now - s_fault_blink_last_ms) >= per) {
-                    s_fault_blink_last_ms = now;
-                    s_fault_blink_on = !s_fault_blink_on;
-                    fault_blink_yellow(s_fault_blink_on);
-                }
-            }
             continue;
         }
+        /* === END NODE follow_root === */
 
-        /* stale ALL_OFF watchdog */
+        /* stale ALL_OFF watchdog (ROOT) */
         if (s_state == TRAFFIC_STATE_RUNNING &&
             s_fault == TRAFFIC_FAULT_ALL_OFF) {
             if (all_off_since_ms == 0) {
@@ -421,7 +471,8 @@ void traffic_task_loop(void *arg)
                 s_fault_count = 0;
                 s_phase_start_ms = now;
                 s_force_resync_pending = true;
-                apply_stage_dd(s_phase);
+                root_apply_stage_sync_first(s_phase,
+                    effective_stage_duration_ms(s_phase));
             }
         } else {
             all_off_since_ms = 0;
@@ -457,7 +508,9 @@ void traffic_task_loop(void *arg)
                 xSemaphoreGive(s_mutex);
             }
             s_in_force_phase = true;
-            apply_stage_dd(next_seq);
+            /* === FIX ROOT-SEND-FIRST === */
+            root_apply_stage_sync_first(next_seq, next_dur);
+            /* === END FIX ROOT-SEND-FIRST === */
             s_in_force_phase = false;
             phase_change_cancel_pending();
             continue;
@@ -474,26 +527,22 @@ void traffic_task_loop(void *arg)
         }
 
         if (s_fault != TRAFFIC_FAULT_NONE) {
-    if (s_fault == TRAFFIC_FAULT_YELLOW_BLINK) {
-        uint32_t per = g_config.traffic.phases_ms.fault_blink_period;
-        if (per < BLINK_MIN_PERIOD_MS) per = 500;
-        if (s_fault_blink_last_ms == 0 ||
-            (now - s_fault_blink_last_ms) >= per) {
-            s_fault_blink_last_ms = now;
-            s_fault_blink_on = !s_fault_blink_on;
-            fault_blink_yellow(s_fault_blink_on);
+            if (s_fault == TRAFFIC_FAULT_YELLOW_BLINK) {
+                uint32_t per = g_config.traffic.phases_ms.fault_blink_period;
+                if (per < BLINK_MIN_PERIOD_MS) per = 500;
+                if (s_fault_blink_last_ms == 0 ||
+                    (now - s_fault_blink_last_ms) >= per) {
+                    s_fault_blink_last_ms = now;
+                    s_fault_blink_on = !s_fault_blink_on;
+                    fault_blink_yellow(s_fault_blink_on);
+                }
+                if (!s_fault_blink_state &&
+                    (now - s_last_recovery_ms >= g_config.traffic.fault.recovery_ms)) {
+                    try_recovery(now, NULL);
+                }
+            }
+            continue;
         }
-        if (!s_fault_blink_state &&
-            (now - s_last_recovery_ms >= g_config.traffic.fault.recovery_ms)) {
-            try_recovery(now, NULL);
-        }
-    }
-    /* === FIX ALL-OFF-MANUAL-ONLY ===
-       Для ALL_OFF try_recovery НЕ вызываем. Восстановление только
-       вручную: mqtt traffic:start или короткое нажатие BOOT. */
-    /* === END FIX ALL-OFF-MANUAL-ONLY === */
-    continue;
-}
 
         /* hold detection */
         {
@@ -526,7 +575,6 @@ void traffic_task_loop(void *arg)
 
         if (s_hold_active && !s_insert_pending) {
             if (s_pending_sync_phase != 0xFF) {
-                vTaskDelay(pdMS_TO_TICKS(20));
                 continue;
             }
             if (g_config.traffic.hold.max_hold_ms > 0 &&
@@ -546,15 +594,23 @@ void traffic_task_loop(void *arg)
 
         /* INSERT block */
         if (s_insert_pending) {
-            /* === FIX PED-DISPLAY-AFTER-PED-GREEN ===
-       Как только в текущем insert дошли до ped_green/ped_blink —
-       ЖДИТЕ больше не нужно, пешеход видит свой сигнал.
-       После этого display не включается до следующего нажатия. */
-    if (!s_ped_display_done && stage_is_ped_green_or_blink(s_phase)) {
-        s_ped_display_done = true;
-        ESP_LOGI(TAG, "PED DISPLAY: ped_green/blink reached → done");
-    }
-    /* === END FIX PED-DISPLAY-AFTER-PED-GREEN === */
+            if (s_insert_idx == 0) {
+                uint32_t age = now - s_insert_request_ms;
+                if (age > g_config.traffic.pedestrian.insert_timeout_ms + 2000) {
+                    ESP_LOGW(TAG, "INSERT watchdog: pending %lu ms, idx=0 → cancel",
+                             (unsigned long)age);
+                    s_insert_pending = false;
+                    s_insert_count = 0;
+                    s_insert_idx = 0;
+                    s_ped_display_done = true;
+                    continue;
+                }
+            }
+
+            if (!s_ped_display_done && stage_is_ped_green_or_blink(s_phase)) {
+                s_ped_display_done = true;
+                ESP_LOGI(TAG, "PED DISPLAY: ped_green/blink reached → done");
+            }
             uint32_t since_req = now - s_insert_request_ms;
 
             if (s_insert_idx == 0 &&
@@ -597,6 +653,10 @@ void traffic_task_loop(void *arg)
                          s_insert_idx, s_insert_count,
                          ins_id, seq_idx, (unsigned long)dur_ins);
 
+                if (stage_is_ped_green_or_blink(seq_idx)) {
+                    s_ped_display_done = true;
+                }
+
                 if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
                     s_phase = seq_idx;
                     s_phase_start_ms = now;
@@ -605,10 +665,11 @@ void traffic_task_loop(void *arg)
                     xSemaphoreGive(s_mutex);
                 }
                 s_in_force_phase = true;
-                apply_stage_dd(seq_idx);
+                /* === FIX ROOT-SEND-FIRST === */
+                root_apply_stage_sync_first(seq_idx, dur_ins);
+                /* === END FIX ROOT-SEND-FIRST === */
                 s_in_force_phase = false;
                 phase_change_cancel_pending();
-                send_sync_to_node_async_ex(seq_idx, 0, dur_ins, true, NULL);
                 continue;
             }
 
@@ -673,16 +734,20 @@ void traffic_task_loop(void *arg)
                     ESP_LOGW(TAG, "insert DONE → safe_exit[1/%u] id=%u (seq=%u) dur=%lu",
                              exit_count, next_id, seq_idx, (unsigned long)dur_ex);
 
+                    s_insert_pending  = false;
+                    s_ped_display_done = true;
+
                     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
                         s_phase = seq_idx;
                         s_phase_start_ms = now;
                         xSemaphoreGive(s_mutex);
                     }
                     s_in_force_phase = true;
-                    apply_stage_dd(seq_idx);
+                    /* === FIX ROOT-SEND-FIRST === */
+                    root_apply_stage_sync_first(seq_idx, dur_ex);
+                    /* === END FIX ROOT-SEND-FIRST === */
                     s_in_force_phase = false;
                     phase_change_cancel_pending();
-                    send_sync_to_node_async_ex(seq_idx, 0, dur_ex, true, NULL);
                     s_insert_idx = s_insert_count + 1;
                     continue;
                 }
@@ -720,16 +785,21 @@ void traffic_task_loop(void *arg)
                     ESP_LOGW(TAG, "insert DONE → safe_exit[%d/%u] id=%u (seq=%u) dur=%lu",
                              exit_step + 1, exit_count, next_id, seq_idx,
                              (unsigned long)dur_ex);
+
+                    s_insert_pending  = false;
+                    s_ped_display_done = true;
+
                     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
                         s_phase = seq_idx;
                         s_phase_start_ms = now;
                         xSemaphoreGive(s_mutex);
                     }
                     s_in_force_phase = true;
-                    apply_stage_dd(seq_idx);
+                    /* === FIX ROOT-SEND-FIRST === */
+                    root_apply_stage_sync_first(seq_idx, dur_ex);
+                    /* === END FIX ROOT-SEND-FIRST === */
                     s_in_force_phase = false;
                     phase_change_cancel_pending();
-                    send_sync_to_node_async_ex(seq_idx, 0, dur_ex, true, NULL);
                     s_insert_idx = s_insert_count + exit_step + 1;
                     continue;
                 }
@@ -756,18 +826,10 @@ void traffic_task_loop(void *arg)
                     ESP_LOGW(TAG, "insert DONE → return_to_hold id=%u (seq=%u) dur=%lu",
                              hold_id, hold_seq, (unsigned long)dur_hold);
 
-                    /* === FIX PED-DISPLAY-CLEAR-BEFORE-RETURN-HOLD ===
-                       Insert завершён. Сбрасываем s_insert_pending и
-                       связанные поля ДО send_sync_to_node_async_ex,
-                       иначе send_channels_to_node соберёт маску с ch11
-                       (need_display = s_insert_pending && !ped_green/blink)
-                       и ROOT отправит c: с display → NODE CONFLICT →
-                       ALL_OFF. После сброса маска уходит без ch11, и
-                       ЖДИТЕ гаснет вместе с переходом на hold-стадию. */
-                    s_insert_pending = false;
+                    s_insert_pending  = false;
+                    s_ped_display_done = true;
                     s_insert_idx     = 0;
                     s_insert_count   = 0;
-                    /* === END FIX PED-DISPLAY-CLEAR-BEFORE-RETURN-HOLD === */
 
                     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
                         s_phase = hold_seq;
@@ -776,10 +838,11 @@ void traffic_task_loop(void *arg)
                         xSemaphoreGive(s_mutex);
                     }
                     s_in_force_phase = true;
-                    apply_stage_dd(hold_seq);
+                    /* === FIX ROOT-SEND-FIRST === */
+                    root_apply_stage_sync_first(hold_seq, dur_hold);
+                    /* === END FIX ROOT-SEND-FIRST === */
                     s_in_force_phase = false;
                     phase_change_cancel_pending();
-                    send_sync_to_node_async_ex(hold_seq, 0, dur_hold, true, NULL);
                     s_force_resync_pending = true;
                 }
             }
@@ -916,7 +979,14 @@ void traffic_task_loop(void *arg)
         s_phase_start_ms = now;
         s_hold_pm_frozen = false;
         xSemaphoreGive(s_mutex);
-        apply_stage_dd(s_phase);
+
+        /* === FIX ROOT-SEND-FIRST ===
+           ROOT: сначала c: на NODE → lead_ms → apply_stage_dd.
+           NODE: сразу apply_stage_dd (но NODE сюда не попадает —
+           у него follow_root и return выше). */
+        uint32_t dur_next = effective_stage_duration_ms(s_phase);
+        root_apply_stage_sync_first(s_phase, dur_next);
+        /* === END FIX ROOT-SEND-FIRST === */
 
         if (s_ped_min_recall && stage_is_pedestrian(s_phase)) {
             ESP_LOGW(TAG, "MIN_RECALL: ped phase min %lu s applied",
@@ -945,14 +1015,15 @@ esp_err_t traffic_light_init(void)
     xTaskCreate(traffic_task_loop, "traffic_task", 8192, NULL, 4, &s_task);
     ESP_LOGI(TAG, "Traffic initialized (DD, stages=%u seq=%u ped_button=%d, "
                   "follow_root=%d, hold=%d/%u, insert_seq=%u, safe_exit=%u, "
-                  "conflicts=%u, ped_display=%u)",
+                  "conflicts=%u, ped_display=%u, sync_lead_ms=%lu)",
              g_config.traffic.stage_count, g_config.traffic.sequence_count,
              g_config.traffic.pedestrian.button_enabled, s_follow_root,
              g_config.traffic.hold.enabled, g_config.traffic.hold.stage_count,
              g_config.traffic.pedestrian.insert_count,
              g_config.traffic.pedestrian.safe_exit_count,
              g_config.traffic.conflict_count,
-             g_config.traffic.pins.cross_ped.ped_display);
+             g_config.traffic.pins.cross_ped.ped_display,
+             (unsigned long)sync_config_get_lead_ms());
     return ESP_OK;
 }
 
@@ -995,9 +1066,7 @@ void traffic_light_set_pins_cross_ped(const traffic_pins_cross_ped_t *pins)
     g_config.traffic.pins.cross_ped.axis_a3.green  = pins->axis_a3_green;
     g_config.traffic.pins.cross_ped.ped_red        = pins->ped_red;
     g_config.traffic.pins.cross_ped.ped_green      = pins->ped_green;
-    /* === FIX PED-DISPLAY === */
     g_config.traffic.pins.cross_ped.ped_display    = pins->ped_display;
-    /* === END FIX PED-DISPLAY === */
 }
 
 esp_err_t traffic_light_set_mode(traffic_mode_t mode)
@@ -1034,8 +1103,8 @@ esp_err_t traffic_light_set_mode(traffic_mode_t mode)
 }
 
 /* ============================================================
-   traffic_light_start / stop / pause / resume / reset / next /
-   force_phase / apply_mask
+   start / stop / pause / resume / reset / next / force_phase /
+   apply_mask
    ============================================================ */
 esp_err_t traffic_light_start(void)
 {
@@ -1120,6 +1189,7 @@ void traffic_light_set_state_recovering(void)
     s_insert_pending = false;
     s_insert_count = 0;
     s_insert_idx = 0;
+    s_ped_display_done = false;
     s_fault_count = 0;
     s_fault_yellow_mask = 0;
     s_fault_yellow_mask_from_root = 0;
@@ -1170,6 +1240,8 @@ esp_err_t traffic_light_start_with_red(void)
     s_insert_count = 0;
     s_insert_idx = 0;
     s_ped_display_done = false;
+
+    traffic_display_force_off();
 
     if (g_config.role == DEVICE_ROLE_SLAVE) {
         s_follow_root = true;
@@ -1332,9 +1404,12 @@ esp_err_t traffic_light_next_phase(void)
     s_hold_pm_frozen = false;
     s_insert_pending = false;
     uint8_t ph = s_phase;
+    uint32_t dur = effective_stage_duration_ms(ph);
     xSemaphoreGive(s_mutex);
     s_in_force_phase = true;
-    apply_stage_dd(ph);
+    /* === FIX ROOT-SEND-FIRST === */
+    root_apply_stage_sync_first(ph, dur);
+    /* === END FIX ROOT-SEND-FIRST === */
     s_in_force_phase = false;
     phase_change_cancel_pending();
     ESP_LOGI(TAG, "NEXT → seq=%u", ph);
@@ -1368,29 +1443,43 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
     s_phase_start_ms = now - phase_ms;
     s_state          = TRAFFIC_STATE_RUNNING;
     s_follow_root    = false;
+    uint32_t dur_use = (duration_ms > 0) ? duration_ms
+                                         : effective_stage_duration_ms(phase);
     xSemaphoreGive(s_mutex);
 
     if (!in_fault) {
         s_in_force_phase = true;
-        apply_stage_dd(phase);
+        /* === FIX ROOT-SEND-FIRST ===
+           force_phase вызывается из mqtt traffic:next и recovery —
+           на ROOT отправляем c: первым, на NODE — сразу apply. */
+        root_apply_stage_sync_first(phase, dur_use);
+        /* === END FIX ROOT-SEND-FIRST === */
         s_in_force_phase = false;
         phase_change_cancel_pending();
     }
     return ESP_OK;
 }
 
+/* ============================================================
+   traffic_light_apply_mask
+   === FIX APPLY-MASK-ATOMIC ===
+   === FIX ROOT-SEND-FIRST ===
+       apply_mask вызывается ТОЛЬКО на NODE (из c: от ROOT).
+       Здесь НЕЛЬЗЯ ждать lead_ms — NODE должен применить
+       маску сразу. ROOT уже подождал перед apply_stage_dd.
+
+   === FIX APPLY-MASK-NO-BACKWARD-PM ===
+       Если NODE уже в этой же фазе, и пришедший pm < текущего
+       pm — НЕ отматываем s_phase_start_ms назад. Иначе при
+       периодическом refresh от ROOT (каждые 300 мс) pm в c:
+       растёт (ROOT успел продвинуться), а NODE откатывает
+       начало фазы назад → blink замирает на pos~0 (всегда ON).
+   ============================================================ */
 void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
                               uint8_t phase, uint32_t phase_ms,
                               uint32_t duration_ms)
 {
     if (!s_mutex) return;
-
-    if (s_follow_root && s_sync_delay_us > 0) {
-        uint32_t delay_ms = s_sync_delay_us / 1000;
-        if (delay_ms > 0 && delay_ms < 2000) {
-            vTaskDelay(pdMS_TO_TICKS(delay_ms));
-        }
-    }
 
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
         return;
@@ -1412,13 +1501,7 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
         return;
     }
 
-    uint16_t blink_orig = blink_mask;
     blink_mask &= ~on_mask;
-    if (blink_orig != blink_mask) {
-        ESP_LOGW(TAG, "APPLY MASK: on=0x%04X blink_orig=0x%04X → blink=0x%04X",
-                 (unsigned)on_mask, (unsigned)blink_orig,
-                 (unsigned)blink_mask);
-    }
 
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
@@ -1428,16 +1511,29 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
         phase_ms = 0;
     }
 
+    /* Гасим display, если он не в on/blink */
+    {
+        uint8_t disp_ch = g_config.traffic.pins.cross_ped.ped_display;
+        if (disp_ch < 16 &&
+            !(on_mask    & (1u << disp_ch)) &&
+            !(blink_mask & (1u << disp_ch))) {
+            sr_output_off(disp_ch);
+        }
+    }
+
+    /* Гасим всё, что не в новой маске */
     for (int ch = 0; ch < 16; ch++) {
         if (!(on_mask & (1u << ch)) &&
             !(blink_mask & (1u << ch))) {
             sr_output_off(ch);
         }
     }
+    /* Включаем on_mask */
     for (int ch = 0; ch < 16; ch++) {
         if (on_mask & (1u << ch))
             sr_output_on(ch);
     }
+    /* Гасим stale из предыдущего blink */
     if (blink_mask != s_prev_blink_mask || on_mask != s_prev_on_mask) {
         uint16_t stale = s_prev_blink_mask & ~(on_mask | blink_mask);
         for (int ch = 0; ch < 16; ch++) {
@@ -1446,6 +1542,20 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
         s_prev_blink_mask = blink_mask;
         s_prev_on_mask    = on_mask;
     }
+
+    /* === FIX APPLY-MASK-NO-BACKWARD-PM ===
+       Если NODE уже в этой же фазе, и пришедший pm < текущего pm —
+       НЕ отматываем s_phase_start_ms назад. Иначе при периодическом
+       refresh от ROOT (каждые 300 мс) pm в c: растёт (ROOT успел
+       продвинуться), а NODE откатывает начало фазы назад → blink
+       замирает на pos~0 (всегда ON). */
+    if (s_state == TRAFFIC_STATE_RUNNING && s_phase == phase) {
+        uint32_t cur_pm = now - s_phase_start_ms;
+        if (phase_ms < cur_pm) {
+            phase_ms = cur_pm;
+        }
+    }
+    /* === END FIX APPLY-MASK-NO-BACKWARD-PM === */
 
     s_phase            = phase;
     s_phase_start_ms   = now - phase_ms;
@@ -1478,7 +1588,7 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
 
     xSemaphoreGive(s_mutex);
 
-    ESP_LOGD(TAG, "APPLY MASK ph=%u pm=%lu dur=%lu on=0x%04X blink=0x%04X",
+    ESP_LOGI(TAG, "APPLY MASK ph=%u pm=%lu dur=%lu on=0x%04X blink=0x%04X",
              phase, (unsigned long)phase_ms, (unsigned long)duration_ms,
              (unsigned)on_mask, (unsigned)blink_mask);
 }
@@ -1716,9 +1826,12 @@ esp_err_t traffic_light_manual_override(uint8_t seq_idx)
     s_fault = TRAFFIC_FAULT_NONE;
     s_fault_count = 0;
     s_hold_pm_frozen = false;
+    uint32_t dur_use = effective_stage_duration_ms(seq_idx);
     xSemaphoreGive(s_mutex);
     s_in_force_phase = true;
-    apply_stage_dd(seq_idx);
+    /* === FIX ROOT-SEND-FIRST === */
+    root_apply_stage_sync_first(seq_idx, dur_use);
+    /* === END FIX ROOT-SEND-FIRST === */
     s_in_force_phase = false;
     phase_change_cancel_pending();
     return ESP_OK;

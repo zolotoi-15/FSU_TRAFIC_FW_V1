@@ -15,7 +15,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include "time_sync.h" 
+#include "time_sync.h"
 
 static const char *TAG = "wifi_mqtt";
 
@@ -34,6 +34,13 @@ char       s_node_json_topic[192];
 char       s_node_channels_topic[192];
 /* === END FIX T_CHANNELS === */
 
+/* === FIX MQTT-EVENTS ===
+   s_events_topic объявлен ЗДЕСЬ, один раз, и инициализируется
+   в build_topics(). Раньше он был объявлен ниже (дубль) и нигде
+   не заполнялся → публикация в пустой топик. */
+char       s_events_topic[192];
+/* === END FIX MQTT-EVENTS === */
+
 TickType_t s_last_event_time = 0;
 int        s_publish_fail_count = 0;
 
@@ -48,12 +55,6 @@ static bool s_mqtt_tasks_started = false;
 static volatile uint32_t s_mqtt_last_connected_ms    = 0;
 static volatile uint32_t s_mqtt_last_disconnected_ms = 0;
 static volatile uint32_t s_mqtt_down_since_ms        = 0;
-
-char       s_node_json_topic[192];
-/* === FIX MQTT-EVENTS === */
-char       s_events_topic[192];
-/* === END FIX MQTT-EVENTS === */
-char       s_node_channels_topic[192];
 
 static portMUX_TYPE s_mqtt_state_mtx = portMUX_INITIALIZER_UNLOCKED;
 
@@ -82,6 +83,10 @@ void wifi_mqtt_publish_event(const char *type, const char *detail,
 {
     if (!s_mqtt_connected || !g_mqtt_client) return;
     if (!type) return;
+    if (s_events_topic[0] == '\0') {
+        ESP_LOGW(TAG, "publish_event: s_events_topic empty (build_topics not called?)");
+        return;
+    }
 
     uint32_t sec = 0; uint16_t ms = 0;
     char ts[40] = "1970-01-01T00:00:00.000Z";
@@ -226,6 +231,11 @@ static void build_topics(void)
     snprintf(s_node_channels_topic, sizeof(s_node_channels_topic),
              "%s/Node/Channels", s_topic);
     /* === END FIX T_CHANNELS === */
+    /* === FIX MQTT-EVENTS ===
+       Инициализируем s_events_topic — раньше публикация шла в
+       пустой топик, и MQTT-клиент возвращал ошибку. */
+    snprintf(s_events_topic, sizeof(s_events_topic), "%s/Events", s_topic);
+    /* === END FIX MQTT-EVENTS === */
 
     ESP_LOGI(TAG, "Topic:      %s", s_topic);
     ESP_LOGI(TAG, "Subscribe:  %s", s_sub_topic);
@@ -234,6 +244,9 @@ static void build_topics(void)
     /* === FIX T_CHANNELS === */
     ESP_LOGI(TAG, "NodeChannels: %s", s_node_channels_topic);
     /* === END FIX T_CHANNELS === */
+    /* === FIX MQTT-EVENTS === */
+    ESP_LOGI(TAG, "Events:     %s", s_events_topic);
+    /* === END FIX MQTT-EVENTS === */
 }
 
 int wifi_mqtt_fault_priority_ex(traffic_fault_t f) { return mqtt_fault_priority(f); }

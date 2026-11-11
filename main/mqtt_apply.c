@@ -1,8 +1,14 @@
 /* ============================================================
    mqtt_apply.c — применение конфига к runtime.
 
-   === FIX SYNC-LEAD-CONSISTENT: SYNC_LEAD_MS из sync_config.h ===
-   === FIX NODE-BLINK-AND-ON:
+   === FIX SYNC-LEAD-CONSISTENT ===
+   === FIX LEAD-MS-RUNTIME ===
+       Задержка ROOT между отправкой c: и локальным
+       apply_stage_dd читается через sync_config_get_lead_ms()
+       (runtime, g_sync_lead_ms, дефолт 150 мс). Раньше был
+       #define SYNC_LEAD_MS.
+
+   === FIX NODE-BLINK-AND-ON ===
        mqtt_apply_config_runtime() НЕ вызывает traffic_light_start()
        для NODE — NODE остаётся в STOPPED + ALL_OFF до traffic:start
        от ROOT. Для ROOT — ALL_OFF до cfg:ok от NODE.
@@ -108,7 +114,11 @@ void mqtt_apply_config_runtime(void)
 
 /* ============================================================
    mqtt_notify_phase — sync: из MQTT (только ROOT).
-   Использует SYNC_LEAD_MS из sync_config.h.
+
+   === FIX LEAD-MS-RUNTIME ===
+       Задержка читается через sync_config_get_lead_ms()
+       (runtime, g_sync_lead_ms, дефолт 150 мс). Раньше было
+       #define SYNC_LEAD_MS.
    ============================================================ */
 void mqtt_notify_phase(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms)
 {
@@ -126,7 +136,9 @@ void mqtt_notify_phase(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms)
     s_last_sync_phase = phase;
     s_last_sync_ms    = now_ms;
 
-    uint32_t apply_ms = now_ms + SYNC_LEAD_MS;
+    /* === FIX LEAD-MS-RUNTIME === */
+    uint32_t apply_ms = now_ms + sync_config_get_lead_ms();
+    /* === END FIX LEAD-MS-RUNTIME === */
 
     char cmd[128];
     int n = snprintf(cmd, sizeof(cmd), "sync:%u:%lu:%lu:%lu:%lu",

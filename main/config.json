@@ -53,7 +53,7 @@
       "ped_green": 15000,
       "ped_blink": 4000,
       "fault_blink_period": 500,
-      "phase_blink_period": 1000
+      "phase_blink_period": 500
     },
 
     "fault": {
@@ -68,7 +68,7 @@
     "hold": {
       "enabled": true,
       "stage_ids": [3],
-      "max_hold_ms": 25000,
+      "max_hold_ms": 0,
       "on_ped_request": "insert"
     },
 
