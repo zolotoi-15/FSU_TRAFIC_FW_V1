@@ -1,50 +1,33 @@
 /* ============================================================
    traffic_light.c — основной цикл traffic_task + force_phase.
 
-   === FIX BLINK-NODE-VIA-MASK ===
-   NODE в follow_root КРУТИТ blink_mask из c: (зелёный мигающий,
-   ped_blink ch10). Блок blink — ДО continue для follow_root.
-
-   === FIX NO-DOUBLE-BLINK ===
-   ROOT в RUNNING (follow_root=false) крутит blink сам, NODE — по
-   маске.
-
-   === FIX BLINK-FROM-PM ===
-   Обе стороны считают blink как ((now - s_phase_start_ms)/period)&1.
-   s_phase_start_ms на NODE выставляется в apply_mask из pm,
-   пришедшего в c: (или из pm_utc — приоритет).
-
-   === FIX APPLY-MASK-ATOMIC ===
-   s_phase_start_ms и s_blink_mask выставляются под одним мьютексом.
-
-   === FIX APPLY-MASK-CLEAR-STALE-BLINK ===
-   При смене маски гасятся каналы, которые были в blink_mask,
-   но не вошли в новый on|blink.
-
-   === FIX INSERT-WATCHDOG ===
-   Если s_insert_pending висит с s_insert_idx == 0 дольше
-   insert_timeout_ms + 2 с — сбрасываем.
-
-   === FIX NODE-PED-DISPLAY-CLEAR ===
-   NODE не включает "ЖДИТЕ" сам — display приходит в on_mask от
-   ROOT. Но при ручном применении маски без display — гасим.
+   === FIX BLINK-VIA-MASK-FIRST ===
+   Блок blink крутится ПЕРВЫМ в traffic_task_loop, ДО всех
+   проверок sync_handshake и s_follow_root. Это гарантирует:
+     - NODE мигает, даже если застрял в sync_handshake;
+     - ROOT мигает, даже если потерял NODE и запустил sync;
+     - мигание не зависит от состояния state/phase, если
+       s_state=RUNNING и s_blink_mask != 0.
 
    === FIX ROOT-SEND-FIRST ===
-   ROOT при смене фазы СНАЧАЛА отправляет c: на NODE,
-   ждёт lead_ms (runtime, g_sync_lead_ms, дефолт 150 мс ≈
-   LoRa ToA + обработка NODE), и только потом применяет маску
-   у себя. Каналы ROOT и NODE зажигаются одновременно.
+   ROOT при смене фазы СНАЧАЛА отправляет c: на NODE, ждёт
+   lead_ms (runtime, g_sync_lead_ms, дефолт 150 мс ≈ LoRa ToA +
+   обработка NODE), и только потом применяет маску у себя.
 
    === FIX LEAD-MS-RUNTIME ===
    Задержка читается через sync_config_get_lead_ms(), меняется
-   на лету из MQTT (sync_lead:<ms>) или BLE (sync.set). Валидация
-   [50..1000] мс выполняется в sync_config_set_lead_ms().
+   на лету из MQTT (sync_lead:<ms>) или BLE (sync.set).
 
-   === FIX APPLY-MASK-NO-BACKWARD-PM (новое) ===
-   apply_mask на NODE больше НЕ откатывает s_phase_start_ms назад,
-   если pm из c: меньше текущего pm. Раньше периодический refresh
-   от ROOT (pm≈300, растёт) заставлял NODE сдвигать начало фазы
-   назад каждые 300 мс → blink замирал на pos~0 (всегда ON).
+   === FIX APPLY-MASK-PM-DRIFT-TOLERANCE ===
+   При refresh от ROOT pm в c: может отличаться от текущего pm
+   на LoRa ToA (~112 мс). Если применять «в лоб» —
+   s_phase_start_ms откатывается каждые 300 мс → blink замирает.
+   Толерантность 250 мс: меньший дрейф игнорируем (не двигаем
+   начало фазы), больший — синхронизируемся.
+
+   === FIX BLINK-DEBUG-LOGI ===
+   BLINK ON/OFF печатается на ESP_LOGI (временно), чтобы видеть
+   в мониторе, крутится ли blink. Потом вернуть на ESP_LOGD.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -198,10 +181,6 @@ static inline void apply_blink_bit(uint16_t mask, bool on)
    g_sync_lead_ms) → применить у себя. Вызывается БЕЗ s_mutex.
 
    Для NODE (или если transport не LoRa) — просто apply_stage_dd().
-
-   pm передаём = 0: helper вызывается сразу после обновления
-   s_phase_start_ms вызывающим кодом, значит ROOT стартует
-   фазу с pm=0, и NODE должен тоже с pm=0.
    ============================================================ */
 static void root_apply_stage_sync_first(uint8_t seq_idx, uint32_t dur_ms)
 {
@@ -217,9 +196,7 @@ static void root_apply_stage_sync_first(uint8_t seq_idx, uint32_t dur_ms)
     /* 1. Отправляем c: на NODE (pm=0, force=true) */
     send_sync_to_node_async_ex(seq_idx, 0, dur_ms, true, NULL);
 
-    /* 2. Ждём, пока NODE примет c: и включит каналы.
-       ROOT свои каналы пока НЕ трогает — они в старой маске.
-       lead_ms читаем через геттер — меняется на лету. */
+    /* 2. Ждём, пока NODE примет c: и включит каналы. */
     uint32_t lead = sync_config_get_lead_ms();
     vTaskDelay(pdMS_TO_TICKS(lead));
 
@@ -367,6 +344,10 @@ static uint32_t insert_duration_ms(uint8_t seq_idx)
 
 /* ============================================================
    traffic_task_loop
+   === FIX BLINK-VIA-MASK-FIRST ===
+       Blink — ПЕРВЫМ блоком. До проверок sync_handshake,
+       follow_root, state, fault. NODE мигает, даже если он
+       застрял в sync (sync:done не пришёл).
    ============================================================ */
 void traffic_task_loop(void *arg)
 {
@@ -383,20 +364,14 @@ void traffic_task_loop(void *arg)
     while (1) {
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(20));
 
-        /* === FIX SYNC-HANDSHAKE === */
-        if (g_config.role == DEVICE_ROLE_MASTER &&
-            sync_handshake_root_is_syncing()) {
-            continue;
-        }
-        if (g_config.role == DEVICE_ROLE_SLAVE &&
-            sync_handshake_node_is_syncing()) {
-            continue;
-        }
-        /* === END FIX SYNC-HANDSHAKE === */
-
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        /* === FIX BLINK-VIA-MASK (ROOT и NODE) === */
+        /* === FIX BLINK-VIA-MASK-FIRST ===
+           Blink работает ВСЕГДА, когда s_state=RUNNING и
+           s_blink_mask != 0. НЕ блокируется sync_handshake и
+           follow_root. Это критично: NODE может застрять в
+           ALIGNED (sync:done не пришёл от ROOT) — но blink
+           должен крутиться по маске из c:. */
         if (s_fault == TRAFFIC_FAULT_NONE &&
             s_state == TRAFFIC_STATE_RUNNING &&
             s_blink_mask != 0) {
@@ -407,10 +382,15 @@ void traffic_task_loop(void *arg)
             if (want_on != s_blink_on) {
                 s_blink_on = want_on;
                 apply_blink_bit(bm, s_blink_on);
-                ESP_LOGD(TAG, "BLINK %s ch=0x%04X", want_on ? "ON" : "OFF", bm);
+                /* === FIX BLINK-DEBUG-LOGI ===
+                   Временно LOGI (не LOGD), чтобы видеть в мониторе.
+                   Потом вернуть на LOGD. */
+                ESP_LOGI(TAG, "BLINK %s ch=0x%04X pos=%lu per=%lu",
+                         want_on ? "ON" : "OFF", bm,
+                         (unsigned long)pos, (unsigned long)per);
             }
         }
-        /* === END FIX BLINK-VIA-MASK === */
+        /* === END FIX BLINK-VIA-MASK-FIRST === */
 
         /* === FIX PED-DISPLAY (ROOT only) === */
         if (g_config.role == DEVICE_ROLE_MASTER && !s_follow_root &&
@@ -431,6 +411,20 @@ void traffic_task_loop(void *arg)
             }
         }
         /* === END FIX PED-DISPLAY === */
+
+        /* === FIX SYNC-HANDSHAKE (ПОСЛЕ blink) ===
+           Sync-handshake блокирует только ЛОГИКУ выбора фазы
+           (hold, insert, next_phase, all_red, recovery), но не
+           мигание каналов. */
+        if (g_config.role == DEVICE_ROLE_MASTER &&
+            sync_handshake_root_is_syncing()) {
+            continue;
+        }
+        if (g_config.role == DEVICE_ROLE_SLAVE &&
+            sync_handshake_node_is_syncing()) {
+            continue;
+        }
+        /* === END FIX SYNC-HANDSHAKE === */
 
         if (now - last_phase_log_ms >= 5000) {
             last_phase_log_ms = now;
@@ -665,9 +659,7 @@ void traffic_task_loop(void *arg)
                     xSemaphoreGive(s_mutex);
                 }
                 s_in_force_phase = true;
-                /* === FIX ROOT-SEND-FIRST === */
                 root_apply_stage_sync_first(seq_idx, dur_ins);
-                /* === END FIX ROOT-SEND-FIRST === */
                 s_in_force_phase = false;
                 phase_change_cancel_pending();
                 continue;
@@ -743,9 +735,7 @@ void traffic_task_loop(void *arg)
                         xSemaphoreGive(s_mutex);
                     }
                     s_in_force_phase = true;
-                    /* === FIX ROOT-SEND-FIRST === */
                     root_apply_stage_sync_first(seq_idx, dur_ex);
-                    /* === END FIX ROOT-SEND-FIRST === */
                     s_in_force_phase = false;
                     phase_change_cancel_pending();
                     s_insert_idx = s_insert_count + 1;
@@ -795,9 +785,7 @@ void traffic_task_loop(void *arg)
                         xSemaphoreGive(s_mutex);
                     }
                     s_in_force_phase = true;
-                    /* === FIX ROOT-SEND-FIRST === */
                     root_apply_stage_sync_first(seq_idx, dur_ex);
-                    /* === END FIX ROOT-SEND-FIRST === */
                     s_in_force_phase = false;
                     phase_change_cancel_pending();
                     s_insert_idx = s_insert_count + exit_step + 1;
@@ -838,9 +826,7 @@ void traffic_task_loop(void *arg)
                         xSemaphoreGive(s_mutex);
                     }
                     s_in_force_phase = true;
-                    /* === FIX ROOT-SEND-FIRST === */
                     root_apply_stage_sync_first(hold_seq, dur_hold);
-                    /* === END FIX ROOT-SEND-FIRST === */
                     s_in_force_phase = false;
                     phase_change_cancel_pending();
                     s_force_resync_pending = true;
@@ -1407,9 +1393,7 @@ esp_err_t traffic_light_next_phase(void)
     uint32_t dur = effective_stage_duration_ms(ph);
     xSemaphoreGive(s_mutex);
     s_in_force_phase = true;
-    /* === FIX ROOT-SEND-FIRST === */
     root_apply_stage_sync_first(ph, dur);
-    /* === END FIX ROOT-SEND-FIRST === */
     s_in_force_phase = false;
     phase_change_cancel_pending();
     ESP_LOGI(TAG, "NEXT → seq=%u", ph);
@@ -1449,11 +1433,7 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
 
     if (!in_fault) {
         s_in_force_phase = true;
-        /* === FIX ROOT-SEND-FIRST ===
-           force_phase вызывается из mqtt traffic:next и recovery —
-           на ROOT отправляем c: первым, на NODE — сразу apply. */
         root_apply_stage_sync_first(phase, dur_use);
-        /* === END FIX ROOT-SEND-FIRST === */
         s_in_force_phase = false;
         phase_change_cancel_pending();
     }
@@ -1462,18 +1442,10 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
 
 /* ============================================================
    traffic_light_apply_mask
-   === FIX APPLY-MASK-ATOMIC ===
-   === FIX ROOT-SEND-FIRST ===
-       apply_mask вызывается ТОЛЬКО на NODE (из c: от ROOT).
-       Здесь НЕЛЬЗЯ ждать lead_ms — NODE должен применить
-       маску сразу. ROOT уже подождал перед apply_stage_dd.
-
-   === FIX APPLY-MASK-NO-BACKWARD-PM ===
-       Если NODE уже в этой же фазе, и пришедший pm < текущего
-       pm — НЕ отматываем s_phase_start_ms назад. Иначе при
-       периодическом refresh от ROOT (каждые 300 мс) pm в c:
-       растёт (ROOT успел продвинуться), а NODE откатывает
-       начало фазы назад → blink замирает на pos~0 (всегда ON).
+   === FIX APPLY-MASK-PM-DRIFT-TOLERANCE ===
+       apply_mask вызывается ТОЛЬКО на NODE (из c:).
+       pm в c: может отличаться от текущего на LoRa ToA.
+       Применяем только если |diff| > 250 мс (сильный дрейф).
    ============================================================ */
 void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
                               uint8_t phase, uint32_t phase_ms,
@@ -1543,19 +1515,19 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
         s_prev_on_mask    = on_mask;
     }
 
-    /* === FIX APPLY-MASK-NO-BACKWARD-PM ===
-       Если NODE уже в этой же фазе, и пришедший pm < текущего pm —
-       НЕ отматываем s_phase_start_ms назад. Иначе при периодическом
-       refresh от ROOT (каждые 300 мс) pm в c: растёт (ROOT успел
-       продвинуться), а NODE откатывает начало фазы назад → blink
-       замирает на pos~0 (всегда ON). */
+    /* === FIX APPLY-MASK-PM-DRIFT-TOLERANCE ===
+       |diff| > 250 мс → синхронизируемся.
+       |diff| <= 250 мс → не двигаем s_phase_start_ms. */
+    #define PM_DRIFT_TOLERANCE_MS  250
     if (s_state == TRAFFIC_STATE_RUNNING && s_phase == phase) {
         uint32_t cur_pm = now - s_phase_start_ms;
-        if (phase_ms < cur_pm) {
+        int32_t  diff   = (int32_t)phase_ms - (int32_t)cur_pm;
+        int32_t  abs_diff = diff < 0 ? -diff : diff;
+        if (abs_diff <= PM_DRIFT_TOLERANCE_MS) {
             phase_ms = cur_pm;
         }
     }
-    /* === END FIX APPLY-MASK-NO-BACKWARD-PM === */
+    /* === END FIX APPLY-MASK-PM-DRIFT-TOLERANCE === */
 
     s_phase            = phase;
     s_phase_start_ms   = now - phase_ms;
@@ -1829,9 +1801,7 @@ esp_err_t traffic_light_manual_override(uint8_t seq_idx)
     uint32_t dur_use = effective_stage_duration_ms(seq_idx);
     xSemaphoreGive(s_mutex);
     s_in_force_phase = true;
-    /* === FIX ROOT-SEND-FIRST === */
     root_apply_stage_sync_first(seq_idx, dur_use);
-    /* === END FIX ROOT-SEND-FIRST === */
     s_in_force_phase = false;
     phase_change_cancel_pending();
     return ESP_OK;

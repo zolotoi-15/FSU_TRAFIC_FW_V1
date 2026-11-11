@@ -2,79 +2,25 @@
    sync_handshake.c — ускоренное восстановление LoRa-связи
    с ритуалом синхронизации и синхронным миганием ЖДИТЕ.
 
-   Жизненный цикл (ROOT):
-     IDLE → (нет NODE) → PROBE
-     PROBE → (получен sync:ack) → TIME
-     TIME  → (отправлены time: ×3) → PHASE
-     PHASE → (отправлены lock ×N, получены pong с drift <= SYNC_ALIGN_DRIFT_MS
-              SYNC_ALIGN_STREAK раз подряд) → ALIGNED
-     ALIGNED → (NODE мигает display синхронно SYNC_DISPLAY_STREAK_MIN
-                STATUS подряд) → отправка traffic:start + sync:done + c:
-                → IDLE (конфиг запущен)
+   === FIX NODE-ALIGNED-TIMEOUT (новое) ===
+       Если NODE в ALIGNED дольше SYNC_ALIGN_TIMEOUT_MS и
+       sync:done не пришёл — принудительно IDLE + display_off.
+       ROOT к этому моменту уже вышел из sync и шлёт c:/traffic:start.
+       Без этого фикса NODE висит в ALIGNED бесконечно,
+       traffic_task_loop уходит в continue, blink не крутится.
 
-   Жизненный цикл (NODE):
-     IDLE → (нет ROOT) → PROBE
-     PROBE → (получен sync:probe от ROOT) → ack; (sync:ack от ROOT) → TIME
-     TIME  → (получен time:) → PHASE
-     PHASE → (получен sync:lock) → pong; ALIGNED
-     ALIGNED → (получен sync:done / traffic:start) → IDLE
+   === FIX ALIGNED-TIMEOUT (ROOT) ===
+       ROOT в ALIGNED дольше SYNC_ALIGN_TIMEOUT_MS без disp_streak —
+       принудительный IDLE + traffic:start + c:.
 
-   Пока state != IDLE:
-     - все каналы кроме ch11 (display) выключены;
-     - ch11 мигает с периодом SYNC_DISPLAY_BLINK_MS;
-     - с момента SYNC_STATE_TIME мигание синхронно от UTC.
+   === FIX TIME-IN-ALIGNED ===
+       Пока ROOT в ALIGNED — time: раз в 1000 мс. Иначе часы NODE
+       уплывают, disp не совпадает.
 
-   === FIX SYNC-BLINK-NODE ===
-   В NODE в состоянии PHASE/ALIGNED мигание продолжается по UTC,
-   не замирает на одном бите, пока ROOT готовит sync:done.
-
-   === FIX SYNC-DISPLAY-UTC-PHASE ===
-   - PROBE: локальный таймер.
-   - TIME/PHASE/ALIGNED: абсолютная фаза от UTC
-     (utc / SYNC_DISPLAY_BLINK_MS) & 1 → мигание синхронно до мс.
-   - ROOT в ALIGNED раз в SYNC_DISPLAY_RESYNC_MS шлёт
-     sync:display:<0|1>:<utc_ms_next_edge> для форса фазы NODE.
-
-   === FIX SYNC-DISPLAY-VERIFY ===
-   ROOT запускает конфиг (ALIGNED → IDLE) ТОЛЬКО когда NODE
-   несколько STATUS подряд прислал "disp", совпадающий с
-   текущим битом ROOT.
-
-   === FIX DISPLAY-OFF-AFTER-SYNC ===
-   При выходе из sync (ALIGNED → IDLE) display_only_stop()
-   вызывается явно И дублируется прямым sr_output_off(ped_display).
-
-   === FIX SYNC-PROBE-ALWAYS-ANSWER ===
-   - NODE отвечает sync:ack на sync:probe в любом состоянии, кроме ALIGNED.
-   - ROOT принимает sync:ack в любом состоянии; если ROOT в IDLE — стартует PROBE.
-   - ROOT на sync:probe от NODE отвечает sync:ack в любом состоянии, кроме ALIGNED.
-
-   === FIX SYNC-PROBE-FORCE-IDLE-TIMEOUT ===
-   Если ROOT в PROBE не получил ack за SYNC_ALIGN_TIMEOUT_MS, он
-   принудительно выходит в IDLE, гасит display и запускает traffic
-   с красного.
-
-   === FIX SYNC-LOCK-ANY-STATE ===
-   NODE принимает sync:lock в любом состоянии, кроме ALIGNED
-   (и IDLE → принудительно PROBE→PHASE). Раньше lock принимался
-   только в PHASE. Но ROOT начинает слать lock сразу после time:,
-   а time: может потеряться → NODE в TIME игнорировал lock →
-   бесконечный цикл PROBE→TIME→(lock ignore)→TIMEOUT→PROBE.
-
-   === FIX SYNC-ACK-IN-PHASE ===
-   ROOT в PHASE при получении sync:ack от NODE переотправляет
-   time: ×3 — NODE потерял time:, надо перевести его в PHASE.
-
-   === FIX SYNC-TIME-IN-PHASE ===
-   ROOT в PHASE, помимо lock, раз в 1000 мс переотправляет time:.
-   Иначе пока ROOT в PHASE (не в RUNNING) NODE не получает свежее
-   время → |delta| растёт → UTC-коррекция в c: отбрасывается
-   (UTC_DELTA_MAX_MS) → рассинхрон продолжается.
-
-   === FIX NO-DRIFT-RESTART-TIME ===
-   ROOT при "no drift match after SYNC_LOCK_TRIES locks"
-   рестартит TIME (а не PHASE). Иначе ROOT снова шлёт lock ×5,
-   а NODE (без time:) в TIME игнорирует → цикл.
+   === FIX ALIGNED-NO-RESET-STATE-MS ===
+       В ALIGNED при resend sync:display НЕ обновляем
+       s_root_state_ms / s_node_state_ms — иначе таймауты не
+       сработают.
    ============================================================ */
 
 #include "sync_handshake.h"
@@ -96,8 +42,8 @@
 
 static const char *TAG = "sync_hs";
 
-extern volatile bool     s_node_running;      /* node_proto.c */
-extern volatile uint32_t s_last_node_msg_ms;  /* blink_example_main.c */
+extern volatile bool     s_node_running;
+extern volatile uint32_t s_last_node_msg_ms;
 
 /* ============================================================
    Общее: мигание ЖДИТЕ + выключение остальных
@@ -113,7 +59,6 @@ static void display_only_blink(uint32_t now_ms, bool use_utc)
     uint8_t ch = g_config.traffic.pins.cross_ped.ped_display;
     if (ch >= 16) ch = SYNC_DISPLAY_CH;
 
-    /* Гасим всё, кроме display, один раз при входе в sync */
     if (!s_display_cleared) {
         for (int i = 0; i < 16; i++) {
             if (i != ch) sr_output_off(i);
@@ -165,14 +110,12 @@ static void display_only_stop(void)
     ESP_LOGI(TAG, "SYNC: display blink stopped");
 }
 
-/* === FIX DISPLAY-OFF-AFTER-SYNC === */
 static inline void display_force_off(void)
 {
     uint8_t ch = g_config.traffic.pins.cross_ped.ped_display;
     if (ch >= 16) ch = SYNC_DISPLAY_CH;
     sr_output_off(ch);
 }
-/* === END FIX DISPLAY-OFF-AFTER-SYNC === */
 
 /* ============================================================
    ROOT
@@ -189,13 +132,11 @@ static volatile uint8_t      s_root_aligned_streak = 0;
 static volatile int32_t      s_root_last_drift_ms = 0;
 static volatile uint32_t     s_root_sync_started_ms = 0;
 
-/* последний pm NODE, полученный в STATUS */
 static volatile uint32_t     s_root_node_pm = 0;
 static volatile uint8_t      s_root_node_phase = 0xFF;
 static volatile uint32_t     s_root_node_pm_ms = 0;
 static volatile bool         s_root_node_status_fresh = false;
 
-/* === FIX SYNC-DISPLAY-VERIFY === */
 static volatile uint8_t  s_root_node_disp       = 0xFF;
 static volatile uint32_t s_root_node_disp_ms    = 0;
 static volatile uint8_t  s_root_disp_streak     = 0;
@@ -206,11 +147,8 @@ static uint8_t root_current_disp_bit(void)
     if (utc == 0) return 0xFF;
     return (uint8_t)((utc / SYNC_DISPLAY_BLINK_MS) & 1ULL);
 }
-/* === END FIX SYNC-DISPLAY-VERIFY === */
 
-/* === FIX SYNC-TIME-IN-PHASE === */
 static volatile uint32_t s_root_last_phase_time_ms = 0;
-/* === END FIX SYNC-TIME-IN-PHASE === */
 
 sync_state_t sync_handshake_root_state(void) { return s_root_state; }
 bool sync_handshake_root_is_syncing(void) { return s_root_state != SYNC_STATE_IDLE; }
@@ -222,9 +160,7 @@ static void root_set_state(sync_state_t st)
     s_root_state = st;
     s_root_state_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_root_aligned_streak = 0;
-    /* === FIX SYNC-DISPLAY-VERIFY === */
     s_root_disp_streak = 0;
-    /* === END FIX SYNC-DISPLAY-VERIFY === */
 }
 
 void sync_handshake_root_start(void)
@@ -240,21 +176,16 @@ void sync_handshake_root_start(void)
     s_root_aligned_streak = 0;
     s_root_node_status_fresh = false;
 
-    /* === FIX SYNC-DISPLAY-VERIFY === */
     s_root_node_disp    = 0xFF;
     s_root_node_disp_ms = 0;
     s_root_disp_streak  = 0;
-    /* === END FIX SYNC-DISPLAY-VERIFY === */
 
-    /* Все каналы выключаем, ЖДИТЕ начинает мигать */
     for (int i = 0; i < 16; i++) sr_output_off(i);
 
-    /* сбрасываем локальные флаги display, чтобы «очистка» прошла заново */
     s_display_cleared  = false;
     s_display_blink_on = false;
     s_display_blink_last = 0;
 
-    /* сбрасываем ped-флаги на случай, если остались от предыдущей работы */
     s_insert_pending  = false;
     s_ped_request     = false;
     s_ped_display_done = false;
@@ -272,9 +203,6 @@ void sync_handshake_root_on_rx(const char *evt, size_t len)
     memcpy(buf, evt, n);
     buf[n] = '\0';
 
-    /* sync:ack — NODE готов
-       === FIX SYNC-PROBE-ALWAYS-ANSWER ===
-       === FIX SYNC-ACK-IN-PHASE === */
     if (strncmp(buf, "sync:ack", 8) == 0) {
         if (s_root_state == SYNC_STATE_PROBE) {
             ESP_LOGW(TAG, "ROOT sync: got ack in PROBE → TIME");
@@ -290,10 +218,6 @@ void sync_handshake_root_on_rx(const char *evt, size_t len)
                 root_set_state(SYNC_STATE_TIME);
             }
         } else if (s_root_state == SYNC_STATE_PHASE) {
-            /* === FIX SYNC-ACK-IN-PHASE ===
-               NODE потерял time: и просит probe. ROOT в PHASE —
-               переотправляем time: ×3, чтобы NODE перешёл в PHASE
-               и принял lock. */
             ESP_LOGW(TAG, "ROOT sync: got ack in PHASE → resend time:");
             s_root_time_sent = 0;
             s_root_last_time_ms = 0;
@@ -304,8 +228,6 @@ void sync_handshake_root_on_rx(const char *evt, size_t len)
         return;
     }
 
-    /* sync:probe от NODE
-       === FIX SYNC-PROBE-ALWAYS-ANSWER === */
     if (strncmp(buf, "sync:probe", 10) == 0) {
         if (s_root_state == SYNC_STATE_ALIGNED) return;
         if (s_root_state == SYNC_STATE_IDLE) {
@@ -316,7 +238,6 @@ void sync_handshake_root_on_rx(const char *evt, size_t len)
         return;
     }
 
-    /* sync:pong:<ts>:<t_recv>:<pm>:<phase> — NODE ответил на sync:lock */
     if (strncmp(buf, "sync:pong:", 10) == 0) {
         unsigned int ts = 0, t_recv = 0, pm = 0, phase = 0;
         if (sscanf(buf + 10, "%u:%u:%u:%u", &ts, &t_recv, &pm, &phase) == 4) {
@@ -352,7 +273,6 @@ void sync_handshake_root_on_rx(const char *evt, size_t len)
         return;
     }
 
-    /* STATUS от NODE — обновляем pm/phase + display-бит */
     if (buf[0] == '{' && memmem(buf, n, "\"phase_ms\":", 11)) {
         const char *pm_p = memmem(buf, n, "\"phase_ms\":", 11);
         const char *ph_p = memmem(buf, n, "\"phase\":", 8);
@@ -371,7 +291,6 @@ void sync_handshake_root_on_rx(const char *evt, size_t len)
             }
         }
 
-        /* === FIX SYNC-DISPLAY-VERIFY === */
         const char *dp = memmem(buf, n, "\"disp\":", 7);
         if (dp) {
             int nb = -1;
@@ -397,20 +316,18 @@ void sync_handshake_root_on_rx(const char *evt, size_t len)
                 }
             }
         }
-        /* === END FIX SYNC-DISPLAY-VERIFY === */
     }
 }
 
 void sync_handshake_root_tick(uint32_t now_ms)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) return;
-
     if (s_root_state == SYNC_STATE_IDLE) return;
 
     bool use_utc = (s_root_state >= SYNC_STATE_TIME);
     display_only_blink(now_ms, use_utc);
 
-    /* === FIX SYNC-PROBE-FORCE-IDLE-TIMEOUT === */
+    /* Глобальный таймаут — только для PROBE и TIME (не для ALIGNED) */
     if (s_root_sync_started_ms != 0 &&
         (now_ms - s_root_sync_started_ms) > SYNC_ALIGN_TIMEOUT_MS) {
         if (s_root_state == SYNC_STATE_PROBE) {
@@ -441,7 +358,6 @@ void sync_handshake_root_tick(uint32_t now_ms)
             root_set_state(SYNC_STATE_PROBE);
         }
     }
-    /* === END FIX SYNC-PROBE-FORCE-IDLE-TIMEOUT === */
 
     switch (s_root_state) {
     case SYNC_STATE_PROBE:
@@ -478,10 +394,6 @@ void sync_handshake_root_tick(uint32_t now_ms)
         break;
 
     case SYNC_STATE_PHASE: {
-        /* === FIX SYNC-TIME-IN-PHASE ===
-           Пока ROOT в PHASE (не в RUNNING), периодический time:
-           раз в 1000 мс, чтобы NODE не уплыл по часам и UTC-коррекция
-           в c: работала. */
         if (s_root_last_phase_time_ms == 0 ||
             (now_ms - s_root_last_phase_time_ms) >= 1000) {
             s_root_last_phase_time_ms = now_ms;
@@ -493,7 +405,6 @@ void sync_handshake_root_tick(uint32_t now_ms)
                 if (tn > 0) transport_send_cmd_noack(tcmd, tn);
             }
         }
-        /* === END FIX SYNC-TIME-IN-PHASE === */
 
         if (s_root_lock_sent < SYNC_LOCK_TRIES) {
             if (s_root_last_lock_ms == 0 ||
@@ -516,10 +427,6 @@ void sync_handshake_root_tick(uint32_t now_ms)
                 s_root_lock_sent++;
                 if (s_root_lock_sent >= SYNC_LOCK_TRIES &&
                     s_root_aligned_streak == 0) {
-                    /* === FIX NO-DRIFT-RESTART-TIME ===
-                       Раньше рестартили PHASE (снова lock ×5). NODE
-                       терял time: и не переходил в PHASE → замкнутый
-                       круг. Теперь рестартим TIME. */
                     ESP_LOGW(TAG, "ROOT sync: no drift match after %u locks "
                                   "→ restart TIME", SYNC_LOCK_TRIES);
                     s_root_time_sent = 0;
@@ -527,7 +434,6 @@ void sync_handshake_root_tick(uint32_t now_ms)
                     s_root_lock_sent = 0;
                     s_root_last_lock_ms = 0;
                     root_set_state(SYNC_STATE_TIME);
-                    /* === END FIX NO-DRIFT-RESTART-TIME === */
                 }
             }
         }
@@ -535,7 +441,49 @@ void sync_handshake_root_tick(uint32_t now_ms)
     }
 
     case SYNC_STATE_ALIGNED: {
-        /* sync:display ресинк */
+        /* === FIX ALIGNED-TIMEOUT (ROOT) === */
+        if ((now_ms - s_root_state_ms) >= SYNC_ALIGN_TIMEOUT_MS) {
+            ESP_LOGE(TAG, "ROOT sync: ALIGNED timeout %u ms "
+                          "(disp_streak=%u) → force IDLE + traffic:start",
+                     (unsigned)(now_ms - s_root_state_ms),
+                     s_root_disp_streak);
+
+            transport_send_cmd_noack("traffic:start",
+                                     strlen("traffic:start"));
+            transport_send_cmd_noack("sync:done", 9);
+
+            s_fault_from_remote_ex = true;
+            traffic_light_set_fault(TRAFFIC_FAULT_NONE);
+            s_fault_from_remote_ex = false;
+            traffic_light_set_follow_root(false);
+            traffic_light_start_with_red();
+            uint8_t ph = traffic_light_get_phase();
+            send_sync_to_node_async_ex(
+                ph, 0,
+                traffic_light_get_phase_duration_ms(),
+                true, NULL);
+
+            display_only_stop();
+            display_force_off();
+            root_set_state(SYNC_STATE_IDLE);
+            break;
+        }
+        /* === END FIX ALIGNED-TIMEOUT === */
+
+        /* === FIX TIME-IN-ALIGNED === */
+        if (s_root_last_phase_time_ms == 0 ||
+            (now_ms - s_root_last_phase_time_ms) >= 1000) {
+            s_root_last_phase_time_ms = now_ms;
+            uint32_t sec = 0; uint16_t ms = 0;
+            if (time_sync_get(&sec, &ms)) {
+                char tcmd[64];
+                int tn = snprintf(tcmd, sizeof(tcmd), "time:%lu:%u:0",
+                                  (unsigned long)sec, (unsigned)ms);
+                if (tn > 0) transport_send_cmd_noack(tcmd, tn);
+            }
+        }
+        /* === END FIX TIME-IN-ALIGNED === */
+
         static uint32_t s_last_display_sync_ms = 0;
         if (s_last_display_sync_ms == 0 ||
             (now_ms - s_last_display_sync_ms) >= SYNC_DISPLAY_RESYNC_MS) {
@@ -556,7 +504,6 @@ void sync_handshake_root_tick(uint32_t now_ms)
             }
         }
 
-        /* === FIX SYNC-DISPLAY-VERIFY === */
         bool disp_synced = (s_root_disp_streak >= SYNC_DISPLAY_STREAK_MIN);
 
         if (disp_synced) {
@@ -598,9 +545,9 @@ void sync_handshake_root_tick(uint32_t now_ms)
                                   (unsigned long long)next_edge);
                 if (dn > 0) transport_send_cmd_noack(dcmd, dn);
             }
-            s_root_state_ms = now_ms;
+            /* НЕ обновляем s_root_state_ms — иначе ALIGNED-TIMEOUT
+               никогда не сработает. */
         }
-        /* === END FIX SYNC-DISPLAY-VERIFY === */
         break;
     }
 
@@ -665,7 +612,6 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
     memcpy(buf, cmd, n);
     buf[n] = '\0';
 
-    /* === FIX SYNC-PROBE-ALWAYS-ANSWER === */
     if (strncmp(buf, "sync:probe", 10) == 0) {
         if (s_node_state != SYNC_STATE_ALIGNED) {
             s_node_last_ack_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -676,7 +622,6 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
         return;
     }
 
-    /* sync:ack — ROOT ответил на наш probe */
     if (strncmp(buf, "sync:ack", 8) == 0) {
         if (s_node_state == SYNC_STATE_PROBE) {
             ESP_LOGW(TAG, "NODE sync: got ack → TIME");
@@ -691,7 +636,6 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
         return;
     }
 
-    /* time: — время от ROOT */
     if (strncmp(buf, "time:", 5) == 0) {
         if (s_node_state == SYNC_STATE_PROBE ||
             s_node_state == SYNC_STATE_TIME) {
@@ -701,16 +645,11 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
         return;
     }
 
-    /* sync:lock:<ph>:<pm>:<dur>:<end_utc>
-       === FIX SYNC-LOCK-ANY-STATE === */
     if (strncmp(buf, "sync:lock:", 10) == 0) {
         unsigned int ph = 0, pm = 0, dur = 0;
         unsigned long long end_utc = 0;
         if (sscanf(buf + 10, "%u:%u:%u:%llu",
                    &ph, &pm, &dur, &end_utc) == 4) {
-            /* lock содержит end_utc, самодостаточен. Принимаем в
-               любом состоянии, кроме ALIGNED. Если NODE в PROBE
-               или TIME — принудительно переходим в PHASE. */
             if (s_node_state == SYNC_STATE_IDLE) {
                 ESP_LOGW(TAG, "NODE sync: lock while IDLE → force start PHASE");
                 sync_handshake_node_start();
@@ -756,9 +695,7 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
         }
         return;
     }
-    /* === END FIX SYNC-LOCK-ANY-STATE === */
 
-    /* sync:display:<0|1>:<utc_ms_next_edge> */
     if (strncmp(buf, "sync:display:", 13) == 0) {
         unsigned int bit = 0;
         unsigned long long next_edge = 0;
@@ -784,7 +721,6 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
         return;
     }
 
-    /* sync:done */
     if (strncmp(buf, "sync:done", 9) == 0) {
         if (s_node_state == SYNC_STATE_ALIGNED) {
             ESP_LOGW(TAG, "NODE sync: done → IDLE");
@@ -795,7 +731,6 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
         return;
     }
 
-    /* traffic:start — если ещё в ALIGNED, принимаем как done */
     if (strcmp(buf, "traffic:start") == 0) {
         if (s_node_state == SYNC_STATE_ALIGNED) {
             ESP_LOGW(TAG, "NODE sync: traffic:start in ALIGNED → IDLE");
@@ -810,19 +745,29 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
 void sync_handshake_node_tick(uint32_t now_ms)
 {
     if (g_config.role != DEVICE_ROLE_SLAVE) return;
-
     if (s_node_state == SYNC_STATE_IDLE) return;
 
-    /* === FIX SYNC-BLINK-NODE ===
-       В любом состоянии sync (PROBE/TIME/PHASE/ALIGNED) display
-       мигает. В TIME+ — по UTC. Это критично: если ROOT не присылает
-       sync:done сразу после ALIGNED, display продолжает мигать, а не
-       замирает на одном бите. */
     bool use_utc = (s_node_state >= SYNC_STATE_TIME);
     display_only_blink(now_ms, use_utc);
-    /* === END FIX SYNC-BLINK-NODE === */
 
-    /* Таймаут: если долго в любом состоянии и нет ack — рестарт probe */
+    /* === FIX NODE-ALIGNED-TIMEOUT ===
+       Если NODE в ALIGNED дольше SYNC_ALIGN_TIMEOUT_MS и
+       sync:done не пришёл — принудительно IDLE + display_off.
+       ROOT к этому моменту уже вышел из sync и шлёт c:/traffic:start.
+       Без этого фикса NODE висит в ALIGNED бесконечно,
+       traffic_task_loop уходит в continue, blink не крутится. */
+    if (s_node_state == SYNC_STATE_ALIGNED &&
+        (now_ms - s_node_state_ms) >= SYNC_ALIGN_TIMEOUT_MS) {
+        ESP_LOGE(TAG, "NODE sync: ALIGNED timeout %u ms → force IDLE",
+                 (unsigned)(now_ms - s_node_state_ms));
+        display_only_stop();
+        display_force_off();
+        node_set_state(SYNC_STATE_IDLE);
+        return;
+    }
+    /* === END FIX NODE-ALIGNED-TIMEOUT === */
+
+    /* Глобальный таймаут для PROBE/TIME/PHASE */
     if (s_node_sync_started_ms != 0 &&
         (now_ms - s_node_sync_started_ms) > SYNC_ALIGN_TIMEOUT_MS &&
         s_node_state != SYNC_STATE_ALIGNED) {
@@ -843,6 +788,8 @@ void sync_handshake_node_tick(uint32_t now_ms)
         break;
 
     case SYNC_STATE_ALIGNED:
+        /* resend pong раз в 3 с. НЕ обновляем s_node_state_ms —
+           иначе ALIGNED-TIMEOUT никогда не сработает. */
         if ((now_ms - s_node_state_ms) >= 3000) {
             ESP_LOGW(TAG, "NODE sync: no done for 3s → resend pong");
             uint32_t my_pm = traffic_light_get_phase_ms();
@@ -853,7 +800,7 @@ void sync_handshake_node_tick(uint32_t now_ms)
                               (unsigned)now_ms, (unsigned)now_ms,
                               (unsigned)my_pm, (unsigned)my_ph);
             if (pn > 0) transport_send_evt_noack(pong, pn);
-            s_node_state_ms = now_ms;
+            /* НЕ трогаем s_node_state_ms */
         }
         break;
 

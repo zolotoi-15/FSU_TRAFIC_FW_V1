@@ -4,21 +4,13 @@
    === FIX C-BUFFER-BEFORE-START ===
        Если c: приходит раньше, чем NODE перешёл в RUNNING
        (s_node_running == false), сохраняем его в s_pending_c_*
-       и применяем сразу после traffic:start. Раньше c:
-       игнорировался → NODE терял первую маску и стартовал
-       с пустым состоянием (все каналы OFF).
+       и применяем сразу после traffic:start.
 
    === FIX UTC-DELTA-MAX ===
        UTC_DELTA_MAX_MS 500 → 3000, SYNC_MAX_DRIFT_MS 250 → 500.
-       При LoRa ToA ~112 мс и TIME_PUSH_PERIOD_MS=10000 дрейф
-       кварца легко выходит за 500 мс → pm_utc никогда не
-       применялся → рассинхрон накапливался.
 
    === FIX APPLY-MASK-PM-UTC ===
        При c: с валидным end_utc применяем pm_utc, НЕ pm из c:.
-       pm в c: — момент snprintf на ROOT, он устаревает на
-       LoRa ToA (~150 мс). pm_utc от end_utc_ms — актуален на
-       момент apply_mask.
 
    === FIX SYNC-HANDSHAKE ===
        on_cmd_from_root:
@@ -30,8 +22,12 @@
        sync_handshake_root_on_rx.
 
    === FIX T_CHANNELS ===
-       NODE раз в 60 с шлёт T_CHANNELS с 16 каналами. ROOT
-       публикует в <base>/Node/Channels.
+       NODE раз в 60 с шлёт T_CHANNELS с 16 каналами.
+
+   === FIX TIME-APPLY-IN-ALIGNED ===
+       time: применяется на NODE всегда, независимо от
+       sync-состояния. Иначе во время ALIGNED часы NODE
+       уплывают, disp не совпадает, ROOT висит в ALIGNED.
    ============================================================ */
 
 #include "node_proto.h"
@@ -108,8 +104,7 @@ static volatile bool s_c_received_since_start = false;
 
 /* === FIX C-BUFFER-BEFORE-START ===
    Если c: приходит раньше traffic:start, сохраняем его здесь
-   и применяем после перехода в RUNNING. Иначе NODE теряет
-   первую маску и стартует с пустым состоянием. */
+   и применяем после перехода в RUNNING. */
 static volatile bool     s_pending_c_valid = false;
 static volatile uint8_t  s_pending_c_phase = 0;
 static volatile uint32_t s_pending_c_pm    = 0;
@@ -207,6 +202,37 @@ static void on_cmd_from_root(const char *cmd, size_t len)
     memcpy(buf, cmd, n);
     buf[n] = '\0';
 
+    /* === FIX TIME-APPLY-IN-ALIGNED ===
+       time: применяем ДО обработки sync:*, чтобы не зависеть
+       от состояния. Если NODE в ALIGNED и ROOT шлёт time: —
+       часы NODE подтягиваются, disp синхронизируется,
+       ROOT выходит из ALIGNED. */
+    if (strncmp(buf, "time:", 5) == 0) {
+        unsigned long sec = 0;
+        unsigned int ms = 0;
+        unsigned long rtt = 0;
+        if (sscanf(buf + 5, "%lu:%u:%lu", &sec, &ms, &rtt) >= 2) {
+            uint32_t local_sec = 0;
+            uint16_t local_ms = 0;
+            if (time_sync_get(&local_sec, &local_ms)) {
+                int32_t delta = (int32_t)((int64_t)sec * 1000 + ms
+                                          - ((int64_t)local_sec * 1000 + local_ms));
+                time_sync_note_delta_ms(delta);
+                ESP_LOGI(TAG, "time: root=%lu.%03u local=%lu.%03u delta=%ld ms",
+                         sec, ms, (unsigned long)local_sec, local_ms,
+                         (long)delta);
+            } else {
+                ESP_LOGI(TAG, "time: first set root=%lu.%03lu", sec, ms);
+            }
+            time_sync_set((uint32_t)sec, (uint16_t)ms, (uint32_t)rtt);
+        }
+        /* Sync-handshake тоже должен знать о time: (PROBE/TIME →
+           PHASE), но только если NODE ещё не в ALIGNED. */
+        sync_handshake_node_on_rx(buf, n);
+        return;
+    }
+    /* === END FIX TIME-APPLY-IN-ALIGNED === */
+
     /* === FIX SYNC-HANDSHAKE === */
     if (len >= 5 && strncmp(buf, "sync:", 5) == 0) {
         sync_handshake_node_on_rx(buf, n);
@@ -236,8 +262,7 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         if (!s_node_running) {
             /* === FIX C-BUFFER-BEFORE-START ===
                NODE ещё не перешёл в RUNNING — сохраняем c: и
-               применим после traffic:start. Иначе теряем первую
-               маску и стартуем с пустым состоянием. */
+               применим после traffic:start. */
             ESP_LOGW(TAG, "c: NODE not RUNNING → stash for later "
                           "(ph=%u)", ph);
             s_pending_c_phase = (uint8_t)ph;
@@ -327,28 +352,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
             traffic_light_priority_shorten(pms);
             return;
         }
-    }
-
-    if (strncmp(buf, "time:", 5) == 0) {
-        unsigned long sec = 0;
-        unsigned int ms = 0;
-        unsigned long rtt = 0;
-        if (sscanf(buf + 5, "%lu:%u:%lu", &sec, &ms, &rtt) >= 2) {
-            uint32_t local_sec = 0;
-            uint16_t local_ms = 0;
-            if (time_sync_get(&local_sec, &local_ms)) {
-                int32_t delta = (int32_t)((int64_t)sec * 1000 + ms
-                                          - ((int64_t)local_sec * 1000 + local_ms));
-                time_sync_note_delta_ms(delta);
-                ESP_LOGI(TAG, "time: root=%lu.%03u local=%lu.%03u delta=%ld ms",
-                         sec, ms, (unsigned long)local_sec, local_ms,
-                         (long)delta);
-            } else {
-                ESP_LOGI(TAG, "time: first set root=%lu.%03lu", sec, ms);
-            }
-            time_sync_set((uint32_t)sec, (uint16_t)ms, (uint32_t)rtt);
-        }
-        return;
     }
 
     if (strcmp(buf, "timeq") == 0) {
@@ -451,8 +454,7 @@ static void on_cmd_from_root(const char *cmd, size_t len)
 
         /* === FIX C-BUFFER-BEFORE-START ===
            Если c: пришёл раньше traffic:start — применяем его
-           СЕЙЧАС. end_utc пересчитывается от now_utc, чтобы
-           pm был актуальным. */
+           СЕЙЧАС. */
         if (s_pending_c_valid) {
             ESP_LOGI(TAG, "traffic:start → apply stashed c: ph=%u",
                      s_pending_c_phase);
@@ -474,7 +476,7 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         s_node_running = false;
         s_root_lost_flag = false;
         s_c_received_since_start = false;
-        s_pending_c_valid = false;   /* === FIX C-BUFFER-BEFORE-START === */
+        s_pending_c_valid = false;
         return;
     }
     if (strcmp(buf, "traffic:pause")  == 0) { traffic_light_pause();  return; }

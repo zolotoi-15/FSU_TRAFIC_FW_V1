@@ -2,15 +2,10 @@
    root_wd.c — ROOT: phase-sync + heartbeat.
 
    === FIX SET-REMOTE-FLAG ===
-       Макрос SET_REMOTE_FLAG определён локально в этом файле
-       (в исходной версии он был утерян при рефакторинге).
-       Используется везде, где ROOT сам меняет fault, чтобы
-       fault_handler не сделал echo.
+       Макрос SET_REMOTE_FLAG определён локально в этом файле.
 
    === FIX NO-PRE-DELAY ===
-       Убран vTaskDelay(SYNC_PRE_DELAY_MS) перед c:. Раньше pm
-       читался ДО sleep 50 мс, отправлялся ПОСЛЕ — NODE получал
-       устаревший pm.
+       Убран vTaskDelay(SYNC_PRE_DELAY_MS) перед c:.
 
    === FIX PM-AT-SEND ===
        pm вычисляется внутри send_channels_to_node_impl в момент
@@ -18,16 +13,23 @@
 
    === FIX C-IMMEDIATE-AFTER-START ===
        Убран vTaskDelay(300) между traffic:start и первым c:.
-       Если NODE ещё не RUNNING — буферизация в node_proto.c
-       сохранит c: и применит после traffic:start.
 
    === FIX C-REFRESH-300 ===
        LORA_SYNC_INTERVAL_MS 500 → 300: меньше дрейф между c:.
 
    === FIX SYNC-HANDSHAKE ===
        При старте и потере NODE — sync_handshake_root_start().
-       phase_sync_task в самом начале вызывает
-       sync_handshake_root_tick(); пока is_syncing() — c: не шлём.
+
+   === FIX NO-DOUBLE-C-ON-PHASE-CHANGE (новое) ===
+       phase_sync_task больше НЕ отправляет c: при смене фазы.
+       Первичный c: с pm=0 уже ушёл из
+       root_apply_stage_sync_first() в traffic_light.c (force=true).
+       Раньше здесь дублировался c: с pm≈300, NODE откатывал
+       s_phase_start_ms назад → blink замирал.
+
+       Refresh c: (каждые LORA_SYNC_INTERVAL_MS) ОСТАВЛЕН — он
+       нужен для компенсации дрейфа, и phase_sync_task больше не
+       «перезапускает» blink на NODE.
    ============================================================ */
 
 #include "root_wd.h"
@@ -73,9 +75,6 @@ extern volatile bool s_insert_pending;
 
 /* ============================================================
    === SET_REMOTE_FLAG ===
-   Пометка "мы сами меняем fault", чтобы fault_handler не сделал
-   echo. Переменная объявлена в app_shared.h, определена в
-   node_proto.c (volatile bool s_fault_from_remote_ex).
    ============================================================ */
 #define SET_REMOTE_FLAG(v) do { s_fault_from_remote_ex = (v); } while (0)
 /* === END SET_REMOTE_FLAG === */
@@ -83,10 +82,6 @@ extern volatile bool s_insert_pending;
 /* ============================================================
    send_channels_to_node_impl
    === FIX PM-AT-SEND ===
-   phase_ms_hint == UINT32_MAX → pm берётся СЕЙЧАС из
-   traffic_light_get_phase_ms(), в момент snprintf, а не в
-   вызывающем коде. Иначе между чтением pm и отправкой c:
-   накапливается задержка (vTaskDelay + LoRa ToA).
    ============================================================ */
 static uint32_t send_channels_to_node_impl(uint8_t phase,
                                            uint32_t phase_ms_hint,
@@ -424,11 +419,7 @@ static void root_node_watchdog_task(void *arg)
                 traffic_light_set_follow_root(false);
                 traffic_light_start_with_red();
 
-                /* === FIX C-IMMEDIATE-AFTER-START ===
-                   traffic:start и c: — подряд, без vTaskDelay(300).
-                   Если NODE ещё не RUNNING — буферизация в
-                   node_proto.c сохранит c: и применит после
-                   traffic:start. */
+                /* === FIX C-IMMEDIATE-AFTER-START === */
                 transport_send_cmd_noack("traffic:start",
                                          strlen("traffic:start"));
                 send_channels_to_node(0, UINT32_MAX,
@@ -541,14 +532,20 @@ static void root_node_watchdog_task(void *arg)
 
 /* ============================================================
    phase_sync_task
-   === FIX NO-PRE-DELAY + C-IMMEDIATE-ON-PHASE-CHANGE ===
-   При смене фазы c: уходит немедленно. pm — hint UINT32_MAX,
-   вычисляется внутри send_channels_to_node_impl.
+   === FIX NO-DOUBLE-C-ON-PHASE-CHANGE ===
+       При смене фазы c: НЕ отправляем — оно уже ушло из
+       root_apply_stage_sync_first() в traffic_light.c (pm=0,
+       force=true). Раньше здесь дублировалось c: с pm≈300,
+       NODE откатывал s_phase_start_ms назад → blink замирал.
+
+       Refresh c: каждые LORA_SYNC_INTERVAL_MS оставлен — он
+       компенсирует дрейф и не «дёргает» blink (pm растёт
+       синхронно с ROOT, NODE применяет с pm >= cur_pm).
    ============================================================ */
 static void phase_sync_task(void *arg)
 {
     ESP_LOGI(TAG, "phase_sync_task started (refresh=%d ms, "
-                  "TIME-PUSH=%d ms, C-ALWAYS-IN-RUNNING, NO-PRE-DELAY, "
+                  "TIME-PUSH=%d ms, NO-DOUBLE-C-ON-PHASE-CHANGE, "
                   "PM-AT-SEND, SYNC-HANDSHAKE)",
              LORA_SYNC_INTERVAL_MS, TIME_PUSH_PERIOD_MS);
 
@@ -589,18 +586,25 @@ static void phase_sync_task(void *arg)
             uint8_t  phase = traffic_light_get_phase();
             uint32_t dur   = traffic_light_get_phase_duration_ms();
 
+            /* === FIX NO-DOUBLE-C-ON-PHASE-CHANGE ===
+               Первичный c: при смене фазы уже отправлен из
+               root_apply_stage_sync_first() в traffic_light.c
+               (с pm=0, force=true). Здесь его НЕ дублируем,
+               иначе NODE получает два c: подряд (второй с pm≈300),
+               откатывает s_phase_start_ms → blink замирает.
+               Только запоминаем фазу для последующего refresh. */
             if (phase != last_phase) {
-                if (send_channels_to_node(phase, UINT32_MAX, dur, false)) {
-                    last_phase = phase;
-                    last_ms = now;
-                    ESP_LOGI(TAG, "c: phase changed -> ph=%u", phase);
-                }
+                last_phase = phase;
+                last_ms = now;
+                ESP_LOGD(TAG, "phase changed → c: already sent by "
+                              "root_apply_stage_sync_first (ph=%u)", phase);
             } else if ((now - last_ms) >= LORA_SYNC_INTERVAL_MS) {
                 if (send_channels_to_node(phase, UINT32_MAX, dur, false)) {
                     last_ms = now;
                     ESP_LOGD(TAG, "c: refresh ph=%u", phase);
                 }
             }
+            /* === END FIX NO-DOUBLE-C-ON-PHASE-CHANGE === */
         }
 
         vTaskDelay(pdMS_TO_TICKS(20));
