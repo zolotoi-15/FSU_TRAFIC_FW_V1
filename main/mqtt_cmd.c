@@ -607,6 +607,27 @@ void mqtt_handle_command(const char *data, int data_len)
         nvs_flash_erase();
         esp_restart();
     }
+
+     /* === FIX LEAD-MS-NVS ===
+       sync_lead:erase — стереть сохранённый lead_ms из NVS,
+       вернуть дефолт 150 мс. */
+    if (strcmp(cmd, "sync_lead:erase") == 0) {
+        esp_err_t e = sync_config_nvs_erase();
+        if (s_mqtt_connected && g_mqtt_client) {
+            char resp[64];
+            int rn = snprintf(resp, sizeof(resp),
+                e == ESP_OK
+                    ? "{\"sync_lead_erase\":\"ok\"}"
+                    : "{\"error\":\"sync_lead_erase_fail\"}");
+            if (rn > 0)
+                esp_mqtt_client_publish(g_mqtt_client, s_topic,
+                                        resp, rn, 1, 0);
+        }
+        changed = true;
+        goto publish;
+    }
+    /* === END FIX LEAD-MS-NVS === */
+    
     ESP_LOGW(TAG, "Unknown: %s", cmd);
     return;
 

@@ -4,23 +4,18 @@
 
    === FIX MEASURE-ALL-ALWAYS ===
        Меряем ВСЕ 16 каналов, включая !sr_on и inactive.
-       Иначе не поймать:
-         - «напряжение на выключенном канале» (замыкание между
-           выходами): SR=0, V_IN≥5 В;
-         - «короткое замыкание»: SR=1, V_IN<5 В, V_IMON любой.
 
    === FIX MUX-READ-IN-ALL-OFF ===
-       При ALL_OFF (NODE ждёт traffic:start от ROOT) меряем
-       каналы — иначе T_CHANNELS пустой, ROOT не видит состояние
-       каналов NODE.
-
-       При YELLOW_BLINK — ПРОПУСКАЕМ итерацию: fault_blink_yellow
-       меняет SR (мигание), try_recovery дёргает DIAG_EN —
-       mux_task мешал бы им и получал ложные данные.
+       При ALL_OFF меряем каналы. При YELLOW_BLINK — пропускаем.
 
    === FIX CHANNEL-PERIODIC-LOG ===
-       Отдельная задача ch_log_task печатает таблицу текущих
-       показаний раз в 5 с. mux_task не блокируется.
+       Отдельная задача ch_log_task печатает таблицу раз в 5 с.
+
+   === FIX FAULT-CHECK-EVERY-CYCLE ===
+       traffic_light_check_faults(&local) вызывается КАЖДЫЙ
+       цикл (раз в MUX_TASK_PERIOD_MS), даже если данные не
+       изменились. Иначе переход SHORT_GND → восстановление
+       между двумя циклами мог быть не замечен.
    ============================================================ */
 
 #include "mux_task.h"
@@ -46,14 +41,14 @@ static void mux_task(void *arg)
 
     while (1) {
         /* === FIX MUX-READ-IN-ALL-OFF ===
-           Пропускаем только YELLOW_BLINK. При ALL_OFF — меряем
-           (NODE ждёт traffic:start, но каналы нужны для
-           T_CHANNELS → ROOT). */
+           Пропускаем только YELLOW_BLINK (fault_blink меняет SR,
+           try_recovery дёргает DIAG_EN — mux_task мешал бы).
+           ALL_OFF — меряем (NODE ждёт traffic:start, но каналы
+           нужны для T_CHANNELS → ROOT). */
         if (traffic_light_get_fault() == TRAFFIC_FAULT_YELLOW_BLINK) {
             vTaskDelay(pdMS_TO_TICKS(MUX_TASK_PERIOD_MS));
             continue;
         }
-        /* === END FIX MUX-READ-IN-ALL-OFF === */
 
         mux_data_t local = {0};
 
@@ -62,9 +57,6 @@ static void mux_task(void *arg)
             if (ch < g_config.sr.count) is_active = g_config.sr.outputs[ch].active;
             local.sr_state[ch] = sr_get_output(ch) ? 1 : 0;
 
-            /* Неактивный в конфиге канал — нет физического выхода,
-               не меряем. Но SR=0 при active=true — меряем
-               обязательно (детект «V_IN на выключенном»). */
             if (!is_active) {
                 local.v_in[ch] = 0.0f;
                 local.i_load[ch] = 0;
@@ -78,19 +70,20 @@ static void mux_task(void *arg)
             esp_err_t dret = board_diag_en_set(ch, true);
             local.diag_en[ch] = (dret == ESP_OK) ? 1 : 0;
 
-            esp_rom_delay_us(200);   /* tMON(on1) typ 10 мкс, с запасом */
+            esp_rom_delay_us(200);   /* tMON(on1) typ 10 мкс */
 
             /* Один захват мьютекса — оба сигнала */
             SemaphoreHandle_t mux_mtx = mux_get_mutex();
             if (mux_mtx) xSemaphoreTake(mux_mtx, portMAX_DELAY);
             mux_select_channel(ch);
             vTaskDelay(pdMS_TO_TICKS(5));
-            int mv_vin  = mux_read_sig1_avg_mv(4);   // V_IN (делитель)
-            int mv_imon = mux_read_sig2_avg_mv(8);   // V_IMON (ток)
+            int mv_vin  = mux_read_sig1_avg_mv(4);   // V_IN
+            int mv_imon = mux_read_sig2_avg_mv(8);   // V_IMON
             if (mux_mtx) xSemaphoreGive(mux_mtx);
 
-            float v_in = (mv_vin >= 0) ? (mv_vin * MUX1_DIVIDER_RATIO / 1000.0f) : 0.0f;
-            if (v_in < 1.0f) v_in = 0.0f;   /* шумовой порог */
+            float v_in = (mv_vin >= 0)
+                         ? (mv_vin * MUX1_DIVIDER_RATIO / 1000.0f) : 0.0f;
+            if (v_in < 1.0f) v_in = 0.0f;
             local.v_in[ch] = v_in;
 
             int iload = 0;
@@ -99,17 +92,14 @@ static void mux_task(void *arg)
                 st = IMON_STATE_NO_DIAG;
                 local.imon_mv[ch] = 0;
             } else {
-                /* V_IN < UVLO — V_IMON невалиден (ключ выключен,
-                   питание просело). imon_classify вернёт
-                   UNKNOWN/NO_DIAG, но SHORT_GND ловится в
-                   classify_channel по V_IN < vin_on_min_v. */
                 st = imon_classify(mv_imon, g_config.traffic.fault.imin_mv);
                 local.imon_mv[ch] = (int16_t)(mv_imon > 32767 ? 32767 : mv_imon);
                 if (st == IMON_STATE_OK) {
                     int offset = mux_get_imon_offset_mv(ch);
                     int corr = mv_imon - offset;
                     if (corr < 0) corr = 0;
-                    iload = (int)(((float)corr * TPS27S100B_K_IMON) / TPS27S100B_R_IMON);
+                    iload = (int)(((float)corr * TPS27S100B_K_IMON) /
+                                  TPS27S100B_R_IMON);
                 }
             }
             local.i_load[ch]     = iload;
@@ -121,15 +111,21 @@ static void mux_task(void *arg)
         local.timestamp = xTaskGetTickCount() * portTICK_PERIOD_MS;
         local.valid = true;
         mux_data_set(&local);
+
+        /* === FIX FAULT-CHECK-EVERY-CYCLE ===
+           Проверяем аварии сразу после mux_data_set. Логика
+           внутри: SHORT_GND/VIN_ON_OFF ловятся даже в grace
+           period; SUSPECT/OVERLOAD — только после grace.
+           check_faults вызывается независимо от того,
+           изменились ли данные — важно поймать переход. */
         traffic_light_check_faults(&local);
+        /* === END FIX FAULT-CHECK-EVERY-CYCLE === */
+
         vTaskDelay(pdMS_TO_TICKS(MUX_TASK_PERIOD_MS));
     }
 }
 
-/* === FIX CHANNEL-PERIODIC-LOG ===
-   Отдельная задача — печатает таблицу текущих показаний раз в
-   5 с. mux_task не блокируется. При YELLOW_BLINK — пропускаем,
-   чтобы не смешивать с fault-логом. */
+/* === FIX CHANNEL-PERIODIC-LOG === */
 static void ch_log_task(void *arg)
 {
     vTaskDelay(pdMS_TO_TICKS(CHANNEL_LOG_PERIOD_MS));

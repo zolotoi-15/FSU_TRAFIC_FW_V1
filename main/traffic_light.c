@@ -196,7 +196,9 @@ static void root_apply_stage_sync_first(uint8_t seq_idx, uint32_t dur_ms)
     /* 1. Отправляем c: на NODE (pm=0, force=true) */
     send_sync_to_node_async_ex(seq_idx, 0, dur_ms, true, NULL);
 
-    /* 2. Ждём, пока NODE примет c: и включит каналы. */
+    /* 2. Ждём lead_ms (runtime). При lead=0 vTaskDelay(0) не
+       блокирует — apply_stage_dd выполнится сразу, без
+       синхронизма с NODE (пользователь сам выбрал). */
     uint32_t lead = sync_config_get_lead_ms();
     vTaskDelay(pdMS_TO_TICKS(lead));
 

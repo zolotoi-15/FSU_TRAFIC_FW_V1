@@ -3,15 +3,15 @@
    check_faults, set_fault, build_fault_report.
 
    === FIX CHANNEL-FAULT-CLASSIFY ===
-       Новая классификация V_IN/V_IMON/SR по каналу:
-         1. SHORT_GND: SR=1, V_IN=0, I=0 — короткое замыкание
-            (ключ закрыт по току / питание просело).
-         2. VIN_ON_OFF: SR=0, V_IN≥vin_off_min_v — напряжение на
-            выключенном канале (замыкание между выходами).
-         3. NO_DIAG: V_IN≥5, DIAG_EN не пришёл.
+       Классификация V_IN/V_IMON/SR по каналу:
+         1. SHORT_GND: SR=1, V_IN < vin_on_min_v — короткое
+            замыкание (ключ закрыт по току / питание просело).
+         2. VIN_ON_OFF: SR=0, V_IN ≥ vin_off_min_v — напряжение
+            на выключенном канале (замыкание между выходами).
+         3. NO_DIAG: V_IN ≥ 5, DIAG_EN не пришёл.
          4. FAULT: V_IMON ≥ 4.2 В — overload / thermal / short.
          5. SUSPECT (OVERLOAD): V_IMON 3.0..4.2 В.
-         6. NO_LOAD: SR=1, V_IN≥5, V_IMON < imin_mv — обрыв.
+         6. NO_LOAD: SR=1, V_IN ≥ 5, V_IMON < imin_mv — обрыв.
          7. OVERLOAD / UNDERLOAD по i_load.
 
    === FIX YELLOW-FAULT-ALL-OFF ===
@@ -27,12 +27,17 @@
    === FIX MQTT-EVENTS ===
        Каждое появление / снятие аварии по каналу, каждое
        переключение в YELLOW_BLINK / ALL_OFF, каждое
-       восстановление → wifi_mqtt_publish_event() (топик
-       <base>/Events с UTC ISO8601).
+       восстановление → wifi_mqtt_publish_event().
 
    === FIX CHANNEL-FAULT-LOG ===
-       Логируем ПЕРЕХОДЫ состояния по каналу (появление, смена
-       типа, снятие) с явным текстом.
+       Логируем ПЕРЕХОДЫ состояния по каналу.
+
+   === FIX PHYSICAL-FAULT-IGNORE-GRACE (новое) ===
+       SHORT_GND (SR=1, V_IN < vin_on_min_v) и VIN_ON_OFF
+       (SR=0, V_IN ≥ vin_off_min_v) — физические аварии.
+       Ловим ВСЕГДА, даже в grace period после смены фазы.
+       Остальные (SUSPECT, OVERLOAD, NO_LOAD, DIAG) — только
+       после grace, чтобы не ловить переходные процессы.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -118,9 +123,7 @@ void apply_fault_mode(traffic_fault_t fault)
         s_fault_yellow_mask = s_fault_yellow_mask_from_root;
         ESP_LOGE(TAG, "FAULT → YELLOW_BLINK (mask=0x%04X from ROOT)",
                  s_fault_yellow_mask);
-        /* === FIX MQTT-EVENTS === */
         wifi_mqtt_publish_event("fault_mode", "yellow_blink:from_root", NULL, 0);
-        /* === END FIX MQTT-EVENTS === */
         return;
     }
 
@@ -142,9 +145,7 @@ void apply_fault_mode(traffic_fault_t fault)
     }
     ESP_LOGE(TAG, "FAULT → YELLOW_BLINK (mask=0x%04X by s_mode)",
              s_fault_yellow_mask);
-    /* === FIX MQTT-EVENTS === */
     wifi_mqtt_publish_event("fault_mode", "yellow_blink", NULL, 0);
-    /* === END FIX MQTT-EVENTS === */
 }
 
 void fault_blink_yellow(bool on)
@@ -268,17 +269,13 @@ void try_recovery(uint32_t now_ms, uint32_t *blink_last)
         } else {
             ESP_LOGW(TAG, "recovery: NODE ok → request ROOT");
         }
-        /* === FIX MQTT-EVENTS === */
         wifi_mqtt_publish_event("recover", "node:request_root_confirm", NULL, 0);
-        /* === END FIX MQTT-EVENTS === */
         return;
     }
 
     if (fire) {
         apply_stage_dd(s_phase);
-        /* === FIX MQTT-EVENTS === */
         wifi_mqtt_publish_event("recover", "auto:recovery_ok", NULL, 0);
-        /* === END FIX MQTT-EVENTS === */
     }
     if (fire && s_fault_notify) s_fault_notify(TRAFFIC_FAULT_NONE);
 }
@@ -311,7 +308,7 @@ void fill_reason_text(traffic_fault_info_t *fi, const char *detail, uint8_t pair
 }
 
 /* ============================================================
-   classify_channel
+   classify_channel — полная классификация канала.
    === FIX CHANNEL-FAULT-CLASSIFY ===
    ============================================================ */
 uint8_t classify_channel(uint8_t ch, bool should_be_on,
@@ -330,10 +327,8 @@ uint8_t classify_channel(uint8_t ch, bool should_be_on,
        V_IMON при этом может быть ЛЮБЫМ (fault-зона, остаточное,
        паразитная связь) — не смотрим на него.
 
-       Раньше условие было `V_IN < 5 && V_IMON < 10` — при
-       V_IMON=3152 (fault-зона) оно НЕ срабатывало, и канал
-       уходил в SUSPECT → OVERLOAD (неверно: это КЗ, а не
-       перегрузка). */
+       Приоритет над всем: даже если V_IMON в SUSPECT-зоне
+       (3000..4200 мВ) — это SHORT_GND, а не OVERLOAD. */
     if (sr_on && v_in < g_config.traffic.fault.vin_on_min_v) {
         *out_detail = "short to GND (SR=1, V_IN low)";
         return TRAFFIC_REASON_SHORT_GND;
@@ -359,8 +354,7 @@ uint8_t classify_channel(uint8_t ch, bool should_be_on,
         *out_detail = "short to GND / thermal";
         return TRAFFIC_REASON_SHORT_GND;
     }
-    /* SUSPECT = перегрузка (V_IMON 3.0..4.2 В) — но при
-       V_IN≥5 В, иначе SHORT_GND уже сработал выше */
+    /* SUSPECT = перегрузка (V_IMON 3.0..4.2 В) */
     if (data->imon_state[ch] == IMON_STATE_SUSPECT) {
         *out_detail = "overload (V_IMON high)";
         return TRAFFIC_REASON_OVERLOAD;
@@ -389,6 +383,11 @@ uint8_t classify_channel(uint8_t ch, bool should_be_on,
    === FIX YELLOW-FAULT-ALL-OFF ===
    === FIX CHANNEL-FAULT-LOG ===
    === FIX MQTT-EVENTS ===
+   === FIX PHYSICAL-FAULT-IGNORE-GRACE ===
+       SHORT_GND (SR=1, V_IN < vin_on_min_v) и VIN_ON_OFF
+       (SR=0, V_IN ≥ vin_off_min_v) — физические аварии.
+       Ловим ВСЕГДА, даже в grace period. Остальные — только
+       после grace.
    ============================================================ */
 void traffic_light_check_faults(const mux_data_t *data)
 {
@@ -414,8 +413,8 @@ void traffic_light_check_faults(const mux_data_t *data)
     }
 
     uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-
-    if (now_ms - s_phase_start_ms < g_config.traffic.fault.phase_grace_ms) return;
+    bool in_grace = (now_ms - s_phase_start_ms <
+                     g_config.traffic.fault.phase_grace_ms);
 
     uint16_t blink    = s_blink_mask;
 
@@ -424,20 +423,24 @@ void traffic_light_check_faults(const mux_data_t *data)
     bool force_all_off = false;
 
     for (uint8_t ch = 0; ch < 16; ch++) {
-        /* Для VIN_ON_OFF (SR=0) канал может НЕ быть в active —
-           проверяем все 16, если в конфиге active. */
         bool ch_active = true;
         if (ch < g_config.sr.count) ch_active = g_config.sr.outputs[ch].active;
         if (!ch_active) continue;
 
+        bool sr_on = (data->sr_state[ch] != 0);
+        float v_in = data->v_in[ch];
+
         bool is_active_mask = (active & (1u << ch)) != 0;
         bool is_blink = (blink & (1u << ch)) != 0;
+
         if (!is_active_mask && !is_blink) {
-            /* Канал не в текущей фазе, но может быть VIN_ON_OFF */
+            /* Канал не в текущей фазе. Проверяем только VIN_ON_OFF —
+               напряжение на выключенном канале. */
             const char *detail = NULL;
             uint8_t r = classify_channel(ch, false, data, &detail);
             if (r == TRAFFIC_REASON_VIN_ON_OFF) {
-                if (++s_vin_off_counter[ch] >= g_config.traffic.fault.vin_off_confirmations) {
+                if (++s_vin_off_counter[ch] >=
+                    g_config.traffic.fault.vin_off_confirmations) {
                     force_all_off = true;
                     if (n_faults < TRAFFIC_FAULT_MAX) {
                         traffic_fault_info_t *fi = &list[n_faults];
@@ -461,11 +464,27 @@ void traffic_light_check_faults(const mux_data_t *data)
 
         bool should_be_on = (expected & (1u << ch)) != 0;
 
+        /* === FIX PHYSICAL-FAULT-IGNORE-GRACE ===
+           SHORT_GND и VIN_ON_OFF — физические аварии, ловим
+           ВСЕГДА, даже в grace period. Остальные (SUSPECT,
+           OVERLOAD, NO_LOAD, DIAG) — только после grace. */
         const char *detail = NULL;
-        uint8_t reason = classify_channel(ch, should_be_on, data, &detail);
+        uint8_t reason = TRAFFIC_REASON_NONE;
+
+        if (sr_on && v_in < g_config.traffic.fault.vin_on_min_v) {
+            reason = TRAFFIC_REASON_SHORT_GND;
+            detail = "short to GND (SR=1, V_IN low)";
+        } else if (!sr_on && v_in >= g_config.traffic.fault.vin_off_min_v) {
+            reason = TRAFFIC_REASON_VIN_ON_OFF;
+            detail = "V_IN present while OFF";
+        } else if (!in_grace && should_be_on) {
+            reason = classify_channel(ch, should_be_on, data, &detail);
+        }
+        /* === END FIX PHYSICAL-FAULT-IGNORE-GRACE === */
 
         if (!should_be_on && reason == TRAFFIC_REASON_VIN_ON_OFF) {
-            if (++s_vin_off_counter[ch] >= g_config.traffic.fault.vin_off_confirmations) {
+            if (++s_vin_off_counter[ch] >=
+                g_config.traffic.fault.vin_off_confirmations) {
                 force_all_off = true;
             } else {
                 reason = TRAFFIC_REASON_NONE;
@@ -525,16 +544,12 @@ void traffic_light_check_faults(const mux_data_t *data)
             if (cur == 0) {
                 ESP_LOGW(TAG, "ch%02d: FAULT CLEARED (was %s)",
                          ch, reason_str(prev));
-                /* === FIX MQTT-EVENTS === */
                 wifi_mqtt_publish_event("fault_clear", reason_str(prev), NULL, 0);
-                /* === END FIX MQTT-EVENTS === */
             } else {
                 ESP_LOGE(TAG, "ch%02d: FAULT %s [%s]", ch,
                          reason_ru(cur),
                          now_detail[ch] ? now_detail[ch] : reason_str(cur));
-                /* === FIX MQTT-EVENTS === */
                 wifi_mqtt_publish_event("fault", reason_ru(cur), NULL, 0);
-                /* === END FIX MQTT-EVENTS === */
             }
             s_last_channel_fault[ch] = cur;
             s_last_channel_log_ms[ch] = now_ms;
@@ -545,8 +560,7 @@ void traffic_light_check_faults(const mux_data_t *data)
     if (n_faults == 0) return;
 
     /* === FIX YELLOW-FAULT-ALL-OFF ===
-       Если авария на канале, который сейчас ЖЁЛТЫЙ (или должен
-       быть жёлтым в fault-режиме) — ALL_OFF на обоих. */
+       Если авария на канале, который сейчас ЖЁЛТЫЙ — ALL_OFF. */
     bool fault_on_yellow = false;
     {
         uint16_t yellow_mask = 0;

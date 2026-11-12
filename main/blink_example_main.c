@@ -60,6 +60,8 @@
 #include "sync_handshake.h"     /* === FIX SYNC-HANDSHAKE === */
 #include "app_shared.h"
 #include "ble_transport.h"
+#include "sync_config.h"
+
 
 extern const uint8_t config_json_start[] asm("_binary_config_json_start");
 extern const uint8_t config_json_end[]   asm("_binary_config_json_end");
@@ -493,6 +495,13 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_ret);
 
+/* === FIX LEAD-MS-NVS ===
+       Загружаем lead_ms из NVS до traffic_light_init(). Если
+       в NVS пусто — sync_config_init() оставит SYNC_LEAD_MS_DEFAULT
+       (150 мс). */
+    sync_config_init();
+    /* === END FIX LEAD-MS-NVS === */
+    
     log_heap("app_main start");
 
     bool pending_applied = run_cfg_load();
@@ -522,12 +531,7 @@ void app_main(void)
 
     buttons_start_tasks();
 
-    connectivity_register_rs485_can();
-
-    transport_init();
-    node_proto_register_callbacks();
-
-    /* === FIX BLE-TRANSPORT === */
+/* === FIX BLE-TRANSPORT === */
     esp_err_t ble_err = fsu_ble_init();
     if (ble_err != ESP_OK) {
         ESP_LOGW(TAG, "fsu_ble_init: %s", esp_err_to_name(ble_err));
@@ -535,6 +539,13 @@ void app_main(void)
         ESP_LOGI(TAG, "BLE transport initialized");
     }
     /* === END FIX BLE-TRANSPORT === */
+
+    connectivity_register_rs485_can();
+
+    transport_init();
+    node_proto_register_callbacks();
+
+    
 
     /* === FIX SYNC-DELAY-ZERO === */
     blink_reset_rtt();
