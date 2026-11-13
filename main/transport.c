@@ -70,7 +70,7 @@ static const char *TAG = "transport";
 #define FRAG_HDR_SIZE     3
 #define FRAG_DATA_MAX     (PKT_MAX - 4 - FRAG_HDR_SIZE)   /* 41 */
 
-#define FRAG_GAP_MS       200
+#define FRAG_GAP_MS       300
 #define FRAG_GAP_STATUS_EXTRA_MS  150
 
 #define TX_IDLE_GUARD_MS  50
