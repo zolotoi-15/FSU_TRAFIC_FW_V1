@@ -16,6 +16,16 @@
        цикл (раз в MUX_TASK_PERIOD_MS), даже если данные не
        изменились. Иначе переход SHORT_GND → восстановление
        между двумя циклами мог быть не замечен.
+
+   === FIX RT-CHANNELS ===
+       На NODE при наличии pending-маски (node_mask_pending())
+       ПРОПУСКАЕМ traffic_light_check_faults. Иначе за ~150 мс
+       до применения новой маски SR ещё в старой, а
+       s_expected_mask_from_root уже новая → check_faults увидит
+       «канал должен быть ON, а SR=0» → ложный SHORT_GND.
+
+       Меряем каналы всё равно (данные нужны для T_CHANNELS),
+       но fault-check не вызываем.
    ============================================================ */
 
 #include "mux_task.h"
@@ -25,6 +35,7 @@
 #include "shift_register.h"
 #include "traffic_light.h"
 #include "config_manager.h"
+#include "node_proto.h"        /* === FIX RT-CHANNELS: node_mask_pending() === */
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
@@ -117,9 +128,22 @@ static void mux_task(void *arg)
            внутри: SHORT_GND/VIN_ON_OFF ловятся даже в grace
            period; SUSPECT/OVERLOAD — только после grace.
            check_faults вызывается независимо от того,
-           изменились ли данные — важно поймать переход. */
-        traffic_light_check_faults(&local);
-        /* === END FIX FAULT-CHECK-EVERY-CYCLE === */
+           изменились ли данные — важно поймать переход.
+
+           === FIX RT-CHANNELS ===
+           Но на NODE, если есть pending-маска (c: уже пришёл,
+           но apply_utc_ms ещё не наступил), ПРОПУСКАЕМ проверку:
+           SR ещё в старой маске, s_expected_mask_from_root уже
+           новая → check_faults сгенерирует ложный SHORT_GND.
+           После применения маски (scheduler) node_mask_pending()
+           станет false — check_faults снова работает. */
+        if (g_config.role == DEVICE_ROLE_SLAVE && node_mask_pending()) {
+            ESP_LOGD(TAG, "mux_task: RT-mask pending → skip check_faults "
+                          "(SR in old mask, expected already new)");
+        } else {
+            traffic_light_check_faults(&local);
+        }
+        /* === END FIX RT-CHANNELS === */
 
         vTaskDelay(pdMS_TO_TICKS(MUX_TASK_PERIOD_MS));
     }
@@ -156,6 +180,6 @@ static void ch_log_task(void *arg)
 
 void mux_app_task_start(void)
 {
-    xTaskCreate(mux_task,   "mux_task", 8192, NULL, 5, NULL);
-    xTaskCreate(ch_log_task, "ch_log",  3072, NULL, 3, NULL);
+    xTaskCreate(mux_task,    "mux_task", 8192, NULL, 5, NULL);
+    xTaskCreate(ch_log_task, "ch_log",   3072, NULL, 3, NULL);
 }

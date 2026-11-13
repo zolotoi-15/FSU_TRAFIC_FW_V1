@@ -34,14 +34,32 @@ uint32_t send_channels_to_node(uint8_t phase, uint32_t phase_ms,
                                uint32_t duration_ms, bool force);
 /* === END FIX PED-DISPLAY === */
 
-/* === FIX PED-DISPLAY-CLEAR-BEFORE-RETURN-HOLD ===
-   Принудительный c: без display (ch11). Вызывается из
-   traffic_light.c в ветке return_to_hold после сброса
-   s_insert_pending, чтобы NODE получил маску без ch11 и не
-   ушёл в ALL_OFF. */
+/* === FIX PED-DISPLAY-CLEAR-BEFORE-RETURN-HOLD === */
 uint32_t send_channels_to_node_no_display(uint8_t phase, uint32_t phase_ms,
                                           uint32_t duration_ms, bool force);
 /* === END FIX PED-DISPLAY-CLEAR-BEFORE-RETURN-HOLD === */
+
+/* === FIX RT-CHANNELS ===
+   UTC-тайминг: c: содержит apply_utc_ms — момент, когда и ROOT, и
+   NODE должны переключить каналы. ToA/джиттер LoRa не влияют на
+   синхронность — оба смотрят на UTC.
+
+   apply_utc_ms == 0 → fallback на старое поведение (сразу по
+   приходу c:, + lead_ms на ROOT). Используется, когда время ещё
+   не синхронизировано (нет SNTP/RTC/DS1307). */
+uint32_t send_sync_to_node_async_utc(uint8_t phase, uint32_t phase_ms,
+                                     uint32_t duration_ms,
+                                     uint64_t apply_utc_ms,
+                                     bool force, uint8_t *out_next_phase);
+
+uint32_t send_channels_to_node_utc(uint8_t phase, uint32_t phase_ms,
+                                   uint32_t duration_ms,
+                                   uint64_t apply_utc_ms, bool force);
+
+/* Хелпер: вычислить ближайший apply_utc_ms = now + lead, кратный 10 мс.
+   Возвращает 0, если UTC ещё не валиден. */
+uint64_t root_compute_apply_utc_ms(void);
+/* === END FIX RT-CHANNELS === */
 
 extern volatile bool     s_cfg_ack;
 extern volatile bool     s_cfg_pushing;

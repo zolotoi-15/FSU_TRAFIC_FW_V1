@@ -1,31 +1,29 @@
 /* ============================================================
    traffic_light.c — основной цикл traffic_task + force_phase.
 
-   === FIX FAULT-HAS-TOP-PRIORITY ===
-   Авария — наивысший приоритет. Все функции управления
-   каналами (start/stop/reset/force_phase/apply_mask/
-   manual_override/night_mode/priority_*) проверяют
-   fault_active() и НЕ трогают каналы, пока s_fault != NONE.
+   === FIX RT-CHANNELS ===
+   root_apply_stage_sync_first теперь:
+     1. вычисляет apply_utc_ms = root_compute_apply_utc_ms();
+     2. шлёт c: с apply_utc_ms (новый 7-й параметр);
+     3. ЖДЁТ до apply_utc_ms (а не фиксированные lead_ms);
+     4. применяет маску локально в этот же момент UTC.
 
-   === FIX ALL-OFF-STANDBY-NOT-FAULT ===
-   mqtt_apply_config_runtime для ROOT больше НЕ ставит
-   TRAFFIC_FAULT_ALL_OFF. ROOT просто в STOPPED + set_all_off().
-   Это позволяет send_channels_to_node_impl отправить
-   первичный c:0:...:red ДО первого трафика (иначе
-   fault_has_priority блокирует и NODE никогда не выйдет из
-   standby).
+   NODE в node_proto.c делает то же самое (node_mask_scheduler_task).
+   Результат: каналы на ROOT и NODE переключаются ОДНОВРЕМЕННО
+   (в пределах ±5 мс джиттера планировщика), ToA LoRa не влияет.
 
-   === FIX HOLD-PHASE ===
-   Добавлена hold-ветка в traffic_task_loop. Если текущая фаза
-   — hold-фаза (например, зелёный транспортный) и нет активного
-   ped-запроса/insert, контроллер НЕ переходит на следующую
-   фазу. Держится до:
-     - нажатия кнопки (s_ped_request || s_insert_pending),
-     - истечения hold.max_hold_ms (если >0).
-   Возврат из insert в hold (return_to_hold) — через
-   root_apply_stage_sync_first(hold_seq, ...), после чего
-   следующая итерация цикла снова увидит stage_is_hold()==true
-   и останется в зелёном.
+   Если UTC недоступен — fallback на старое поведение (lead_ms).
+
+   === FIX RT-CHANNELS-API ===
+   root_apply_stage_sync_first сделан НЕ static (объявлен в
+   traffic_internal.h). Это позволяет mqtt_cmd.c и
+   sync_handshake.c вызывать его напрямую для первого запуска
+   (start_with_red → c:0:red) с UTC-таймингом. Раньше они
+   использовали force_phase(0, ...), что тоже работало, но
+   лишний раз проходило через force_phase → apply_stage_dd →
+   phase_change_cancel_pending. Прямой вызов чище.
+
+   Все остальные FIX сохранены.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -126,6 +124,18 @@ static uint16_t s_prev_on_mask    = 0;
 
 static volatile traffic_fault_t s_last_pushed_fault = TRAFFIC_FAULT_NONE;
 
+/* === FIX RT-CHANNELS-API ===
+   root_apply_stage_sync_first не static — объявлен в
+   traffic_internal.h. Вызывается из:
+     - traffic_task_loop
+     - traffic_light_next_phase
+     - traffic_light_force_phase
+     - traffic_light_manual_override
+     - mqtt_cmd.c → root_start_traffic_rt (при старте из ALL_OFF
+       и config:reload с auto_start)
+     - sync_handshake.c → root_start_rt (PROBE/ALIGNED timeout)
+   === END FIX RT-CHANNELS-API === */
+
 /* === FIX FAULT-HAS-TOP-PRIORITY === */
 bool traffic_light_fault_has_priority(void)
 {
@@ -163,9 +173,7 @@ void traffic_light_set_follow_root(bool en)
 
 void traffic_light_ped_display_set(bool on)
 {
-    /* === FIX FAULT-HAS-TOP-PRIORITY === */
     if (fault_active()) return;
-    /* === END FIX === */
     uint8_t ch = g_config.traffic.pins.cross_ped.ped_display;
     if (ch >= 16) return;
     if (on) sr_output_on(ch);
@@ -210,9 +218,9 @@ void root_push_fault_to_node(traffic_fault_t fault)
         uint64_t utc = time_sync_get_utc_ms();
         uint32_t dur = 1000;
         uint64_t end = utc ? utc + dur : 0;
-        char cbuf[80];
+        char cbuf[112];
         int cn = snprintf(cbuf, sizeof(cbuf),
-                          "c:0:0:0000:0000:%lu:%llu",
+                          "c:0:0:0000:0000:%lu:%llu:0",
                           (unsigned long)dur,
                           (unsigned long long)end);
         if (cn > 0) transport_send_cmd_noack(cbuf, cn);
@@ -241,10 +249,19 @@ void root_push_fault_to_node(traffic_fault_t fault)
 
 /* ============================================================
    root_apply_stage_sync_first
-   === FIX FAULT-HAS-TOP-PRIORITY ===
-   При активной аварии НЕ трогаем каналы и НЕ шлём c:.
+   === FIX RT-CHANNELS ===
+   ROOT вычисляет apply_utc_ms, шлёт c: с этим моментом, ЖДЁТ
+   до него и применяет маску локально в ту же UTC-мс. NODE
+   (в node_proto.c → node_mask_scheduler_task) делает то же —
+   каналы переключаются одновременно.
+
+   Если UTC не валиден — fallback на lead_ms (старое поведение).
+
+   === FIX RT-CHANNELS-API ===
+   Не static. Вызывается из mqtt_cmd.c и sync_handshake.c для
+   первого запуска (см. root_start_traffic_rt / root_start_rt).
    ============================================================ */
-static void root_apply_stage_sync_first(uint8_t seq_idx, uint32_t dur_ms)
+void root_apply_stage_sync_first(uint8_t seq_idx, uint32_t dur_ms)
 {
     if (fault_active()) {
         ESP_LOGW(TAG, "root_apply_stage_sync_first(%u): fault active (%s), "
@@ -261,12 +278,32 @@ static void root_apply_stage_sync_first(uint8_t seq_idx, uint32_t dur_ms)
         dur_ms = effective_stage_duration_ms(seq_idx);
     }
 
-    send_sync_to_node_async_ex(seq_idx, 0, dur_ms, true, NULL);
-    uint32_t lead = sync_config_get_lead_ms();
-    vTaskDelay(pdMS_TO_TICKS(lead));
-    apply_stage_dd(seq_idx);
+    uint64_t apply_utc_ms = root_compute_apply_utc_ms();
+    if (apply_utc_ms != 0) {
+        /* === FIX RT-CHANNELS: UTC-тайминг === */
+        send_sync_to_node_async_utc(seq_idx, 0, dur_ms,
+                                    apply_utc_ms, true, NULL);
+
+        uint64_t now_utc = time_sync_get_utc_ms();
+        if (now_utc != 0 && now_utc < apply_utc_ms) {
+            uint32_t wait_ms = (uint32_t)(apply_utc_ms - now_utc);
+            if (wait_ms > 0 && wait_ms < 2000) {
+                vTaskDelay(pdMS_TO_TICKS(wait_ms));
+            }
+        }
+        apply_stage_dd(seq_idx);
+        /* === END FIX RT-CHANNELS === */
+    } else {
+        /* fallback: время не синхронизировано */
+        ESP_LOGW(TAG, "root_apply_stage_sync_first: UTC unavailable → "
+                      "fallback to lead_ms");
+        send_sync_to_node_async_ex(seq_idx, 0, dur_ms, true, NULL);
+        uint32_t lead = sync_config_get_lead_ms();
+        vTaskDelay(pdMS_TO_TICKS(lead));
+        apply_stage_dd(seq_idx);
+    }
 }
-/* === END FIX FAULT-HAS-TOP-PRIORITY === */
+/* === END FIX RT-CHANNELS-API === */
 
 /* ============================================================
    traffic_light_request_pedestrian_ex
@@ -408,27 +445,10 @@ static uint32_t insert_duration_ms(uint8_t seq_idx)
 
 /* ============================================================
    traffic_task_loop
-   === FIX FAULT-HAS-TOP-PRIORITY ===
-   === FIX ALL-OFF-STANDBY-NOT-FAULT ===
-   В standby (STOPPED + no fault) НЕ выполняем автоматику: смена
-   фаз, insert, hold, ALL_RED. Но и НЕ блокируем цикл полностью —
-   просто `continue` в конце проверки, как только увидели, что
-   state != RUNNING.
-
-   === FIX HOLD-PHASE ===
-   Если текущая фаза — hold-фаза (например, зелёный транспортный)
-   и нет активного ped-запроса/insert:
-     - max_hold_ms == 0 → держим бесконечно (continue);
-     - max_hold_ms > 0  → держим до истечения, потом обычная
-       смена фазы.
-   Нажатие кнопки (s_ped_request/s_insert_pending) снимает hold —
-   дальше идёт insert-логика. После return_to_hold
-   root_apply_stage_sync_first(hold_seq) снова ставит hold-фазу,
-   и следующая итерация цикла снова уходит в hold (continue).
    ============================================================ */
 void traffic_task_loop(void *arg)
 {
-    ESP_LOGI(TAG, "Traffic task started (step=20ms, follow_root=%d)",
+    ESP_LOGI(TAG, "Traffic task started (step=20ms, follow_root=%d, RT=UTC)",
              s_follow_root);
 
     uint8_t  last_min_green_phase  = 0xFF;
@@ -443,7 +463,6 @@ void traffic_task_loop(void *arg)
 
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        /* === FIX BLINK-VIA-MASK-FIRST === */
         if (s_fault == TRAFFIC_FAULT_NONE &&
             s_state == TRAFFIC_STATE_RUNNING &&
             s_blink_mask != 0) {
@@ -457,7 +476,6 @@ void traffic_task_loop(void *arg)
             }
         }
 
-        /* === FIX FAULT-BLINK-ALWAYS-FIRST === */
         if (s_fault == TRAFFIC_FAULT_YELLOW_BLINK) {
             uint32_t per = fault_blink_period_ms();
             if (s_fault_blink_last_ms == 0 ||
@@ -468,8 +486,6 @@ void traffic_task_loop(void *arg)
             }
         }
 
-        /* === FIX FAULT-HAS-TOP-PRIORITY ===
-           try_recovery только для YELLOW_BLINK, не для ALL_OFF. */
         if (fault_active()) {
             if (s_fault == TRAFFIC_FAULT_YELLOW_BLINK &&
                 !s_fault_blink_state &&
@@ -479,9 +495,7 @@ void traffic_task_loop(void *arg)
             }
             continue;
         }
-        /* === END FIX FAULT-HAS-TOP-PRIORITY === */
 
-        /* PED-DISPLAY (ROOT only) */
         if (g_config.role == DEVICE_ROLE_MASTER && !s_follow_root &&
             s_state == TRAFFIC_STATE_RUNNING) {
             uint8_t disp_ch = g_config.traffic.pins.cross_ped.ped_display;
@@ -597,7 +611,6 @@ void traffic_task_loop(void *arg)
             }
         }
 
-        /* INSERT block */
         if (s_insert_pending) {
             if (s_insert_idx == 0) {
                 uint32_t age = now - s_insert_request_ms;
@@ -852,12 +865,6 @@ void traffic_task_loop(void *arg)
             continue;
         }
 
-        /* === FIX HOLD-PHASE ===
-           Держим hold-фазу, пока не нажата кнопка и не истёк
-           max_hold_ms. Работает только для RUNNING + no fault.
-           s_ped_request / s_insert_pending снимают hold — тогда
-           управление уйдёт в INSERT block выше (insert_pending)
-           или в обычную смену фаз (ped_request, mode=STAGE). */
         if (s_state == TRAFFIC_STATE_RUNNING &&
             s_fault == TRAFFIC_FAULT_NONE &&
             !s_ped_request && !s_insert_pending &&
@@ -871,15 +878,12 @@ void traffic_task_loop(void *arg)
                          (unsigned long)g_config.traffic.hold.max_hold_ms,
                          s_phase);
                 s_hold_active = false;
-                /* падаем в обычную смену фазы ниже */
             } else {
-                /* остаёмся в hold-фазе */
                 continue;
             }
         } else {
             s_hold_active = false;
         }
-        /* === END FIX HOLD-PHASE === */
 
         bool need_fault = false;
         {
@@ -1037,15 +1041,14 @@ esp_err_t traffic_light_init(void)
     xTaskCreate(traffic_task_loop, "traffic_task", 8192, NULL, 4, &s_task);
     ESP_LOGI(TAG, "Traffic initialized (DD, stages=%u seq=%u ped_button=%d, "
                   "follow_root=%d, hold=%d/%u, insert_seq=%u, safe_exit=%u, "
-                  "conflicts=%u, ped_display=%u, sync_lead_ms=%lu)",
+                  "conflicts=%u, ped_display=%u, RT=UTC)",
              g_config.traffic.stage_count, g_config.traffic.sequence_count,
              g_config.traffic.pedestrian.button_enabled, s_follow_root,
              g_config.traffic.hold.enabled, g_config.traffic.hold.stage_count,
              g_config.traffic.pedestrian.insert_count,
              g_config.traffic.pedestrian.safe_exit_count,
              g_config.traffic.conflict_count,
-             g_config.traffic.pins.cross_ped.ped_display,
-             (unsigned long)sync_config_get_lead_ms());
+             g_config.traffic.pins.cross_ped.ped_display);
     return ESP_OK;
 }
 
@@ -1132,9 +1135,6 @@ esp_err_t traffic_light_set_mode(traffic_mode_t mode)
 
 /* ============================================================
    start / stop / pause / resume / reset / next / force_phase
-   === FIX ALL-OFF-STANDBY-NOT-FAULT ===
-   traffic_light_start() больше НЕ ставит s_fault = ALL_OFF —
-   s_fault только про аварию. В standby s_fault == NONE.
    ============================================================ */
 esp_err_t traffic_light_start(void)
 {
@@ -1505,10 +1505,6 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
 
 /* ============================================================
    traffic_light_apply_mask (NODE из c:)
-   === FIX FAULT-HAS-TOP-PRIORITY ===
-   === FIX ALL-OFF-STANDBY-NOT-FAULT ===
-   При standby (STOPPED + no fault) разрешаем c: — это «первичный
-   старт» от ROOT. Но всё ещё не разрешаем при YELLOW_BLINK.
    ============================================================ */
 void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
                               uint8_t phase, uint32_t phase_ms,
@@ -1627,7 +1623,6 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
              phase, (unsigned long)phase_ms, (unsigned long)duration_ms,
              (unsigned)on_mask, (unsigned)blink_mask);
 }
-/* === END FIX ALL-OFF-STANDBY-NOT-FAULT === */
 
 esp_err_t traffic_light_force_phase_masked(uint8_t phase,
                                            uint32_t phase_ms,

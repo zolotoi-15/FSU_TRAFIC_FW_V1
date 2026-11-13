@@ -1,57 +1,28 @@
 /* ============================================================
    root_wd.c — ROOT: phase-sync + heartbeat + node_watchdog.
 
-   === FIX ROOT-WAIT-NODE-ACK ===
-       ROOT после обнаружения NODE НЕ вызывает
-       traffic_light_start_with_red() сразу. Отправляет
-       traffic:start + c:0:...:red, ждёт STATUS с RUNNING
-       (WAIT_NODE_ACK_TIMEOUT_MS=3000), затем локально start.
+   === FIX RT-CHANNELS ===
+   Реальное время: c: содержит apply_utc_ms — момент UTC, когда
+   ROOT и NODE ОДНОВРЕМЕННО переключают каналы.
 
-   === FIX WAIT-TIME-SYNC-TIMEOUT ===
-       Не ждём time_sync вечно. SNTP может быть недоступен
-       за APN. Через WAIT_TIME_SYNC_MAX_MS (10000 мс) стартуем
-       БЕЗ UTC — NODE получит c: с end_utc=0, будет работать
-       по локальному pm. Time дошлётся позже (когда/если SNTP
-       ответит) — phase_sync_task делает time_sync_root_push
-       раз в TIME_PUSH_PERIOD_MS, как только s_valid станет
-       true.
+   send_channels_to_node_impl_ex() принимает apply_utc_ms. Если
+   apply_utc_ms == 0 (время не синхронизировано) — старое
+   поведение: send + (ROOT откладывает apply_stage_dd на lead_ms).
 
-   === FIX FAULT-HAS-TOP-PRIORITY ===
-       phase_sync_task НЕ шлёт c: при активной аварии
-       (traffic_light_fault_has_priority() == true). NODE
-       в YELLOW_BLINK/ALL_OFF управляется fault:*.
+   root_apply_stage_sync_first() в traffic_light.c — UTC-тайминг
+   (compute → send → wait → apply).
 
-   === FIX NO-DOUBLE-C-ON-PHASE-CHANGE ===
-       phase_sync_task больше НЕ отправляет c: при смене
-       фазы. Первичный c: с pm=0 ушёл из
-       root_apply_stage_sync_first() в traffic_light.c.
+   phase_sync_task refresh c: (раз в LORA_SYNC_INTERVAL_MS) —
+   БЕЗ apply_utc_ms (apply_utc_ms=0), чтобы не сбивать текущую
+   фазу; refresh — это коррекция pm, а не смена.
 
-   === FIX PM-AT-SEND ===
-       pm вычисляется внутри send_channels_to_node_impl в
-       момент snprintf (hint=UINT32_MAX).
+   root_apply_new_config_from_mqtt: при auto_start больше НЕ
+   вызывает start_with_red() напрямую — использует
+   root_start_traffic_rt() (start_with_red + force_phase(0) с
+   UTC), чтобы первый запуск после /SetJson тоже был
+   синхронным на ROOT и NODE. См. mqtt_cmd.c.
 
-   === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
-       Перед traffic:start в ветке ROOT-WAIT-NODE-ACK
-       (восстановление связи: was_connected=false → true)
-       отправляем явный fault:none. NODE мог сам уйти в
-       ALL_OFF из-за потери ROOT (node_link_watchdog_task)
-       и блокирует traffic:start/c: через
-       traffic_light_fault_has_priority() без fault:none.
-
-   === FIX NO-FAULT-NONE-ON-RESEND ===
-       Убран fault:none из ветки повторного traffic:start
-       (!s_node_running). Раньше ROOT слал fault:none каждые
-       5 с, когда NODE не RUNNING. Это снимало YELLOW_BLINK
-       на NODE, если NODE в аварии (short to GND), а ROOT
-       ещё не успел применить её у себя: STATUS от NODE
-       приходит раз в 1 с (при fault) или 5 с (норма), а
-       traffic:start шлётся раз в 5 с — ROOT «сбрасывал»
-       аварию на NODE каждые 5 с.
-
-       fault:none оставлен ТОЛЬКО в ветке восстановления
-       связи (!was_connected) и в sync_handshake.c, где
-       NODE действительно мог уйти в standby по
-       s_root_lost_flag.
+   Остальные FIX сохранены.
    ============================================================ */
 
 #include "root_wd.h"
@@ -72,7 +43,6 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include "app_shared.h"
 
 static const char *TAG = "root_wd";
 
@@ -85,23 +55,21 @@ static const char *TAG = "root_wd";
 #define WAIT_NODE_ACK_TIMEOUT_MS   3000
 /* === END FIX ROOT-WAIT-NODE-ACK === */
 
-/* === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
-   Пауза между fault:none и traffic:start — чтобы LoRa успел
-   доставить первый пакет (ToA 10 байт ≈ 40-50 мс SF8/BW250).
-   transport_send_cmd_noack блокирующий (возвращается после
-   физической передачи), так что 80 мс — это запас поверх
-   уже доставленного пакета. */
+/* === FIX ROOT-RETURN-SENDS-FAULT-NONE === */
 #define FAULT_NONE_TO_START_GAP_MS  80
 /* === END FIX ROOT-RETURN-SENDS-FAULT-NONE === */
 
-/* === FIX WAIT-TIME-SYNC-TIMEOUT ===
-   Не ждём time_sync вечно. SNTP может быть недоступен за
-   APN оператора. Через WAIT_TIME_SYNC_MAX_MS стартуем без
-   UTC — NODE получит c: с end_utc=0, будет работать по
-   локальному pm, а time: дошлётся позже (когда/если SNTP
-   ответит). */
+/* === FIX WAIT-TIME-SYNC-TIMEOUT === */
 #define WAIT_TIME_SYNC_MAX_MS       10000
 /* === END FIX WAIT-TIME-SYNC-TIMEOUT === */
+
+/* === FIX RT-CHANNELS ===
+   Задержка между моментом отправки c: и моментом применения маски
+   на обоих концах. Покрывает ToA LoRa (≈112 мс для 64 байт
+   SF8/BW250) + обработку + джиттер. Кратна 10 мс. */
+#define RT_APPLY_LEAD_MS            150
+#define RT_APPLY_QUANTUM_MS         10
+/* === END FIX RT-CHANNELS === */
 
 volatile bool     s_cfg_ack                 = true;
 volatile bool     s_cfg_pushing             = false;
@@ -124,24 +92,38 @@ extern volatile bool s_insert_pending;
 #define SET_REMOTE_FLAG(v) do { s_fault_from_remote_ex = (v); } while (0)
 
 /* ============================================================
-   send_channels_to_node_impl
+   === FIX RT-CHANNELS ===
+   root_compute_apply_utc_ms — момент UTC, когда применить маску.
+   ============================================================ */
+uint64_t root_compute_apply_utc_ms(void)
+{
+    uint64_t now_utc = time_sync_get_utc_ms();
+    if (now_utc == 0) return 0;
+    uint64_t apply = now_utc + RT_APPLY_LEAD_MS;
+    apply = (apply / RT_APPLY_QUANTUM_MS) * RT_APPLY_QUANTUM_MS;
+    return apply;
+}
+/* === END FIX RT-CHANNELS === */
+
+/* ============================================================
+   send_channels_to_node_impl_ex
    === FIX PM-AT-SEND ===
    === FIX FAULT-HAS-TOP-PRIORITY ===
+   === FIX RT-CHANNELS ===
    ============================================================ */
-static uint32_t send_channels_to_node_impl(uint8_t phase,
-                                           uint32_t phase_ms_hint,
-                                           uint32_t duration_ms, bool force,
-                                           bool allow_display)
+static uint32_t send_channels_to_node_impl_ex(uint8_t phase,
+                                              uint32_t phase_ms_hint,
+                                              uint32_t duration_ms,
+                                              bool force,
+                                              bool allow_display,
+                                              uint64_t apply_utc_ms)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) return 0;
     if (!transport_is_lora()) return 0;
     if (g_config.traffic.sequence_count == 0) return 0;
     if (phase >= g_config.traffic.sequence_count) return 0;
 
-    /* === FIX FAULT-HAS-TOP-PRIORITY ===
-       При активной аварии НЕ шлём c:. NODE управляется
-       fault:* (см. root_push_fault_to_node). Иначе c: с
-       маской не-аварийного режима перезапишет fault. */
+    /* === FIX FAULT-HAS-TOP-PRIORITY === */
     if (traffic_light_fault_has_priority()) {
         ESP_LOGW(TAG, "send_channels(%u): fault active (%s), skip c:",
                  phase, traffic_light_fault_str());
@@ -171,7 +153,10 @@ static uint32_t send_channels_to_node_impl(uint8_t phase,
         }
     }
 
-    if (!force && phase == s_last_phase &&
+    /* Для refresh c: (apply_utc_ms == 0) — троттлинг; для смены
+       фазы (apply_utc_ms != 0) — шлём всегда. */
+    if (apply_utc_ms == 0 && !force &&
+        phase == s_last_phase &&
         on_mask == s_last_on && blink_mask == s_last_blink &&
         (now_ms - s_last_ms) < (LORA_SYNC_INTERVAL_MS - 100)) {
         return 0;
@@ -203,14 +188,18 @@ static uint32_t send_channels_to_node_impl(uint8_t phase,
         end_utc_ms = now_utc + (uint64_t)remain;
     }
 
-    char cmd[128];
-    int n = snprintf(cmd, sizeof(cmd), "c:%u:%lu:%04X:%04X:%lu:%llu",
+    /* === FIX RT-CHANNELS ===
+       Формат: c:<phase>:<pm>:<on>:<blink>:<dur>:<end_utc>:<apply_utc> */
+    char cmd[160];
+    int n = snprintf(cmd, sizeof(cmd), "c:%u:%lu:%04X:%04X:%lu:%llu:%llu",
                      phase,
                      (unsigned long)pm_use,
                      (unsigned)on_mask,
                      (unsigned)blink_mask,
                      (unsigned long)duration_ms,
-                     (unsigned long long)end_utc_ms);
+                     (unsigned long long)end_utc_ms,
+                     (unsigned long long)apply_utc_ms);
+    /* === END FIX RT-CHANNELS === */
     if (n <= 0 || n >= (int)sizeof(cmd)) return 0;
 
     esp_err_t err = transport_send_cmd_noack(cmd, n);
@@ -226,16 +215,42 @@ static uint32_t send_channels_to_node_impl(uint8_t phase,
 uint32_t send_channels_to_node(uint8_t phase, uint32_t phase_ms,
                                uint32_t duration_ms, bool force)
 {
-    return send_channels_to_node_impl(phase, phase_ms, duration_ms,
-                                      force, true);
+    return send_channels_to_node_impl_ex(phase, phase_ms, duration_ms,
+                                         force, true, 0);
 }
 
 uint32_t send_channels_to_node_no_display(uint8_t phase, uint32_t phase_ms,
                                           uint32_t duration_ms, bool force)
 {
-    return send_channels_to_node_impl(phase, phase_ms, duration_ms,
-                                      force, false);
+    return send_channels_to_node_impl_ex(phase, phase_ms, duration_ms,
+                                         force, false, 0);
 }
+
+/* === FIX RT-CHANNELS === */
+uint32_t send_channels_to_node_utc(uint8_t phase, uint32_t phase_ms,
+                                   uint32_t duration_ms,
+                                   uint64_t apply_utc_ms, bool force)
+{
+    return send_channels_to_node_impl_ex(phase, phase_ms, duration_ms,
+                                         force, true, apply_utc_ms);
+}
+
+uint32_t send_sync_to_node_async_utc(uint8_t phase, uint32_t phase_ms,
+                                     uint32_t duration_ms,
+                                     uint64_t apply_utc_ms,
+                                     bool force, uint8_t *out_next_phase)
+{
+    if (g_config.role != DEVICE_ROLE_MASTER) return 0;
+    if (!transport_is_lora()) return 0;
+
+    uint32_t r = send_channels_to_node_utc(phase, phase_ms, duration_ms,
+                                           apply_utc_ms, force);
+    if (out_next_phase && r > 0 && g_config.traffic.sequence_count > 0) {
+        *out_next_phase = (phase + 1) % g_config.traffic.sequence_count;
+    }
+    return r;
+}
+/* === END FIX RT-CHANNELS === */
 
 uint32_t send_all_off_to_node(uint32_t duration_ms)
 {
@@ -246,8 +261,8 @@ uint32_t send_all_off_to_node(uint32_t duration_ms)
     uint64_t end_utc_ms = (now_utc != 0)
                           ? (now_utc + (uint64_t)duration_ms) : 0;
 
-    char cmd[80];
-    int n = snprintf(cmd, sizeof(cmd), "c:0:0:0000:0000:%lu:%llu",
+    char cmd[112];
+    int n = snprintf(cmd, sizeof(cmd), "c:0:0:0000:0000:%lu:%llu:0",
                      (unsigned long)duration_ms,
                      (unsigned long long)end_utc_ms);
     if (n <= 0) return 0;
@@ -313,6 +328,13 @@ void apply_sync_at(uint8_t phase, uint32_t phase_ms,
 /* ============================================================
    root_apply_new_config_from_mqtt
    === FIX FAULT-MASK-ON-CONFIG-LOAD ===
+   === FIX RT-CHANNELS ===
+   При auto_start вызываем root_apply_stage_sync_first(0, dur0)
+   вместо traffic_light_start_with_red() — это даёт c:0:red с
+   apply_utc_ms, ROOT и NODE включают красный одновременно.
+
+   При disabled/auto_start=false — оставляем YELLOW_BLINK, как
+   раньше.
    ============================================================ */
 void root_apply_new_config_from_mqtt(const char *json, int len)
 {
@@ -398,44 +420,50 @@ void root_apply_new_config_from_mqtt(const char *json, int len)
     traffic_light_reset();
 
     if (g_config.traffic.enabled && g_config.traffic.auto_start) {
-        ESP_LOGW(TAG, "ROOT: auto-start after config update (c: via phase_sync)");
+        ESP_LOGW(TAG, "ROOT: auto-start after config update (c: via UTC)");
 
         uint32_t utc_sec; uint16_t utc_ms;
         if (time_sync_get(&utc_sec, &utc_ms)) {
             time_sync_root_push_force(blink_get_rtt_us());
         }
 
-        SET_REMOTE_FLAG(true);
-        traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-        SET_REMOTE_FLAG(false);
+        /* === FIX RT-CHANNELS ===
+           Подготовка к первичному c:0:red с UTC-таймингом:
+             1. start_with_red на ROOT — LOCAL: state=RUNNING,
+                phase=0, fault=NONE. Каналы пока apply_stage_dd(0).
+             2. root_apply_stage_sync_first(0, dur0) — вычисляет
+                apply_utc_ms, шлёт c:0:red с apply_utc_ms на NODE,
+                ждёт UTC, применяет маску 0 локально в ту же мс.
+           NODE в этот момент: получил traffic:start → start_with_red
+           (follow_root=true, STANDBY), затем получил c:0:...:red
+           с apply_utc_ms → node_schedule_mask_apply → применит
+           маску 0 в тот же момент UTC. */
         traffic_light_set_follow_root(false);
         traffic_light_start_with_red();
+
+        uint32_t dur0 = traffic_light_stage_duration_ms(0);
+        root_apply_stage_sync_first(0, dur0);
+        /* === END FIX RT-CHANNELS === */
     } else {
         ESP_LOGW(TAG, "ROOT: auto_start disabled - stay in YELLOW_BLINK");
-        /* === FIX FAULT-MASK-ON-CONFIG-LOAD ===
-           Явно применяем YELLOW_BLINK, чтобы apply_fault_mode
-           построил маску по уже применённому g_config.pins. */
         SET_REMOTE_FLAG(true);
         traffic_light_set_fault(TRAFFIC_FAULT_YELLOW_BLINK);
         SET_REMOTE_FLAG(false);
-        /* === END FIX === */
     }
 }
 
 /* ============================================================
    root_node_watchdog_task
-   === FIX WAIT-TIME-SYNC-TIMEOUT ===
-   === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
-   === FIX NO-FAULT-NONE-ON-RESEND ===
    ============================================================ */
 static void root_node_watchdog_task(void *arg)
 {
     ESP_LOGI(TAG, "root_node_watchdog_task started (comm_lost=%d ms, "
                   "SYNC-HANDSHAKE, ROOT-WAIT-NODE-ACK timeout=%d ms, "
                   "WAIT-TIME-SYNC-MAX=%d ms, FAULT-NONE-GAP=%d ms, "
-                  "NO-FAULT-NONE-ON-RESEND)",
+                  "RT-APPLY-LEAD=%d ms)",
              NODE_COMM_LOST_MS, WAIT_NODE_ACK_TIMEOUT_MS,
-             WAIT_TIME_SYNC_MAX_MS, FAULT_NONE_TO_START_GAP_MS);
+             WAIT_TIME_SYNC_MAX_MS, FAULT_NONE_TO_START_GAP_MS,
+             RT_APPLY_LEAD_MS);
 
     bool     was_connected = false;
     uint32_t lost_since_ms = 0;
@@ -446,9 +474,7 @@ static void root_node_watchdog_task(void *arg)
     bool     wait_node_ack    = false;
     uint32_t wait_node_ack_ms = 0;
 
-    /* === FIX WAIT-TIME-SYNC-TIMEOUT === */
     uint32_t wait_time_sync_since = 0;
-    /* === END FIX === */
 
     traffic_light_stop();
     SET_REMOTE_FLAG(true);
@@ -471,9 +497,6 @@ static void root_node_watchdog_task(void *arg)
                          s_last_node_msg_ms != 0 &&
                          !link_monitor_root_lost());
 
-        /* === FIX ROOT-WAIT-NODE-ACK ===
-           Ожидание подтверждения от NODE. ROOT в ALL_OFF,
-           каналы выключены. */
         if (wait_node_ack) {
             bool node_confirmed = s_node_running;
             bool timeout = (now - wait_node_ack_ms) >= WAIT_NODE_ACK_TIMEOUT_MS;
@@ -510,7 +533,6 @@ static void root_node_watchdog_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(ROOT_NODE_CHECK_MS));
             continue;
         }
-        /* === END FIX ROOT-WAIT-NODE-ACK === */
 
         if (has_node && !was_connected) {
             ESP_LOGI(TAG, "ROOT: NODE on LoRa -> RECOVER "
@@ -523,12 +545,6 @@ static void root_node_watchdog_task(void *arg)
                 uint32_t utc_sec; uint16_t utc_ms;
                 bool time_ok = time_sync_get(&utc_sec, &utc_ms);
 
-                /* === FIX WAIT-TIME-SYNC-TIMEOUT ===
-                   SNTP может не ответить за APN. Через
-                   WAIT_TIME_SYNC_MAX_MS стартуем без UTC:
-                   NODE получит c: с end_utc=0, будет работать по
-                   локальному pm. Time дошлётся позже (phase_sync
-                   task раз в TIME_PUSH_PERIOD_MS). */
                 if (!time_ok) {
                     if (wait_time_sync_since == 0) {
                         wait_time_sync_since = now;
@@ -552,23 +568,7 @@ static void root_node_watchdog_task(void *arg)
                     wait_time_sync_since = 0;
                     time_sync_root_push_force(blink_get_rtt_us());
                 }
-                /* === END FIX WAIT-TIME-SYNC-TIMEOUT === */
 
-                /* === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
-                   Восстановление связи (was_connected=false → true).
-                   NODE мог сам уйти в ALL_OFF из-за потери ROOT
-                   (node_link_watchdog_task → set_fault(ALL_OFF) +
-                   s_root_lost_flag=true). NODE блокирует
-                   traffic:start/c: через fault_has_priority() и
-                   ждёт fault:none. Без явного fault:none здесь —
-                   deadlock: ROOT шлёт traffic:start, NODE
-                   игнорирует, ROOT по timeout форсирует локальный
-                   старт, но NODE остаётся в ALL_OFF.
-
-                   Шлём fault:none ПЕРВЫМ, с паузой на доставку
-                   LoRa (ToA для 10 байт ≈ 40-50 мс при SF8/BW250,
-                   transport_send_cmd_noack блокирующий, так что
-                   80 мс — запас). */
                 ESP_LOGW(TAG, "ROOT: send fault:none + traffic:start + "
                               "c:0:...:red to NODE (ROOT stays ALL_OFF "
                               "until NODE confirms)");
@@ -579,7 +579,6 @@ static void root_node_watchdog_task(void *arg)
                                          strlen("traffic:start"));
                 send_channels_to_node(0, UINT32_MAX,
                     traffic_light_stage_duration_ms(0), true);
-                /* === END FIX ROOT-RETURN-SENDS-FAULT-NONE === */
 
                 wait_node_ack = true;
                 wait_node_ack_ms = now;
@@ -625,24 +624,6 @@ static void root_node_watchdog_task(void *arg)
                 traffic_light_stage_duration_ms(0), true);
         }
 
-        /* === FIX NO-FAULT-NONE-ON-RESEND ===
-           Повторный traffic:start когда NODE не RUNNING.
-
-           Раньше здесь слали fault:none КАЖДЫЕ 5 с. Это снимало
-           YELLOW_BLINK на NODE, если NODE в аварии (short to
-           GND) — потому что:
-             - NODE шлёт fault:local:YELLOW_BLINK (EVT, no-ack),
-             - ROOT применяет её у себя только после STATUS от
-               NODE с FAULT.mode == "YELLOW_BLINK" (раз в 1 с
-               при fault),
-             - но traffic:start с fault:none уходит каждые 5 с
-               (эта ветка),
-             - NODE получает fault:none → снимает YELLOW_BLINK →
-               «сбрасывает» аварию, хотя short to GND продолжается.
-
-           Убираем fault:none отсюда. Если NODE в standby по
-           s_root_lost_flag — он получит fault:none из ветки
-           !was_connected (восстановление связи). */
         if (!wait_node_ack && has_node && was_connected && !s_node_running &&
             traffic_light_get_state() == TRAFFIC_STATE_RUNNING) {
             if (last_start_ms == 0 || (now - last_start_ms) >= 5000) {
@@ -653,16 +634,7 @@ static void root_node_watchdog_task(void *arg)
                 last_start_ms = now;
             }
         }
-        /* === END FIX NO-FAULT-NONE-ON-RESEND === */
 
-        /* === FIX NO-FAULT-NONE-ON-RESEND ===
-           Аналогично для ветки YELLOW_BLINK + NODE not RUNNING.
-           Раньше слали fault:none — это могло сбить YELLOW_BLINK
-           на NODE, если NODE уже получил fault:yellow_blink от
-           ROOT (а ROOT сейчас в другом fault — YELLOW_BLINK).
-           Убираем fault:none, оставляем только traffic:start.
-           Если NODE в standby — fault:none придёт из
-           !was_connected или из sync_handshake. */
         if (!wait_node_ack &&
             traffic_light_get_fault() == TRAFFIC_FAULT_YELLOW_BLINK &&
             !s_node_running) {
@@ -675,7 +647,6 @@ static void root_node_watchdog_task(void *arg)
                 last_start_ms = now;
             }
         }
-        /* === END FIX NO-FAULT-NONE-ON-RESEND === */
 
         if (!has_node && was_connected) {
             ESP_LOGW(TAG, "ROOT: NODE lost -> sync_handshake");
@@ -723,13 +694,11 @@ static void root_node_watchdog_task(void *arg)
 
 /* ============================================================
    phase_sync_task
-   === FIX FAULT-HAS-TOP-PRIORITY ===
-   === FIX NO-DOUBLE-C-ON-PHASE-CHANGE ===
    ============================================================ */
 static void phase_sync_task(void *arg)
 {
     ESP_LOGI(TAG, "phase_sync_task started (refresh=%d ms, "
-                  "TIME-PUSH=%d ms, FAULT-PRIORITY, PM-AT-SEND)",
+                  "TIME-PUSH=%d ms, FAULT-PRIORITY, PM-AT-SEND, RT=UTC)",
              LORA_SYNC_INTERVAL_MS, TIME_PUSH_PERIOD_MS);
 
     uint8_t  last_phase = 0xFF;
@@ -765,9 +734,6 @@ static void phase_sync_task(void *arg)
             }
         }
 
-        /* === FIX FAULT-HAS-TOP-PRIORITY ===
-           c: отправляем ТОЛЬКО в нормальном режиме (RUNNING + no fault).
-           При fault c: уже отправлен из traffic_light_set_fault. */
         if (st == TRAFFIC_STATE_RUNNING && !in_fault) {
             uint8_t  phase = traffic_light_get_phase();
             uint32_t dur   = traffic_light_get_phase_duration_ms();
@@ -778,16 +744,19 @@ static void phase_sync_task(void *arg)
                 ESP_LOGD(TAG, "phase changed → c: already sent by "
                               "root_apply_stage_sync_first (ph=%u)", phase);
             } else if ((now - last_ms) >= LORA_SYNC_INTERVAL_MS) {
-                if (send_channels_to_node(phase, UINT32_MAX, dur, false)) {
+                /* refresh: apply_utc_ms=0 — это коррекция pm,
+                   а не смена фазы. */
+                if (send_channels_to_node_utc(phase, UINT32_MAX, dur,
+                                              0, false)) {
                     last_ms = now;
-                    ESP_LOGD(TAG, "c: refresh ph=%u", phase);
+                    ESP_LOGD(TAG, "c: refresh ph=%u (no UTC — коррекция pm)",
+                             phase);
                 }
             }
         } else {
             last_phase = 0xFF;
             last_ms = 0;
         }
-        /* === END FIX FAULT-HAS-TOP-PRIORITY === */
 
         vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -819,14 +788,10 @@ static void root_heartbeat_task(void *arg)
    ============================================================ */
 void root_wd_start_tasks(void)
 {
-    ESP_LOGI(TAG, "Starting ROOT watchdog tasks (SYNC-HANDSHAKE, "
-                  "FAST-LINK-MONITOR: comm_lost=%d ms, hb=%d ms, "
-                  "ROOT-WAIT-NODE-ACK timeout=%d ms, "
-                  "WAIT-TIME-SYNC-MAX=%d ms, "
-                  "FAULT-NONE-GAP=%d ms, NO-FAULT-NONE-ON-RESEND)",
-             NODE_COMM_LOST_MS, HEARTBEAT_INTERVAL_MS,
-             WAIT_NODE_ACK_TIMEOUT_MS, WAIT_TIME_SYNC_MAX_MS,
-             FAULT_NONE_TO_START_GAP_MS);
+    ESP_LOGI(TAG, "Starting ROOT watchdog tasks (RT-APPLY-LEAD=%d ms, "
+                  "comm_lost=%d ms, hb=%d ms, ROOT-WAIT-NODE-ACK timeout=%d ms)",
+             RT_APPLY_LEAD_MS, NODE_COMM_LOST_MS, HEARTBEAT_INTERVAL_MS,
+             WAIT_NODE_ACK_TIMEOUT_MS);
 
     xTaskCreate(phase_sync_task,          "phase_sync",    4096, NULL, 4, NULL);
     xTaskCreate(root_node_watchdog_task,  "root_node_wd",  8192, NULL, 3, NULL);

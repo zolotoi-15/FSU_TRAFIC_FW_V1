@@ -1,70 +1,22 @@
 /* ============================================================
    node_proto.c — NODE/ROOT протокол.
 
-   === FIX C-BUFFER-BEFORE-START ===
-   Если c: приходит раньше, чем NODE перешёл в RUNNING —
-   сохраняем в s_pending_c_* и применяем сразу после
-   traffic:start.
+   === FIX RT-CHANNELS ===
+   NODE: c: содержит apply_utc_ms. Если оно != 0 и UTC валиден,
+   NODE откладывает применение маски до этого момента в
+   node_mask_scheduler_task (шаг 5 мс). Пока маска в pending:
+     - traffic_light_check_faults НЕ вызывается для каналов
+       из pending (иначе ложный SHORT_GND на 150 мс, пока SR
+       ещё в старой маске, а s_active_mask_from_root уже новая);
+     - s_expected_mask_from_root / s_active_mask_from_root
+       обновляются В МОМЕНТ ПРИМЕНЕНИЯ, а не при приходе c:.
+   Реализовано через s_pending_mask_valid — mux_task и
+   check_faults смотрят на этот флаг.
 
-   === FIX FAULT-HAS-TOP-PRIORITY ===
-   Авария — наивысший приоритет. c: не применяется при
-   s_fault != NONE; traffic:start не снимает локальный fault;
-   fault:yellow_blink с mask=0 → ALL_OFF.
+   Если apply_utc_ms == 0 (refresh c:, fallback) — применяем
+   сразу, как раньше.
 
-   === FIX ROOT-RETURN-CLEARS-LOCAL-ALL-OFF ===
-   Если NODE сам выставил ALL_OFF из-за потери ROOT
-   (s_root_lost_flag=true), то ЛЮБОЙ пакет от ROOT означает
-   «ROOT вернулся» → снимаем локальный ALL_OFF ДО проверки
-   traffic_light_fault_has_priority().
-
-   === FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE ===
-   fault:none от ROOT НЕ снимает YELLOW_BLINK на NODE, если
-   у NODE есть активные аварии (s_fault_count > 0). ROOT
-   проверил СВОИ каналы (try_recovery), но авария была на
-   NODE. NODE сам сбросит fault через try_recovery.
-
-   === FIX ROOT-MIRROR-NODE-FAULT ===
-   (в on_evt_from_node) fault:local:<MODE> от NODE → ROOT
-   применяет у себя ту же аварию.
-
-   === FIX UTC-DELTA-MAX ===
-   UTC_DELTA_MAX_MS_LOCAL 500 → 3000.
-
-   === FIX T_CHANNELS ===
-   NODE раз в NODE_CHANNELS_PERIOD_MS (60 с) шлёт отдельный
-   T_CHANNELS с 16 каналами. ROOT публикует в
-   <base>/Node/Channels.
-
-   === FIX TIME-APPLY-IN-ALIGNED ===
-   time: применяется на NODE всегда.
-
-   === FIX NODE-STATUS-ROOT-FORMAT ===
-   STATUS от NODE в формате ROOT (SR/NET/TRAFFIC/FAULT/LINK/
-   NODE/NODE_FAULT/RS485/CAN/RTT + "role":"node" в хвосте).
-   Позволяет потребителю читать ROOT и NODE одинаковым
-   парсером.
-
-   on_node_status_from_transport() парсит LINK.root.rssi (а не
-   LINK.rssi), т.к. LINK теперь — объект с root/node.
-
-   === FIX STATUS-NO-CHANNELS ===
-   КЛЮЧЕВАЯ ПРАВКА.
-   Раньше STATUS включал ch00..ch15 → ~1500 байт = 46 фрагментов
-   по LoRa. Без ACK на каждом фрагменте (T_STATUS = noack) потеря
-   любого фрагмента → frag gap → отбрасывание всего пакета →
-   ROOT не собирает STATUS → MQTT <base>/Node не обновляется.
-
-   Теперь STATUS — только SR/NET/TRAFFIC/FAULT/LINK/NODE/
-   NODE_FAULT/RS485/CAN/RTT/role → ~400 байт = 10 фрагментов.
-   Каналы NODE остаются в T_CHANNELS (раз в 60 с, публикуется
-   в <base>/Node/Channels). Вероятность потери 1 из 10 гораздо
-   ниже, чем 1 из 46.
-
-   === FIX T-CHANNELS-NOT-COMBINED ===
-   T_CHANNELS и STATUS больше НЕ шлются в одной итерации
-   node_send_task. После T_CHANNELS — пауза 3000 мс + continue.
-   Иначе 30+10=40 фрагментов подряд → ROOT шлёт c: каждые
-   LORA_SYNC_INTERVAL_MS → гарантированные коллизии.
+   Остальные FIX сохранены.
    ============================================================ */
 
 #include "node_proto.h"
@@ -88,6 +40,7 @@
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include <string.h>
 #include <stdlib.h>
 #include "traffic_internal.h"
@@ -98,36 +51,28 @@ extern volatile uint32_t s_last_sync_ms;
 extern volatile uint32_t s_last_node_msg_ms;
 extern volatile bool     s_comm_lost;
 
-/* === FIX LORA-LINK-STATS === */
 volatile float    s_node_link_rssi     = 0.0f;
 volatile float    s_node_link_snr      = 0.0f;
 volatile float    s_node_link_sig_rssi = 0.0f;
 volatile uint32_t s_node_link_age_ms   = 0;
 volatile bool     s_node_link_valid    = false;
-/* === END FIX LORA-LINK-STATS === */
 
-/* === FIX T_CHANNELS === */
 char s_node_channels_json[2048] = {0};
 volatile bool s_node_channels_valid = false;
 #define NODE_CHANNELS_PERIOD_MS  60000
 static uint32_t s_last_channels_ms = 0;
-/* === END FIX T_CHANNELS === */
 
 #define NODE_STATUS_PERIOD_MS      8000
 #define NODE_STATUS_FAULT_MS       1000
-#define NODE_STATUS_SYNC_MS        500
-#define STATUS_FORCE_MS            5000
+#define NODE_STATUS_SYNC_MS        300
+#define STATUS_FORCE_MS            500
 
 #define NODE_ROOT_LOST_MS          6000
 
 #define UTC_DELTA_MAX_MS_LOCAL     3000
 #define SYNC_MAX_DRIFT_MS_LOCAL    500
 
-/* === FIX STATUS-NO-CHANNELS ===
-   Буфер STATUS уменьшен: новый формат без ch00..ch15 ≈ 400 байт.
-   1024 — с запасом (FAULT.reasons может быть длинным при аварии). */
 #define NODE_STATUS_BUF_SIZE       1024
-/* === END FIX STATUS-NO-CHANNELS === */
 
 volatile bool s_fault_from_remote_ex = false;
 volatile bool s_node_running = false;
@@ -141,7 +86,6 @@ static volatile uint32_t s_last_root_data_ms = 0;
 static volatile bool s_root_lost_flag = false;
 static volatile bool s_c_received_since_start = false;
 
-/* === FIX C-BUFFER-BEFORE-START === */
 static volatile bool     s_pending_c_valid = false;
 static volatile uint8_t  s_pending_c_phase = 0;
 static volatile uint32_t s_pending_c_pm    = 0;
@@ -149,7 +93,31 @@ static volatile uint16_t s_pending_c_on    = 0;
 static volatile uint16_t s_pending_c_blink = 0;
 static volatile uint32_t s_pending_c_dur   = 0;
 static volatile uint64_t s_pending_c_end   = 0;
-/* === END FIX C-BUFFER-BEFORE-START === */
+
+/* === FIX RT-CHANNELS ===
+   Отложенное применение маски по UTC. NODE получает c: с
+   apply_utc_ms и применяет маску ровно в этот момент.
+   Пока s_pending_mask_valid — mux_task/check_faults пропускают
+   проверку каналов, чтобы не сгенерировать ложный SHORT_GND
+   (SR ещё в старой маске, s_active_mask_from_root уже новая
+   ещё не применена — но мы и не обновляем её до применения). */
+typedef struct {
+    uint8_t  ph;
+    uint32_t pm;
+    uint16_t on;
+    uint16_t blink;
+    uint32_t dur;
+    uint64_t end_utc;
+    bool     has_utc;
+} pending_mask_t;
+
+static pending_mask_t     s_pending_mask = {0};
+static volatile bool      s_pending_mask_valid = false;
+static uint64_t           s_pending_mask_apply_utc = 0;
+static SemaphoreHandle_t  s_pending_mask_mtx = NULL;
+
+bool node_mask_pending(void) { return s_pending_mask_valid; }
+/* === END FIX RT-CHANNELS === */
 
 #define SET_REMOTE_FLAG(v) do { s_fault_from_remote_ex = (v); } while (0)
 
@@ -232,16 +200,100 @@ static void node_apply_c_mask(uint8_t ph,
 }
 
 /* ============================================================
+   === FIX RT-CHANNELS ===
+   node_schedule_mask_apply — поставить маску в pending, чтобы
+   применить её в apply_utc_ms.
+   ============================================================ */
+static void node_schedule_mask_apply(uint8_t ph, uint32_t pm,
+                                     uint16_t on16, uint16_t blink16,
+                                     uint32_t dur, uint64_t end_utc_ms,
+                                     uint64_t apply_utc_ms)
+{
+    if (!s_pending_mask_mtx) {
+        /* scheduler ещё не запущен — применяем сразу (fallback) */
+        node_apply_c_mask(ph, pm, on16, blink16, dur, end_utc_ms,
+                          end_utc_ms != 0);
+        return;
+    }
+
+    if (traffic_light_fault_has_priority()) {
+        ESP_LOGW(TAG, "sched c: IGNORED (fault active: %s)",
+                 traffic_light_fault_str());
+        return;
+    }
+
+    xSemaphoreTake(s_pending_mask_mtx, portMAX_DELAY);
+    s_pending_mask.ph      = ph;
+    s_pending_mask.pm      = pm;
+    s_pending_mask.on      = on16;
+    s_pending_mask.blink   = blink16;
+    s_pending_mask.dur     = dur;
+    s_pending_mask.end_utc = end_utc_ms;
+    s_pending_mask.has_utc = (end_utc_ms != 0);
+    s_pending_mask_apply_utc = apply_utc_ms;
+    s_pending_mask_valid = true;
+    xSemaphoreGive(s_pending_mask_mtx);
+
+    ESP_LOGI(TAG, "sched c: ph=%u apply_utc=%llu (now=%llu, delta=%lld ms)",
+             ph, (unsigned long long)apply_utc_ms,
+             (unsigned long long)time_sync_get_utc_ms(),
+             (long long)((int64_t)apply_utc_ms -
+                         (int64_t)time_sync_get_utc_ms()));
+}
+
+static void node_mask_scheduler_task(void *arg)
+{
+    ESP_LOGI(TAG, "node_mask_scheduler_task started (step=5 ms)");
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(5));
+        if (!s_pending_mask_valid) continue;
+
+        uint64_t now = time_sync_get_utc_ms();
+        if (now == 0) {
+            /* Время пропало — применяем сразу, чтобы не залипнуть.
+               apply_utc_ms здесь не нужен (мы не ждём). */
+            pending_mask_t p;
+            xSemaphoreTake(s_pending_mask_mtx, portMAX_DELAY);
+            p = s_pending_mask;
+            s_pending_mask_valid = false;
+            xSemaphoreGive(s_pending_mask_mtx);
+
+            ESP_LOGW(TAG, "sched c: UTC lost → apply immediately");
+            node_apply_c_mask(p.ph, p.pm, p.on, p.blink, p.dur,
+                              p.end_utc, p.has_utc);
+            continue;
+        }
+
+        uint64_t apply_utc;
+        xSemaphoreTake(s_pending_mask_mtx, portMAX_DELAY);
+        apply_utc = s_pending_mask_apply_utc;
+        xSemaphoreGive(s_pending_mask_mtx);
+
+        if (now >= apply_utc) {
+            pending_mask_t p;
+            xSemaphoreTake(s_pending_mask_mtx, portMAX_DELAY);
+            p = s_pending_mask;
+            s_pending_mask_valid = false;
+            xSemaphoreGive(s_pending_mask_mtx);
+
+            ESP_LOGI(TAG, "sched c: APPLY ph=%u (now=%llu, target=%llu)",
+                     p.ph, (unsigned long long)now,
+                     (unsigned long long)apply_utc);
+            node_apply_c_mask(p.ph, p.pm, p.on, p.blink, p.dur,
+                              p.end_utc, p.has_utc);
+        }
+    }
+}
+/* === END FIX RT-CHANNELS === */
+
+/* ============================================================
    on_cmd_from_root
-   === FIX ROOT-RETURN-CLEARS-LOCAL-ALL-OFF ===
-   === FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE ===
    ============================================================ */
 static void on_cmd_from_root(const char *cmd, size_t len)
 {
     link_monitor_note_ping_rx();
     node_note_root_data();
 
-    /* === FIX ROOT-RETURN-CLEARS-LOCAL-ALL-OFF === */
     if (s_root_lost_flag) {
         ESP_LOGW(TAG, "ROOT back (cmd='%.16s...') -> clear local ALL_OFF "
                       "(was root-lost)",
@@ -251,14 +303,12 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         traffic_light_set_fault(TRAFFIC_FAULT_NONE);
         SET_REMOTE_FLAG(false);
     }
-    /* === END FIX ROOT-RETURN-CLEARS-LOCAL-ALL-OFF === */
 
     char buf[256];
     size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
     memcpy(buf, cmd, n);
     buf[n] = '\0';
 
-    /* === FIX TIME-APPLY-IN-ALIGNED === */
     if (strncmp(buf, "time:", 5) == 0) {
         unsigned long sec = 0;
         unsigned int ms = 0;
@@ -282,7 +332,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         return;
     }
 
-    /* === FIX SYNC-HANDSHAKE === */
     if (len >= 5 && strncmp(buf, "sync:", 5) == 0) {
         sync_handshake_node_on_rx(buf, n);
         if (strncmp(buf, "sync:probe", 10) == 0) return;
@@ -304,17 +353,17 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         unsigned int blink_mask = 0;
         unsigned long dur = 0;
         unsigned long long end_utc_ms = 0;
+        unsigned long long apply_utc_ms = 0;
 
-        int matched = sscanf(buf + 2, "%u:%lu:%4x:%4x:%lu:%llu",
+        int matched = sscanf(buf + 2, "%u:%lu:%4x:%4x:%lu:%llu:%llu",
                              &ph, &pm, &on_mask, &blink_mask, &dur,
-                             &end_utc_ms);
+                             &end_utc_ms, &apply_utc_ms);
         if (matched < 5) {
             ESP_LOGW(TAG, "c: bad format: '%s'", buf);
             return;
         }
 
         if (!s_node_running) {
-            /* === FIX C-BUFFER-BEFORE-START === */
             ESP_LOGW(TAG, "c: NODE not RUNNING → stash for later "
                           "(ph=%u)", ph);
             s_pending_c_phase = (uint8_t)ph;
@@ -325,21 +374,33 @@ static void on_cmd_from_root(const char *cmd, size_t len)
             s_pending_c_end   = (uint64_t)end_utc_ms;
             s_pending_c_valid = true;
             return;
-            /* === END FIX C-BUFFER-BEFORE-START === */
         }
 
         s_c_received_since_start = true;
         s_fault_from_remote_ex = false;
+
+        /* === FIX RT-CHANNELS ===
+           matched >= 7 → есть apply_utc_ms.
+           Если он != 0 — планируем.
+           Если 0 или нет поля (matched < 7) — применяем сразу
+           (refresh c: / fallback). */
+        if (matched >= 7 && apply_utc_ms != 0) {
+            node_schedule_mask_apply((uint8_t)ph, (uint32_t)pm,
+                                     (uint16_t)on_mask, (uint16_t)blink_mask,
+                                     (uint32_t)dur, (uint64_t)end_utc_ms,
+                                     (uint64_t)apply_utc_ms);
+            return;
+        }
 
         node_apply_c_mask((uint8_t)ph, (uint32_t)pm,
                           (uint16_t)on_mask, (uint16_t)blink_mask,
                           (uint32_t)dur, (uint64_t)end_utc_ms,
                           matched >= 6);
         return;
+        /* === END FIX RT-CHANNELS === */
     }
 
     if (strncmp(buf, "fault:none", 10) == 0) {
-        /* === FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE === */
         uint8_t local_cnt = traffic_light_get_fault_count();
         if (traffic_light_fault_has_priority() && local_cnt > 0) {
             ESP_LOGW(TAG, "fault:none from ROOT IGNORED: NODE has %u "
@@ -347,7 +408,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
                      local_cnt);
             return;
         }
-        /* === END FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE === */
 
         ESP_LOGW(TAG, "fault:none from ROOT -> clear local fault");
         s_root_lost_flag = false;
@@ -528,7 +588,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         node_note_root_data();
         node_send_status_for_ms(STATUS_FORCE_MS);
 
-        /* === FIX C-BUFFER-BEFORE-START === */
         if (s_pending_c_valid) {
             ESP_LOGI(TAG, "traffic:start → apply stashed c: ph=%u",
                      s_pending_c_phase);
@@ -542,7 +601,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
             s_pending_c_valid = false;
             s_c_received_since_start = true;
         }
-        /* === END FIX C-BUFFER-BEFORE-START === */
         return;
     }
     if (strcmp(buf, "traffic:stop") == 0) {
@@ -551,6 +609,8 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         s_root_lost_flag = false;
         s_c_received_since_start = false;
         s_pending_c_valid = false;
+        /* pending UTC-mask тоже сбрасываем */
+        s_pending_mask_valid = false;
         return;
     }
     if (strcmp(buf, "traffic:pause")  == 0) { traffic_light_pause();  return; }
@@ -663,10 +723,6 @@ void node_handle_local_cmd(const char *cmd)
 
 /* ============================================================
    on_node_status_from_transport (ROOT)
-   === FIX NODE-STATUS-ROOT-FORMAT ===
-   LINK теперь в формате ROOT: {"root":{"rssi":...,...},"node":{...}}.
-   Из NODE приходит LINK.root (его RX-метрики) + LINK.node=null.
-   ROOT берёт LINK.root как «качество последнего RX от NODE».
    ============================================================ */
 static void on_node_status_from_transport(const char *json, size_t len)
 {
@@ -682,7 +738,6 @@ static void on_node_status_from_transport(const char *json, size_t len)
                            (now - s_last_node_pub_ms) >= 2000);
     if (should_publish) {
         s_last_node_pub_ms = now;
-        /* Диагностика: видно, доходит ли STATUS до MQTT. */
         ESP_LOGI(TAG, "STATUS→MQTT: len=%u mqtt=%d role_found=%d",
                  (unsigned)len,
                  wifi_mqtt_is_connected() ? 1 : 0,
@@ -692,8 +747,6 @@ static void on_node_status_from_transport(const char *json, size_t len)
 
     if (g_config.role != DEVICE_ROLE_MASTER || !json || len == 0) return;
 
-    /* === FIX NODE-STATUS-ROOT-FORMAT ===
-       LINK.root.rssi — LoRa-метрики NODE (его RX). */
     {
         const char *lk = (const char *)memmem(json, len, "\"LINK\":{", 8);
         if (lk) {
@@ -718,7 +771,6 @@ static void on_node_status_from_transport(const char *json, size_t len)
             }
         }
     }
-    /* === END FIX NODE-STATUS-ROOT-FORMAT === */
 
     sync_handshake_root_on_rx(json, len);
 
@@ -796,7 +848,6 @@ static void on_node_status_from_transport(const char *json, size_t len)
     }
 }
 
-/* === FIX T_CHANNELS === */
 static void on_node_channels_from_transport(const char *json, size_t len)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) return;
@@ -811,11 +862,9 @@ static void on_node_channels_from_transport(const char *json, size_t len)
 
     wifi_mqtt_publish_node_channels(json, len);
 }
-/* === END FIX T_CHANNELS === */
 
 /* ============================================================
    on_evt_from_node (ROOT)
-   === FIX ROOT-MIRROR-NODE-FAULT ===
    ============================================================ */
 static void on_evt_from_node(const char *evt, size_t len)
 {
@@ -824,7 +873,6 @@ static void on_evt_from_node(const char *evt, size_t len)
     memcpy(buf, evt, n);
     buf[n] = '\0';
 
-    /* === FIX SYNC-HANDSHAKE === */
     if (len >= 5 && strncmp(buf, "sync:", 5) == 0) {
         if (strncmp(buf, "sync:probe", 10) == 0) {
             sync_state_t rst = sync_handshake_root_state();
@@ -844,13 +892,10 @@ static void on_evt_from_node(const char *evt, size_t len)
         sync_handshake_root_on_rx(buf, n);
         return;
     }
-    /* === END FIX SYNC-HANDSHAKE === */
 
     if (len > 5 && strncmp(buf, "pong:", 5) == 0) return;
     if (len > 5 && strncmp(buf, "time:", 5) == 0) return;
 
-    /* === FIX FAULT-FROM-NODE ===
-       ВАЖНО: проверять "fault:" ДО "fault:recover_ok". */
     if (len > 6 && strncmp(buf, "fault:", 6) == 0) {
         if (strncmp(buf, "fault:recover_ok", 16) == 0) {
             if (traffic_light_get_fault() != TRAFFIC_FAULT_NONE) {
@@ -862,11 +907,6 @@ static void on_evt_from_node(const char *evt, size_t len)
             return;
         }
 
-        /* === FIX ROOT-MIRROR-NODE-FAULT ===
-           fault:local:<MODE> от NODE — NODE сам обнаружил аварию
-           (short to GND, V_IN low). ROOT применяет ту же аварию
-           у себя, чтобы оба контроллера были в одном состоянии.
-           Формат: "fault:local:YELLOW_BLINK" / "fault:local:ALL_OFF". */
         if (strncmp(buf, "fault:local:", 12) == 0) {
             const char *mode = buf + 12;
             traffic_fault_t nf = TRAFFIC_FAULT_NONE;
@@ -886,14 +926,12 @@ static void on_evt_from_node(const char *evt, size_t len)
                 return;
             }
         }
-        /* === END FIX ROOT-MIRROR-NODE-FAULT === */
 
         SET_REMOTE_FLAG(true);
         wifi_mqtt_apply_remote_fault(evt, len);
         SET_REMOTE_FLAG(false);
         return;
     }
-    /* === END FIX FAULT-FROM-NODE === */
 
     if (strcmp(buf, "pedestrian:request") == 0) {
         if (!traffic_light_ped_button_enabled()) return;
@@ -911,31 +949,13 @@ static void on_evt_from_node(const char *evt, size_t len)
 
 /* ============================================================
    node_send_task
-   === FIX STATUS-NO-CHANNELS ===
-   STATUS от NODE (формат ROOT, БЕЗ ch00..ch15):
-     {"SR":{state+hex+outputs},"NET":{role=node,ppp,ip},
-      "TRAFFIC":{state,mode,phase,phase_ms,phase_duration_ms,
-                 phase_count},
-      "FAULT":{mode,count,channels,reasons},
-      "LINK":{"root":{...},"node":{...}},
-      "NODE":null,"NODE_FAULT":null,
-      "RS485":{...},"CAN":{...},"RTT":{...},
-      "role":"node"}
-   ≈ 400 байт = 10 фрагментов по LoRa.
-
-   Каналы NODE (ch00..ch15) идут отдельным T_CHANNELS раз в 60 с.
-
-   === FIX T-CHANNELS-NOT-COMBINED ===
-   После T_CHANNELS — пауза + continue. STATUS в этой итерации
-   НЕ шлётся. Иначе 30+10 фрагментов подряд → коллизии с c:
-   от ROOT → потеря фрагментов → ROOT не собирает пакет.
    ============================================================ */
 static void node_send_task(void *arg)
 {
     char *json = malloc(NODE_STATUS_BUF_SIZE);
     if (!json) { vTaskDelete(NULL); return; }
 
-    ESP_LOGI(TAG, "node_send_task started (transport=%s, buf=%u)",
+    ESP_LOGI(TAG, "node_send_task started (transport=%s, buf=%u, RT=UTC)",
              transport_is_lora() ? "LoRa" : "TCP",
              (unsigned)NODE_STATUS_BUF_SIZE);
     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -948,7 +968,6 @@ static void node_send_task(void *arg)
 
         uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
 
-        /* === FIX T_CHANNELS === */
         bool send_channels = (s_last_channels_ms == 0 ||
                               (now_ms - s_last_channels_ms) >= NODE_CHANNELS_PERIOD_MS);
         if (send_channels && transport_is_lora()) {
@@ -978,18 +997,10 @@ static void node_send_task(void *arg)
             ESP_LOGI(TAG, "T_CHANNELS -> ROOT: %s (%d bytes)",
                      err == ESP_OK ? "OK" : esp_err_to_name(err), off);
 
-            /* === FIX T-CHANNELS-NOT-COMBINED ===
-               После T_CHANNELS — пауза и continue: STATUS в этой
-               итерации НЕ отправляем. Иначе 30+10 фрагментов
-               подряд → коллизии с c: от ROOT. */
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
-            /* === END FIX T-CHANNELS-NOT-COMBINED === */
         }
-        /* === END FIX T_CHANNELS === */
 
-        /* === FIX STATUS-NO-CHANNELS ===
-           STATUS в формате ROOT БЕЗ ch00..ch15. */
         uint16_t sr_state = sr_get_state();
         const char *state_str = traffic_light_state_str();
         const char *fault_str = traffic_light_fault_str();
@@ -1005,7 +1016,6 @@ static void node_send_task(void *arg)
 
         int off = 0;
 
-        /* SR */
         off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
             "{\"SR\":{\"state\":%u,\"hex\":\"0x%04X\",\"outputs\":[",
             sr_state, sr_state);
@@ -1019,11 +1029,9 @@ static void node_send_task(void *arg)
         }
         off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off, "]},");
 
-        /* NET — у NODE нет своего PPP, role=node */
         off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
             "\"NET\":{\"role\":\"node\",\"ppp\":0,\"ip\":\"0.0.0.0\"},");
 
-        /* TRAFFIC — как у ROOT (phase_duration_ms, phase_count) */
         off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
             "\"TRAFFIC\":{\"state\":\"%s\",\"mode\":%d,\"phase\":%d,"
             "\"phase_ms\":%lu,\"phase_duration_ms\":%lu,\"phase_count\":%u},",
@@ -1033,7 +1041,6 @@ static void node_send_task(void *arg)
             (unsigned long)traffic_light_get_phase_duration_ms(),
             traffic_light_get_phase_count());
 
-        /* FAULT — как у ROOT (mode+count+channels+reasons) */
         off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
             "\"FAULT\":{\"mode\":\"%s\",\"count\":%u,\"channels\":[",
             fault_str, fault_cnt);
@@ -1060,9 +1067,6 @@ static void node_send_task(void *arg)
         }
         off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off, "]},");
 
-        /* LINK — как у ROOT: {"root":{...},"node":{...}}.
-           LINK.root — LoRa-метрики NODE (его RX).
-           LINK.node — null (у NODE нет «своего NODE»). */
         off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
             "\"LINK\":{\"root\":{\"rssi\":%.1f,\"snr\":%.1f,"
             "\"sig_rssi\":%.1f,\"age_ms\":%lu,\"valid\":%d},"
@@ -1074,11 +1078,9 @@ static void node_send_task(void *arg)
             (unsigned long)(have_ls ? ls.age_ms : 0),
             have_ls ? 1 : 0);
 
-        /* NODE / NODE_FAULT — для NODE это null */
         off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
             "\"NODE\":null,\"NODE_FAULT\":null,");
 
-        /* RS485 — как у ROOT */
         off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
             "\"RS485\":{\"rx_bytes\":%lu,\"rx_frames\":%lu,\"rx_overflows\":%lu,"
             "\"tx_bytes\":%lu,\"tx_errors\":%lu},",
@@ -1086,7 +1088,6 @@ static void node_send_task(void *arg)
             (unsigned long)rs.rx_overflows, (unsigned long)rs.tx_bytes,
             (unsigned long)rs.tx_errors);
 
-        /* CAN — как у ROOT */
         off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
             "\"CAN\":{\"rx_frames\":%lu,\"tx_frames\":%lu,\"tx_errors\":%lu,"
             "\"bus_off\":%lu,\"recovery\":%lu,\"error_passive\":%lu,\"state\":%lu},",
@@ -1096,11 +1097,9 @@ static void node_send_task(void *arg)
             (unsigned long)cs.error_passive_count,
             (unsigned long)cs.last_state);
 
-        /* RTT — у NODE нули (RTT измеряется на ROOT) */
         off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
             "\"RTT\":{\"us\":0,\"delay_us\":0,\"samples\":0}");
 
-        /* role — в хвосте. mqtt_fault.c проверяет strstr, найдёт. */
         off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
                         ",\"role\":\"node\"}");
 
@@ -1109,7 +1108,6 @@ static void node_send_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(NODE_STATUS_PERIOD_MS));
             continue;
         }
-        /* === END FIX STATUS-NO-CHANNELS === */
 
         bool force = s_status_now ||
                      (s_status_force_until_ms != 0 &&
@@ -1223,8 +1221,17 @@ void node_proto_client_start(const char *host, uint16_t port)
 
 void node_proto_start_tasks(void)
 {
+    /* === FIX RT-CHANNELS: mutex + scheduler task === */
+    if (!s_pending_mask_mtx) {
+        s_pending_mask_mtx = xSemaphoreCreateMutex();
+    }
+    /* === END FIX RT-CHANNELS === */
+
     xTaskCreate(node_send_task,           "node_send", 4096, NULL, 4, NULL);
     xTaskCreate(node_link_watchdog_task,  "node_wd",   3072, NULL, 3, NULL);
+    /* === FIX RT-CHANNELS === */
+    xTaskCreate(node_mask_scheduler_task, "node_msk",  3072, NULL, 5, NULL);
+    /* === END FIX RT-CHANNELS === */
 }
 
 void node_proto_start_root_tasks(void)

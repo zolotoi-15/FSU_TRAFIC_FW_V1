@@ -12,7 +12,8 @@ extern "C" {
 
    === SIMPLIFIED-NO-CFG ===
        NODE больше не загружает конфигурацию. ROOT шлёт готовые
-       маски каналов через 'c:<phase>:<pm>:<on_hex>:<blink_hex>:<dur>'.
+       маски каналов через 'c:<phase>:<pm>:<on_hex>:<blink_hex>:
+       <dur>[:<end_utc>[:<apply_utc>]]'.
        Все функции cfg:* удалены/стали stub'ами для совместимости.
 
    === FIX LORA-LINK-STATS ===
@@ -26,6 +27,20 @@ extern "C" {
        STATE, SR, DIAG). ROOT принимает, публикует в
        <base>/Node/Channels. STATUS остаётся лёгким
        (SR/TRAFFIC/FAULT/LINK).
+
+   === FIX RT-CHANNELS ===
+       c: содержит apply_utc_ms — момент UTC, когда ROOT и NODE
+       ОДНОВРЕМЕННО переключают каналы. ToA LoRa и джиттер
+       фрагментации не влияют на синхронность.
+       NODE ставит маску в pending (node_schedule_mask_apply) и
+       применяет её в node_mask_scheduler_task ровно в apply_utc_ms.
+       Пока pending — node_mask_pending() == true; mux_task и
+       traffic_light_check_faults должны пропускать проверку
+       каналов, чтобы не поймать ложный SHORT_GND (SR ещё в старой
+       маске, ожидаемая — уже новая).
+
+       apply_utc_ms == 0 или поле отсутствует → fallback: применяем
+       сразу (refresh c: / старое поведение).
    ============================================================ */
 
 /* --- Инициализация/запуск --- */
@@ -46,6 +61,19 @@ void node_send_status_for_ms(uint32_t ms);
 bool node_cfg_received(void);
 bool node_cfg_confirmed_by_root(void);
 /* === END SIMPLIFIED-NO-CFG === */
+
+/* === FIX RT-CHANNELS ===
+   TRUE, пока на NODE есть отложенная (pending) маска каналов,
+   которая будет применена в apply_utc_ms.
+   Используется в mux_task.c и traffic_fault.c (через
+   traffic_light_check_faults) для пропуска проверки каналов:
+   иначе за 150 мс до применения новой маски SR ещё в старой,
+   а s_expected_mask_from_root уже новая → ложный SHORT_GND.
+
+   На ROOT всегда false (ROOT не планирует маску — он её
+   применяет сам через root_apply_stage_sync_first). */
+bool node_mask_pending(void);
+/* === END FIX RT-CHANNELS === */
 
 /* === FIX LORA-LINK-STATS ===
    Качество последнего RX от NODE (на стороне ROOT).

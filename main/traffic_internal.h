@@ -87,6 +87,35 @@ extern volatile bool s_ped_display_done;
 void root_push_fault_to_node(traffic_fault_t fault);
 
 /* ============================================================
+   === FIX RT-CHANNELS ===
+   root_apply_stage_sync_first — первичное применение стадии на
+   ROOT с UTC-таймингом для NODE.
+
+   Раньше была static в traffic_light.c. Теперь экспортирована,
+   потому что её напрямую вызывают:
+     - mqtt_cmd.c → root_start_traffic_rt() (старт из ALL_OFF
+       и config:reload с auto_start)
+     - sync_handshake.c → root_start_rt() (PROBE/ALIGNED timeout,
+       disp-synced)
+
+   Внутри traffic_light.c эта функция:
+     1. вычисляет apply_utc_ms = root_compute_apply_utc_ms();
+     2. шлёт c:<phase>:<pm>:<on>:<blink>:<dur>:<end_utc>:<apply_utc>
+        на NODE (через send_sync_to_node_async_utc);
+     3. ЖДЁТ до apply_utc_ms;
+     4. применяет маску локально (apply_stage_dd).
+
+   NODE (node_proto.c → node_mask_scheduler_task) применяет ту же
+   маску в тот же момент UTC. Каналы на ROOT и NODE
+   переключаются ОДНОВРЕМЕННО (в пределах ±5 мс джиттера
+   планировщика). ToA LoRa не влияет.
+
+   Если UTC недоступен — fallback на lead_ms (старое поведение).
+   ============================================================ */
+void root_apply_stage_sync_first(uint8_t seq_idx, uint32_t dur_ms);
+/* === END FIX RT-CHANNELS === */
+
+/* ============================================================
    traffic_config.c
    ============================================================ */
 const traffic_stage_dd_t *find_stage(uint8_t id);

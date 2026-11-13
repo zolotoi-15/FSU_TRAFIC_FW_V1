@@ -20,12 +20,25 @@
    === FIX CHECK-FAULTS-APPLY-MODE ===
    traffic_light_check_faults при переходе NONE → YELLOW_BLINK/
    ALL_OFF вызывает apply_fault_mode ДО установки s_fault.
-   Иначе set_all_off() внутри apply_fault_mode увидит
-   fault_active() == true и пропустит выключение каналов.
 
    === FIX SET-FAULT-APPLY-MODE-BEFORE-SET ===
    traffic_light_set_fault вызывает apply_fault_mode ДО
-   s_fault = fault по той же причине.
+   s_fault = fault.
+
+   === FIX RT-CHANNELS ===
+   КЛЮЧЕВАЯ ПРАВКА. В traffic_light_check_faults добавлена
+   ранняя защита:
+     if (role==SLAVE && node_mask_pending()) return;
+   Пока NODE ждёт apply_utc_ms (c: уже пришёл, маска ещё не
+   применена), SR находится в СТАРОЙ маске, а
+   s_expected_mask_from_root — уже в НОВОЙ. Без этой защиты
+   check_faults на NODE за ~150 мс до применения маски
+   сгенерирует ложный SHORT_GND (SR=1 по старой маске, но
+   канал «не должен быть ON» по новой → V_IN present while OFF
+   или наоборот).
+
+   Защита на уровне check_faults (а не только в mux_task.c) —
+   чтобы любой вызов (mux_task, будущие места) был безопасен.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -35,6 +48,7 @@
 #include "config_manager.h"
 #include "transport.h"
 #include "wifi_mqtt.h"
+#include "node_proto.h"      /* === FIX RT-CHANNELS: node_mask_pending() === */
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
@@ -203,6 +217,17 @@ void try_recovery(uint32_t now_ms, uint32_t *blink_last)
 {
     (void)blink_last;
     if (transport_is_cfg_rx_in_progress()) return;
+
+    /* === FIX RT-CHANNELS ===
+       Если на NODE pending-маска (c: пришёл, apply_utc_ms ещё не
+       наступил), recovery не имеет смысла: каналы ещё не в новой
+       маске. Ждём применения — иначе try_recovery «починит»
+       несуществующую проблему. */
+    if (g_config.role == DEVICE_ROLE_SLAVE && node_mask_pending()) {
+        s_last_recovery_ms = now_ms;
+        return;
+    }
+    /* === END FIX RT-CHANNELS === */
 
     traffic_fault_info_t snap[TRAFFIC_FAULT_MAX];
     uint8_t cnt = 0;
@@ -396,11 +421,28 @@ uint8_t classify_channel(uint8_t ch, bool should_be_on,
    traffic_light_check_faults
    === FIX SHORT-GND-CONFIRM ===
    === FIX CHECK-FAULTS-APPLY-MODE ===
+   === FIX RT-CHANNELS ===
    ============================================================ */
 void traffic_light_check_faults(const mux_data_t *data)
 {
     if (s_state != TRAFFIC_STATE_RUNNING) return;
     if (!data || !data->valid) return;
+
+    /* === FIX RT-CHANNELS ===
+       NODE: пока pending-маска не применена, SR в СТАРОЙ маске,
+       а s_expected_mask_from_root — уже в НОВОЙ (если бы мы её
+       обновили сразу). Но мы её НЕ обновляем до применения
+       (см. node_proto.c → node_apply_c_mask вызывается только
+       из scheduler). Тем не менее, если пользователь отправил
+       новый c:, s_expected_mask_from_root мог быть обновлён на
+       предыдущей итерации (см. traffic_light_apply_mask) —
+       защищаемся на всякий случай. Любой вызов check_faults
+       безопасен. */
+    if (g_config.role == DEVICE_ROLE_SLAVE && node_mask_pending()) {
+        ESP_LOGD(TAG, "check_faults: RT-mask pending → skip");
+        return;
+    }
+    /* === END FIX RT-CHANNELS === */
 
     if (g_config.role == DEVICE_ROLE_SLAVE && s_fault_from_remote_ex) {
         return;
@@ -611,11 +653,7 @@ void traffic_light_check_faults(const mux_data_t *data)
         /* === FIX CHECK-FAULTS-APPLY-MODE ===
            apply_fault_mode вызываем ДО s_fault = nf, чтобы
            set_all_off() внутри него увидел fault_active() == false
-           и реально выключил каналы. Иначе каналы остаются
-           работать по старой маске, а s_fault = YELLOW_BLINK.
-
-           apply_fault_mode быстрая (sr_output_off × 16 +
-           wifi_mqtt_publish_event) — под s_mutex допустимо. */
+           и реально выключил каналы. */
         if (!already && was_none) {
             apply_fault_mode(nf);
         }

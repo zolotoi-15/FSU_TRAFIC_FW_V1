@@ -17,9 +17,24 @@
 
    === FIX LEAD-MS-RUNTIME ===
        Команды "sync_lead" (get) и "sync_lead:<ms>" (set) —
-       меняют g_sync_lead_ms (задержка ROOT между отправкой c:
-       и локальным apply_stage_dd). Валидация [50..1000] мс
-       в sync_config_set_lead_ms().
+       меняют g_sync_lead_ms. Теперь это ТОЛЬКО fallback: при
+       валидном UTC ROOT/NODE применяют маску по apply_utc_ms
+       (см. root_apply_stage_sync_first / node_mask_scheduler_task).
+       lead_ms остаётся запасным путём, если UTC недоступен.
+
+   === FIX RT-CHANNELS ===
+       config:reload: после config_load() + mqtt_apply_config_runtime()
+       стартуем трафик через traffic_light_start_with_red() +
+       root_apply_stage_sync_first(0, ...) — это первый c: с
+       UTC-таймингом, чтобы ROOT и NODE включили красный
+       ОДНОВРЕМЕННО. Раньше start_with_red() на ROOT вызывал
+       apply_stage_dd(0) локально без c: — NODE получал c: только
+       на следующем refresh от phase_sync_task (до 300 мс
+       рассинхрона на первом включении).
+
+       traffic:start при ALL_OFF — тоже через start_with_red() +
+       root_apply_stage_sync_first(0, ...) для одновременного
+       включения.
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -31,6 +46,8 @@
 #include "can_bus.h"
 #include "shift_register.h"
 #include "sync_config.h"
+#include "root_wd.h"        /* === FIX RT-CHANNELS: send_sync_to_node_async_utc === */
+#include "time_sync.h"      /* === FIX RT-CHANNELS: time_sync_get_utc_ms === */
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
@@ -44,6 +61,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include "app_shared.h"
+
 
 static const char *TAG = "mqtt_cmd";
 #define NVS_NS_PENDING   "pending_cfg"
@@ -296,12 +315,79 @@ static bool parse_hex(const char *p, uint8_t *buf, size_t max, size_t *out_n)
 }
 
 /* ============================================================
+   === FIX RT-CHANNELS ===
+   root_start_traffic_rt — старт трафика на ROOT с одновременным
+   включением каналов на ROOT и NODE по UTC.
+
+   Используется:
+     - config:reload с auto_start
+     - traffic:start при восстановлении из ALL_OFF
+
+   Логика:
+     1. traffic_light_start_with_red() на ROOT — подготавливает
+        состояние (STOPPED→RUNNING, phase=0), но НЕ включает
+        каналы сразу (start_with_red на ROOT пока вызывает
+        apply_stage_dd(0) — это первый локальный старт, который
+        мы перезапишем ниже через root_apply_stage_sync_first).
+        На NODE start_with_red уходит в STANDBY (follow_root).
+     2. root_apply_stage_sync_first(0, dur):
+        - вычисляет apply_utc_ms = now_utc + 150;
+        - шлёт c:0:...:red с apply_utc_ms → NODE планирует;
+        - ROOT ждёт до apply_utc_ms;
+        - ROOT применяет маску 0 локально.
+     3. Если UTC недоступен — fallback на lead_ms внутри
+        root_apply_stage_sync_first.
+
+   Внимание: root_apply_stage_sync_first — static в traffic_light.c.
+   Чтобы вызвать его из mqtt_cmd.c, используем публичный
+   force_phase(0, ...), который внутри также идёт через
+   root_apply_stage_sync_first. Но force_phase выставляет
+   s_phase_start_ms = now - phase_ms и s_state = RUNNING —
+   это нам и нужно после start_with_red. */
+static void root_start_traffic_rt(void)
+{
+    if (g_config.role != DEVICE_ROLE_MASTER) return;
+    if (!transport_is_lora()) {
+        /* Без LoRa NODE не существует — просто локальный старт. */
+        traffic_light_start_with_red();
+        return;
+    }
+
+    /* Снимаем возможный fault. */
+    s_fault_from_remote_ex = true;
+    traffic_light_set_fault(TRAFFIC_FAULT_NONE);
+    s_fault_from_remote_ex = false;
+
+    /* Убеждаемся, что ROOT в состоянии RUNNING/phase=0. */
+    traffic_light_start_with_red();
+
+    /* Одновременное включение каналов по UTC. force_phase(0, 0, dur)
+       внутри вызовет root_apply_stage_sync_first(0, dur): отправит
+       c:0:...:red с apply_utc_ms на NODE, дождётся UTC и применит
+       маску 0 локально. */
+    uint32_t dur0 = traffic_light_stage_duration_ms(0);
+    esp_err_t ferr = traffic_light_force_phase(0, 0, dur0);
+    if (ferr != ESP_OK) {
+        ESP_LOGW(TAG, "root_start_traffic_rt: force_phase(0) failed: %s "
+                      "→ channels may be out of sync",
+                 esp_err_to_name(ferr));
+    } else {
+        ESP_LOGI(TAG, "root_start_traffic_rt: c:0 (red) sent with "
+                      "apply_utc_ms, ROOT+NODE channels synced");
+    }
+}
+/* === END FIX RT-CHANNELS === */
+
+/* ============================================================
    mqtt_handle_command
    === SIMPLIFIED-NO-CFG ===
    - config:reload: только локальное обновление, без transport_send_cfg
    - traffic:stop / traffic:mode: без сброса cfg-трекинга (его больше нет)
    === FIX LEAD-MS-RUNTIME ===
    - sync_lead / sync_lead:<ms>
+   === FIX RT-CHANNELS ===
+   - config:reload с auto_start → root_start_traffic_rt()
+   - traffic:start из ALL_OFF → root_start_traffic_rt()
    ============================================================ */
 void mqtt_handle_command(const char *data, int data_len)
 {
@@ -374,32 +460,34 @@ void mqtt_handle_command(const char *data, int data_len)
         goto publish;
     }
     if (strcmp(cmd, "traffic:start") == 0) {
-    /* === FIX ALL-OFF-MANUAL-ONLY ===
-       Если ROOT в ALL_OFF — сначала снять fault, потом
-       start_with_red (восстановление с красного). Иначе — обычный
-       traffic_light_start(). */
-    if (traffic_light_get_fault() == TRAFFIC_FAULT_ALL_OFF) {
-        ESP_LOGW(TAG, "traffic:start → recover from ALL_OFF");
-        traffic_light_stop();
-        traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-        traffic_light_start_with_red();
-        transport_send_cmd_noack("traffic:start", strlen("traffic:start"));
-        wifi_mqtt_publish_event("recover", "manual:traffic_start", NULL, 0);
-    } else {
-        traffic_light_start();
-    }
-    /* === END FIX ALL-OFF-MANUAL-ONLY === */
-    changed = true;
-    goto publish;
-}
+        /* === FIX ALL-OFF-MANUAL-ONLY ===
+           Если ROOT в ALL_OFF — сначала снять fault, потом
+           start_with_red (восстановление с красного). Иначе — обычный
+           traffic_light_start().
 
-    /* === SIMPLIFIED-NO-CFG: без сброса cfg-трекинга === */
+           === FIX RT-CHANNELS ===
+           При восстановлении из ALL_OFF используем
+           root_start_traffic_rt(): c:0:red с UTC-таймингом, чтобы
+           ROOT и NODE включили красный ОДНОВРЕМЕННО. Раньше
+           transport_send_cmd_noack("traffic:start") + локальный
+           start_with_red давали рассинхрон до 300 мс. */
+        if (traffic_light_get_fault() == TRAFFIC_FAULT_ALL_OFF) {
+            ESP_LOGW(TAG, "traffic:start → recover from ALL_OFF (RT)");
+            root_start_traffic_rt();
+            wifi_mqtt_publish_event("recover", "manual:traffic_start", NULL, 0);
+        } else {
+            traffic_light_start();
+        }
+        /* === END FIX RT-CHANNELS === */
+        changed = true;
+        goto publish;
+    }
+
     if (strcmp(cmd, "traffic:stop") == 0) {
         traffic_light_stop();
         changed = true;
         goto publish;
     }
-    /* === END SIMPLIFIED-NO-CFG === */
 
     if (strcmp(cmd, "traffic:pause")  == 0) {
         traffic_light_pause();  changed = true; goto publish;
@@ -448,7 +536,6 @@ void mqtt_handle_command(const char *data, int data_len)
         }
     }
 
-    /* === SIMPLIFIED-NO-CFG: без сброса cfg-трекинга === */
     {
         int mode = 0;
         if (sscanf(cmd, "traffic:mode:%d", &mode) == 1) {
@@ -464,7 +551,6 @@ void mqtt_handle_command(const char *data, int data_len)
             goto publish;
         }
     }
-    /* === END SIMPLIFIED-NO-CFG === */
 
     {
         int tch = -1;
@@ -549,8 +635,10 @@ void mqtt_handle_command(const char *data, int data_len)
     }
 
     /* === FIX LEAD-MS-RUNTIME ===
-       sync_lead:<ms> — изменить задержку ROOT между отправкой c:
-       и локальным apply_stage_dd.
+       sync_lead:<ms> — изменить fallback-задержку ROOT на случай,
+       если UTC недоступен (apply_utc_ms == 0 в c:).
+       При валидном UTC эта настройка НЕ используется —
+       ROOT/NODE применяют маску по apply_utc_ms.
        sync_lead     — прочитать текущее значение (в лог).
        Локальная команда (не транслируется на NODE). */
     {
@@ -574,7 +662,8 @@ void mqtt_handle_command(const char *data, int data_len)
             goto publish;
         }
         if (strcmp(cmd, "sync_lead") == 0) {
-            ESP_LOGI(TAG, "sync_lead=%lu ms",
+            ESP_LOGI(TAG, "sync_lead=%lu ms (fallback, active only if UTC "
+                          "unavailable)",
                      (unsigned long)sync_config_get_lead_ms());
             changed = true;
             goto publish;
@@ -584,17 +673,30 @@ void mqtt_handle_command(const char *data, int data_len)
 
     /* === SIMPLIFIED-NO-CFG ===
        config:reload — только локальное обновление ROOT.
-       NODE получит новые маски через 'c:' на следующей смене фазы. */
+       NODE получит новые маски через 'c:' на следующей смене фазы.
+
+       === FIX RT-CHANNELS ===
+       Если auto_start включён — используем root_start_traffic_rt():
+       после перезагрузки конфига ROOT и NODE включат красный
+       ОДНОВРЕМЕННО (c:0 с apply_utc_ms). Раньше был локальный
+       start_with_red() на ROOT без c: — NODE получал маску только
+       на следующем refresh от phase_sync_task (до 300 мс). */
     if (strcmp(cmd, "config:reload") == 0) {
         ESP_LOGI(TAG, "config:reload → reading NVS");
         traffic_light_stop();
         config_load();
         mqtt_apply_config_runtime();
-        ESP_LOGI(TAG, "config:reload done (NODE получит маски через c:)");
+
+        if (g_config.traffic.enabled && g_config.traffic.auto_start) {
+            ESP_LOGW(TAG, "config:reload: auto_start → root_start_traffic_rt");
+            root_start_traffic_rt();
+        }
+
+        ESP_LOGI(TAG, "config:reload done (NODE маски через c: с UTC)");
         changed = true;
         goto publish;
     }
-    /* === END SIMPLIFIED-NO-CFG === */
+    /* === END SIMPLIFIED-NO-CFG + FIX RT-CHANNELS === */
 
     if (strcmp(cmd, "nvs:erase") == 0) {
         ESP_LOGW(TAG, "nvs:erase → reboot");
@@ -608,9 +710,6 @@ void mqtt_handle_command(const char *data, int data_len)
         esp_restart();
     }
 
-     /* === FIX LEAD-MS-NVS ===
-       sync_lead:erase — стереть сохранённый lead_ms из NVS,
-       вернуть дефолт 150 мс. */
     if (strcmp(cmd, "sync_lead:erase") == 0) {
         esp_err_t e = sync_config_nvs_erase();
         if (s_mqtt_connected && g_mqtt_client) {
@@ -626,8 +725,7 @@ void mqtt_handle_command(const char *data, int data_len)
         changed = true;
         goto publish;
     }
-    /* === END FIX LEAD-MS-NVS === */
-    
+
     ESP_LOGW(TAG, "Unknown: %s", cmd);
     return;
 
