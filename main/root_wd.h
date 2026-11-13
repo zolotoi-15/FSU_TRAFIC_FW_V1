@@ -41,12 +41,7 @@ uint32_t send_channels_to_node_no_display(uint8_t phase, uint32_t phase_ms,
 
 /* === FIX RT-CHANNELS ===
    UTC-тайминг: c: содержит apply_utc_ms — момент, когда и ROOT, и
-   NODE должны переключить каналы. ToA/джиттер LoRa не влияют на
-   синхронность — оба смотрят на UTC.
-
-   apply_utc_ms == 0 → fallback на старое поведение (сразу по
-   приходу c:, + lead_ms на ROOT). Используется, когда время ещё
-   не синхронизировано (нет SNTP/RTC/DS1307). */
+   NODE должны переключить каналы. */
 uint32_t send_sync_to_node_async_utc(uint8_t phase, uint32_t phase_ms,
                                      uint32_t duration_ms,
                                      uint64_t apply_utc_ms,
@@ -56,10 +51,27 @@ uint32_t send_channels_to_node_utc(uint8_t phase, uint32_t phase_ms,
                                    uint32_t duration_ms,
                                    uint64_t apply_utc_ms, bool force);
 
-/* Хелпер: вычислить ближайший apply_utc_ms = now + lead, кратный 10 мс.
-   Возвращает 0, если UTC ещё не валиден. */
 uint64_t root_compute_apply_utc_ms(void);
 /* === END FIX RT-CHANNELS === */
+
+/* === FIX LINK-LOSS-8S-RECOVERY ===
+   Специальная версия send_channels_to_node, которая шлёт c:
+   ДАЖЕ при traffic_light_fault_has_priority() == true.
+
+   Используется ТОЛЬКО в recovery-ветке root_node_watchdog_task
+   (has_node && !was_connected) и в wait_node_ack (node_confirmed
+   || timeout). В этих сценариях ROOT сам только что вышел из
+   ALL_OFF и должен доставить NODE c:0:...:red, чтобы тот
+   вышел из своего ALL_OFF.
+
+   Обычный send_channels_to_node / send_channels_to_node_utc
+   блокирует c: при fault_active(), потому что «аварией
+   управляет fault:*, не c:». Recovery-версия обходит это —
+   ROOT и NODE синхронно выходят из ALL_OFF через один c: с
+   apply_utc_ms. */
+uint32_t send_channels_to_node_recovery(uint8_t phase, uint32_t phase_ms,
+                                        uint32_t duration_ms, bool force);
+/* === END FIX LINK-LOSS-8S-RECOVERY === */
 
 extern volatile bool     s_cfg_ack;
 extern volatile bool     s_cfg_pushing;

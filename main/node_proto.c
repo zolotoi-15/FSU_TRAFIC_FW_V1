@@ -1,22 +1,33 @@
 /* ============================================================
    node_proto.c — NODE/ROOT протокол.
 
-   === FIX RT-CHANNELS ===
-   NODE: c: содержит apply_utc_ms. Если оно != 0 и UTC валиден,
-   NODE откладывает применение маски до этого момента в
-   node_mask_scheduler_task (шаг 5 мс). Пока маска в pending:
-     - traffic_light_check_faults НЕ вызывается для каналов
-       из pending (иначе ложный SHORT_GND на 150 мс, пока SR
-       ещё в старой маске, а s_active_mask_from_root уже новая);
-     - s_expected_mask_from_root / s_active_mask_from_root
-       обновляются В МОМЕНТ ПРИМЕНЕНИЯ, а не при приходе c:.
-   Реализовано через s_pending_mask_valid — mux_task и
-   check_faults смотрят на этот флаг.
+   === FIX LINK-LOSS-8S ===
+   NODE: если от ROOT нет данных (CMD/ping/sync/time/fault/c:)
+   > 8 с — выключить ВСЕ каналы:
+     - traffic_light_stop()
+     - traffic_light_set_fault(ALL_OFF)
+     - traffic_light_set_state_recovering()
+     - sync_handshake_node_start()
 
-   Если apply_utc_ms == 0 (refresh c:, fallback) — применяем
-   сразу, как раньше.
+   Раньше было 6 с (NODE_ROOT_LOST_MS=6000). Теперь 8 с — как
+   на ROOT (NODE_DATA_LOST_MS=8000). Симметрично.
 
-   Остальные FIX сохранены.
+   === FIX MASK-LOST-10S ===
+   NODE в RUNNING, но c: от ROOT не приходил > 10 с → REBOOT.
+   Отдельный счётчик s_last_c_ms (не путать с
+   s_last_root_data_ms, который обновляется на ЛЮБОЙ пакет
+   ROOT: ping/time/fault:none/...).
+
+   Сценарий: ROOT шлёт ping/time, но c: теряется (битый пакет,
+   рассинхрон фаз, потерянный T_CMD). NODE «жив» по связи, но
+   каналы не переключаются → перезагрузка через 10 с.
+
+   Если c: не приходил ни разу — base = s_last_root_data_ms.
+   Если ROOT вообще молчит — раньше сработает root_lost (8 с).
+
+   Остальные FIX сохранены (RT-CHANNELS, FAULT-HAS-TOP-PRIORITY,
+   C-BUFFER-BEFORE-START, NODE-STATUS-ROOT-FORMAT, T_CHANNELS,
+   STATUS-NO-CHANNELS, T-CHANNELS-NOT-COMBINED и т.д.).
    ============================================================ */
 
 #include "node_proto.h"
@@ -67,7 +78,20 @@ static uint32_t s_last_channels_ms = 0;
 #define NODE_STATUS_SYNC_MS        300
 #define STATUS_FORCE_MS            500
 
-#define NODE_ROOT_LOST_MS          6000
+/* === FIX LINK-LOSS-8S ===
+   NODE: если от ROOT нет данных > 8 с — ALL_OFF + recovering +
+   sync_handshake. Симметрично ROOT (root_wd.c → NODE_DATA_LOST_MS=8000).
+   Было 6000. */
+#define NODE_ROOT_LOST_MS          8000
+/* === END FIX LINK-LOSS-8S === */
+
+/* === FIX MASK-LOST-10S ===
+   NODE в RUNNING, но c: не приходил > 10 с — REBOOT.
+   Отдельный счётчик: s_last_root_data_ms обновляется на ЛЮБОЙ
+   пакет ROOT (ping/time/fault:none/...), а нам нужен именно c:. */
+#define NODE_MASK_LOST_MS          10000
+static volatile uint32_t s_last_c_ms = 0;
+/* === END FIX MASK-LOST-10S === */
 
 #define UTC_DELTA_MAX_MS_LOCAL     3000
 #define SYNC_MAX_DRIFT_MS_LOCAL    500
@@ -86,6 +110,7 @@ static volatile uint32_t s_last_root_data_ms = 0;
 static volatile bool s_root_lost_flag = false;
 static volatile bool s_c_received_since_start = false;
 
+/* === FIX C-BUFFER-BEFORE-START === */
 static volatile bool     s_pending_c_valid = false;
 static volatile uint8_t  s_pending_c_phase = 0;
 static volatile uint32_t s_pending_c_pm    = 0;
@@ -93,14 +118,10 @@ static volatile uint16_t s_pending_c_on    = 0;
 static volatile uint16_t s_pending_c_blink = 0;
 static volatile uint32_t s_pending_c_dur   = 0;
 static volatile uint64_t s_pending_c_end   = 0;
+/* === END FIX C-BUFFER-BEFORE-START === */
 
 /* === FIX RT-CHANNELS ===
-   Отложенное применение маски по UTC. NODE получает c: с
-   apply_utc_ms и применяет маску ровно в этот момент.
-   Пока s_pending_mask_valid — mux_task/check_faults пропускают
-   проверку каналов, чтобы не сгенерировать ложный SHORT_GND
-   (SR ещё в старой маске, s_active_mask_from_root уже новая
-   ещё не применена — но мы и не обновляем её до применения). */
+   Отложенное применение маски по UTC. */
 typedef struct {
     uint8_t  ph;
     uint32_t pm;
@@ -210,7 +231,6 @@ static void node_schedule_mask_apply(uint8_t ph, uint32_t pm,
                                      uint64_t apply_utc_ms)
 {
     if (!s_pending_mask_mtx) {
-        /* scheduler ещё не запущен — применяем сразу (fallback) */
         node_apply_c_mask(ph, pm, on16, blink16, dur, end_utc_ms,
                           end_utc_ms != 0);
         return;
@@ -251,7 +271,7 @@ static void node_mask_scheduler_task(void *arg)
         uint64_t now = time_sync_get_utc_ms();
         if (now == 0) {
             /* Время пропало — применяем сразу, чтобы не залипнуть.
-               apply_utc_ms здесь не нужен (мы не ждём). */
+               apply_utc_ms здесь не нужен: мы не ждём. */
             pending_mask_t p;
             xSemaphoreTake(s_pending_mask_mtx, portMAX_DELAY);
             p = s_pending_mask;
@@ -288,6 +308,9 @@ static void node_mask_scheduler_task(void *arg)
 
 /* ============================================================
    on_cmd_from_root
+   === FIX ROOT-RETURN-CLEARS-LOCAL-ALL-OFF ===
+   === FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE ===
+   === FIX MASK-LOST-10S === (обновление s_last_c_ms)
    ============================================================ */
 static void on_cmd_from_root(const char *cmd, size_t len)
 {
@@ -363,6 +386,13 @@ static void on_cmd_from_root(const char *cmd, size_t len)
             return;
         }
 
+        /* === FIX MASK-LOST-10S ===
+           Маска получена (даже если NODE not RUNNING — stash в
+           pending). Обновляем s_last_c_ms — от него watchdog
+           считает «10 с без маски». */
+        s_last_c_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        /* === END FIX MASK-LOST-10S === */
+
         if (!s_node_running) {
             ESP_LOGW(TAG, "c: NODE not RUNNING → stash for later "
                           "(ph=%u)", ph);
@@ -379,11 +409,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         s_c_received_since_start = true;
         s_fault_from_remote_ex = false;
 
-        /* === FIX RT-CHANNELS ===
-           matched >= 7 → есть apply_utc_ms.
-           Если он != 0 — планируем.
-           Если 0 или нет поля (matched < 7) — применяем сразу
-           (refresh c: / fallback). */
         if (matched >= 7 && apply_utc_ms != 0) {
             node_schedule_mask_apply((uint8_t)ph, (uint32_t)pm,
                                      (uint16_t)on_mask, (uint16_t)blink_mask,
@@ -397,7 +422,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
                           (uint32_t)dur, (uint64_t)end_utc_ms,
                           matched >= 6);
         return;
-        /* === END FIX RT-CHANNELS === */
     }
 
     if (strncmp(buf, "fault:none", 10) == 0) {
@@ -609,7 +633,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         s_root_lost_flag = false;
         s_c_received_since_start = false;
         s_pending_c_valid = false;
-        /* pending UTC-mask тоже сбрасываем */
         s_pending_mask_valid = false;
         return;
     }
@@ -1142,11 +1165,13 @@ static void node_send_task(void *arg)
 
 /* ============================================================
    node_link_watchdog_task
+   === FIX LINK-LOSS-8S ===
+   === FIX MASK-LOST-10S ===
    ============================================================ */
 static void node_link_watchdog_task(void *arg)
 {
-    ESP_LOGI(TAG, "node_link_watchdog_task started (timeout=%d ms)",
-             NODE_ROOT_LOST_MS);
+    ESP_LOGI(TAG, "node_link_watchdog_task started (root_lost=%d ms, "
+                  "mask_lost=%d ms)", NODE_ROOT_LOST_MS, NODE_MASK_LOST_MS);
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -1160,8 +1185,29 @@ static void node_link_watchdog_task(void *arg)
 
         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
 
+        /* === FIX MASK-LOST-10S ===
+           NODE в RUNNING, но c: не приходил > 10 с → REBOOT.
+           Если c: не было ни разу — считаем от s_last_root_data_ms.
+           Если и ROOT молчит — раньше сработает root_lost (8 с),
+           и s_node_running станет false — до 10 с не дойдёт. */
+        if (s_node_running) {
+            uint32_t base = s_last_c_ms;
+            if (base == 0) base = s_last_root_data_ms;
+            if (base != 0 && (now - base) > NODE_MASK_LOST_MS) {
+                ESP_LOGE(TAG, "NODE: no c: for %lu ms (> %d) → REBOOT",
+                         (unsigned long)(now - base), NODE_MASK_LOST_MS);
+                node_send_status_now();
+                vTaskDelay(pdMS_TO_TICKS(300));
+                esp_restart();
+            }
+        }
+        /* === END FIX MASK-LOST-10S === */
+
         if (!s_node_running) continue;
 
+        /* === FIX LINK-LOSS-8S: ROOT data lost ===
+           NODE ROOT data lost на 8 с. Symmetric with ROOT
+           (NODE_DATA_LOST_MS=8000). */
         if (!s_c_received_since_start) {
             if (s_last_root_data_ms != 0 &&
                 (now - s_last_root_data_ms) >= (uint32_t)NODE_ROOT_LOST_MS &&
@@ -1196,6 +1242,7 @@ static void node_link_watchdog_task(void *arg)
             s_node_running = false;
             sync_handshake_node_start();
         }
+        /* === END FIX LINK-LOSS-8S === */
     }
 }
 
@@ -1221,17 +1268,13 @@ void node_proto_client_start(const char *host, uint16_t port)
 
 void node_proto_start_tasks(void)
 {
-    /* === FIX RT-CHANNELS: mutex + scheduler task === */
     if (!s_pending_mask_mtx) {
         s_pending_mask_mtx = xSemaphoreCreateMutex();
     }
-    /* === END FIX RT-CHANNELS === */
 
     xTaskCreate(node_send_task,           "node_send", 4096, NULL, 4, NULL);
     xTaskCreate(node_link_watchdog_task,  "node_wd",   3072, NULL, 3, NULL);
-    /* === FIX RT-CHANNELS === */
     xTaskCreate(node_mask_scheduler_task, "node_msk",  3072, NULL, 5, NULL);
-    /* === END FIX RT-CHANNELS === */
 }
 
 void node_proto_start_root_tasks(void)

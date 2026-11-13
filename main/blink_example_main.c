@@ -15,8 +15,16 @@
        LINK_ROOT_EXPECT_MS 10000 → 3000 (NODE STATUS раз в 5 с).
        LINK_NODE_EXPECT_MS 10000 → 2000 (ROOT ping раз в 2 с).
        При 3 пропусках подряд → sync_handshake_root_start() /
-       sync_handshake_node_start(). Это ускоряет восстановление
-       связи с 50 с до 6-9 с + сам ритуал синхронизации.
+       sync_handshake_node_start().
+
+   === FIX LINK-LOSS-8S ===
+       Реальные пороги «выключить каналы» теперь 8 с и живут в:
+         - root_wd.c → root_node_watchdog_task (NODE_DATA_LOST_MS)
+         - node_proto.c → node_link_watchdog_task (NODE_ROOT_LOST_MS)
+       link_monitor_task остаётся вспомогательным — он запускает
+       sync_handshake на 6/9 с. Это НЕ отключает каналы, только
+       ускоряет восстановление связи. 8-секундные ALL_OFF сработают
+       независимо.
    ============================================================ */
 
 #include <stdio.h>
@@ -57,12 +65,12 @@
 #include "fault_handler.h"
 #include "buttons.h"
 #include "root_wd.h"
-#include "sync_handshake.h"     /* === FIX SYNC-HANDSHAKE === */
+#include "sync_handshake.h"
 #include "app_shared.h"
 #include "ble_transport.h"
 #include "sync_config.h"
 #include "connectivity.h"
-#include "modem_ppp.h"          /* ← ДОБАВИТЬ: modem_ppp_get_netif() */
+#include "modem_ppp.h"
 #include "fault_handler.h"
 
 extern const uint8_t config_json_start[] asm("_binary_config_json_start");
@@ -80,7 +88,11 @@ static const char *TAG = "board";
    NODE ждёт CMD/ping/sync от ROOT (HEARTBEAT_INTERVAL_MS = 2000 мс).
 
    LINK_*_EXPECT_MS — окно опроса счётчиков. LINK_LOST_MISSED_PKTS=3.
-   Детект потери: ROOT 3×3=9 с, NODE 3×2=6 с. */
+   Детект потери: ROOT 3×3=9 с, NODE 3×2=6 с.
+
+   === FIX LINK-LOSS-8S ===
+   Не путать с реальными ALL_OFF-порогами (8 с):
+   LINK_LOST_* — только ускорение sync_handshake. */
 #define LINK_ROOT_EXPECT_MS   3000
 #define LINK_NODE_EXPECT_MS   2000
 /* === END FIX FAST-LINK-MONITOR === */
@@ -127,6 +139,15 @@ bool link_monitor_node_lost(void) { return s_node_missed_ping   >= LINK_LOST_MIS
 /* ============================================================
    link_monitor_task
    === FIX LINK-LOSS-SMART + FAST-LINK-MONITOR + SYNC-HANDSHAKE ===
+
+   Этот таск НЕ выключает каналы. Он только:
+     - ведёт счётчики пропущенных пакетов;
+     - при 3 пропусках подряд запускает sync_handshake;
+     - логирует раз в 30 с дельту времени на NODE.
+
+   Реальные «8 с тишины → ALL_OFF» живут в:
+     - root_wd.c → root_node_watchdog_task  (NODE_DATA_LOST_MS)
+     - node_proto.c → node_link_watchdog_task (NODE_ROOT_LOST_MS)
    ============================================================ */
 static void link_monitor_task(void *arg)
 {
@@ -164,11 +185,7 @@ static void link_monitor_task(void *arg)
                         ESP_LOGE(TAG, "ROOT: %u missed STATUS → link LOST "
                                       "→ sync_handshake",
                                  LINK_LOST_MISSED_PKTS);
-                        /* === FIX SYNC-HANDSHAKE ===
-                           Сразу запускаем ритуал восстановления —
-                           без ожидания watchdog-таски. */
                         sync_handshake_root_start();
-                        /* === END FIX SYNC-HANDSHAKE === */
                     }
                 } else {
                     s_root_missed_status = 0;
@@ -194,9 +211,7 @@ static void link_monitor_task(void *arg)
                         ESP_LOGE(TAG, "NODE: %u missed ping/CMD → link LOST "
                                       "→ sync_handshake",
                                  LINK_LOST_MISSED_PKTS);
-                        /* === FIX SYNC-HANDSHAKE === */
                         sync_handshake_node_start();
-                        /* === END FIX SYNC-HANDSHAKE === */
                     }
                 } else {
                     s_node_missed_ping = 0;
@@ -229,15 +244,7 @@ static void on_got_ip(void *arg, esp_event_base_t base,
 
     ESP_LOGI(TAG, "GOT_IP → starting SNTP + MQTT");
 
-    /* === FIX DEFAULT-NETIF-BEFORE-SNTP ===
-       on_got_ip вызывается ИЗНУТРИ modem_ppp_start (IP_EVENT PPP).
-       esp_netif_set_default_netif в connectivity.c выполнится
-       ПОСЛЕ возврата modem_ppp_start, т.е. уже после
-       time_sync_start_sntp(). SNTP-сокет создастся на старом
-       default netif (ethernet/STA) → ответа от pool.ntp.org
-       не будет → time_sync не станет valid → root_wd вечно
-       висит в "time_sync not valid → wait".
-       Выставляем default netif ЗДЕСЬ, до SNTP. */
+    /* === FIX DEFAULT-NETIF-BEFORE-SNTP === */
     esp_netif_t *ppp_netif = modem_ppp_get_netif();
     if (ppp_netif) {
         esp_netif_set_default_netif(ppp_netif);
@@ -506,7 +513,8 @@ static void ensure_valid_cfg(void)
 void app_main(void)
 {
     ESP_LOGI(TAG, "Board bring-up (ROOT/NODE) — NO WIFI, LoRa only, "
-                  "FAST-LINK-MONITOR + SYNC-HANDSHAKE");
+                  "FAST-LINK-MONITOR + SYNC-HANDSHAKE + "
+                  "LINK-LOSS-8S + MASK-LOST-10S");
 
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
@@ -516,13 +524,10 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_ret);
 
-/* === FIX LEAD-MS-NVS ===
-       Загружаем lead_ms из NVS до traffic_light_init(). Если
-       в NVS пусто — sync_config_init() оставит SYNC_LEAD_MS_DEFAULT
-       (150 мс). */
+/* === FIX LEAD-MS-NVS === */
     sync_config_init();
     /* === END FIX LEAD-MS-NVS === */
-    
+
     log_heap("app_main start");
 
     bool pending_applied = run_cfg_load();
@@ -565,8 +570,6 @@ void app_main(void)
 
     transport_init();
     node_proto_register_callbacks();
-
-    
 
     /* === FIX SYNC-DELAY-ZERO === */
     blink_reset_rtt();

@@ -12,30 +12,35 @@
        фрагменте.
 
    === FIX T_CHANNELS ===
-       T_CHANNELS = 6 — снимок 16 каналов NODE (1.4 КБ → 35
+       T_CHANNELS = 6 — снимок 16 каналов NODE (1.4 КБ → 27
        фрагментов). noack.
 
    === FIX BLE-TRANSPORT ===
        Единая точка transport_handle_raw_rx для LoRa RX и BLE RX.
-       BLE-сервер (ble_transport.c) вызывает transport_handle_raw_rx
-       при Write в CFG/CMD — те же байты, что и по LoRa. Логика
-       фрагментации/ACK/accum — общая.
-
-       transport_send_raw — отправка одного пакета через BLE (если
-       подключён) или LoRa. Основной путь — lora_send_fragmented*
-       (LoRa), BLE используется для конфигурации (ble_transport.c
-       сам шлёт JSON в RESP, не через transport_send_raw).
 
    === FIX RX-TYPE-RANGE-GUARD ===
-       s_last_done_seq[] и s_next_frag_idx[] имеют размер 7 и
-       индексируются по type (1..6). Битый пакет с type=0 или
-       type>6 приводил к записи за границы массива (UB). Проверка
-       типа — ДО любых обращений к массивам.
+       Проверка type до любых обращений к массивам.
 
    === FIX SEND-RAW-SIZE-GUARD ===
        transport_send_raw не фрагментирует — при len > PKT_MAX-4
-       уходит только первый кусок (memcpy переполняет buf). Явный
-       лог + ESP_ERR_INVALID_SIZE.
+       ошибка ESP_ERR_INVALID_SIZE.
+
+   === FIX LINK-LOSS-8S-NO-FALSE-ALLOFF ===
+       КЛЮЧЕВАЯ ПРАВКА.
+       Раньше s_last_node_msg_ms (ROOT) обновлялся только при
+       ПОЛНОЙ сборке T_STATUS/T_EVT/T_CHANNELS. При потере
+       фрагмента (frag gap) пакет дропался, счётчик не
+       обновлялся → через 8 с ROOT видел «no NODE data» →
+       ALL_OFF, хотя NODE жив и слал ACK на c:.
+
+       Теперь s_last_node_msg_ms обновляется на ЛЮБОЙ RX от
+       NODE (включая T_ACK и битые фрагменты). Аналогично на
+       NODE: s_last_sync_ms обновляется на любой T_ACK/T_CMD
+       от ROOT.
+
+       Это правильнее семантически: «NODE жив» ≠ «NODE собрал
+       STATUS». Проблема сборки STATUS — отдельная, не должна
+       триггерить ALL_OFF.
    ============================================================ */
 
 #include "transport.h"
@@ -125,6 +130,11 @@ static volatile uint8_t s_next_frag_idx[7] = {0, 0, 0, 0, 0, 0, 0};
 static uint8_t s_last_done_seq[7] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 extern volatile uint32_t s_last_node_msg_ms;
+
+/* === FIX LINK-LOSS-8S-NO-FALSE-ALLOFF ===
+   s_last_sync_ms (NODE) — extern из blink_example_main.c. */
+extern volatile uint32_t s_last_sync_ms;
+/* === END FIX LINK-LOSS-8S-NO-FALSE-ALLOFF === */
 
 /* ============================================================
    SIMPLIFIED-NO-CFG: stub-функции
@@ -389,7 +399,6 @@ static esp_err_t lora_send_fragmented_noack(uint8_t type,
     size_t sent = 0;
     int frag_idx = 0;
     int frag_total = (len + FRAG_DATA_MAX - 1) / FRAG_DATA_MAX;
-    /* Для больших пакетов (CHANNELS = 30 фрагментов) нужен больший gap */
     uint32_t base_gap = FRAG_GAP_MS;
     if (frag_total >= 10) base_gap = 300;
     if (frag_total >= 20) base_gap = 400;
@@ -443,6 +452,7 @@ static void lora_raw_handler(const uint8_t *data, size_t len)
    transport_handle_raw_rx — общая обработка (LoRa + BLE)
    === FIX BLE-TRANSPORT ===
    === FIX RX-TYPE-RANGE-GUARD ===
+   === FIX LINK-LOSS-8S-NO-FALSE-ALLOFF ===
    ============================================================ */
 void transport_handle_raw_rx(const uint8_t *data, size_t len)
 {
@@ -459,6 +469,32 @@ void transport_handle_raw_rx(const uint8_t *data, size_t len)
     uint8_t seq  = data[2];
     uint8_t plen = data[3];
 
+    /* === FIX LINK-LOSS-8S-NO-FALSE-ALLOFF ===
+       КЛЮЧЕВОЕ. Обновляем «признак жизни» ДО любых проверок
+       типа и фрагментации. Любой RX от противоположной стороны
+       означает, что связь есть.
+
+       ROOT: s_last_node_msg_ms — на любой RX от NODE
+             (включая T_ACK, битые фрагменты, неизвестный type).
+             root_wd.c → FIX LINK-LOSS-8S смотрит на него.
+       NODE: s_last_sync_ms — на любой T_ACK/T_CMD от ROOT.
+             blink_example_main.c → link_monitor_task смотрит
+             на s_last_sync_ms.
+
+       Раньше s_last_node_msg_ms обновлялся только при полной
+       сборке T_STATUS/T_EVT/T_CHANNELS (в блоке ниже). При
+       frag gap (коллизии с c: refresh) STATUS дропался,
+       счётчик замирал → через 8 с ROOT видел «no NODE data» →
+       ALL_OFF, хотя NODE жив и слал ACK на c:. */
+    if (g_config.role == DEVICE_ROLE_MASTER) {
+        s_last_node_msg_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    } else {
+        if (type == T_ACK || type == T_CMD) {
+            s_last_sync_ms = (uint32_t)(esp_timer_get_time() / 1000);
+        }
+    }
+    /* === END FIX LINK-LOSS-8S-NO-FALSE-ALLOFF === */
+
     if (type == T_ACK) {
 #if TRANSPORT_LOG_RX
         ESP_LOGI(TAG, "RX ACK seq=%u (last sent %u)", seq, s_last_ack_seq);
@@ -468,12 +504,7 @@ void transport_handle_raw_rx(const uint8_t *data, size_t len)
         return;
     }
 
-    /* === FIX RX-TYPE-RANGE-GUARD ===
-       s_last_done_seq[] и s_next_frag_idx[] имеют размер 7 и
-       индексируются по type (1..6). Если пришёл битый пакет с
-       type=0 или type>6 — раньше мы писали за границы массива
-       (UB → corrupt соседних переменных). Проверяем ДО любых
-       обращений. */
+    /* === FIX RX-TYPE-RANGE-GUARD === */
     if (type < T_CMD || type > T_CHANNELS) {
 #if TRANSPORT_LOG_RX
         ESP_LOGW(TAG, "RX unknown type=%u (len=%u) → drop",
@@ -482,12 +513,6 @@ void transport_handle_raw_rx(const uint8_t *data, size_t len)
         return;
     }
     /* === END FIX RX-TYPE-RANGE-GUARD === */
-
-    if (type == T_STATUS || type == T_EVT || type == T_CHANNELS) {
-        if (g_config.role == DEVICE_ROLE_MASTER) {
-            s_last_node_msg_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        }
-    }
 
     char  *accum = NULL;
     volatile size_t *accum_len = NULL;
@@ -621,20 +646,13 @@ void transport_handle_raw_rx(const uint8_t *data, size_t len)
     }
 }
 
-/* === FIX BLE-TRANSPORT ===
-   transport_send_raw — отправка одного пакета через BLE (если
-   подключён) или LoRa. Основной путь — lora_send_fragmented*,
-   эта функция для совместимости. */
+/* === FIX BLE-TRANSPORT === */
 esp_err_t transport_send_raw(uint8_t type, const uint8_t *payload, size_t len)
 {
     if (!payload || len == 0) return ESP_ERR_INVALID_ARG;
     if (type < T_CMD || type > T_CHANNELS) return ESP_ERR_INVALID_ARG;
 
-    /* === FIX SEND-RAW-SIZE-GUARD ===
-       transport_send_raw не делает фрагментации — если len >
-       PKT_MAX-4, уйдёт только первый кусок (memcpy переполнит
-       buf). Явный лог + ошибка, чтобы было видно, что пакет
-       слишком большой. */
+    /* === FIX SEND-RAW-SIZE-GUARD === */
     if (len > PKT_MAX - 4) {
         ESP_LOGW(TAG, "transport_send_raw: len=%u > PKT_MAX-4=%u "
                       "(no fragmentation), drop",
@@ -700,7 +718,8 @@ esp_err_t transport_init(void)
         xTaskCreate(ack_tx_task,    "ack_tx",    4096,  NULL, 5, NULL);
         ESP_LOGI(TAG, "Transport = LoRa + BLE, PKT_MAX=%d "
                  "(frag data=%d, hdr=%d, gap=%d ms, "
-                 "STATUS/CHANNELS-NOACK, T_CMD-ACK-ON-LAST)",
+                 "STATUS/CHANNELS-NOACK, T_CMD-ACK-ON-LAST, "
+                 "LINK-LOSS-8S-NO-FALSE-ALLOFF)",
                  PKT_MAX, FRAG_DATA_MAX, FRAG_HDR_SIZE, FRAG_GAP_MS);
         return ESP_OK;
     }

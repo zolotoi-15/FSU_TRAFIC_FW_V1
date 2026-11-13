@@ -2,28 +2,36 @@
    mqtt_fault.c — mirror fault между ROOT и NODE (через MQTT).
 
    === FIX FAULT-LOCAL-FORMAT ===
-   NODE шлёт fault:local:<MODE> без маски, когда сам обнаружил
-   аварию (follow_root). Форматы:
-     fault:local:YELLOW_BLINK
-     fault:local:ALL_OFF
-     fault:local:NONE
-   parse_fault_report теперь парсит <MODE> из последней части
-   (после последнего ':'), приводит к нижнему регистру и
-   сравнивает с "yellow_blink"/"all_off"/"none".
-
-   ROOT→NODE формат остаётся:
-     fault:yellow_blink:0x00A0:1,2:reason1,reason2
-     fault:all_off:...
-     fault:none:...
-   Парсинг старого формата работает: mode — часть между
-   первым и вторым ':' после "fault:".
+   NODE шлёт fault:local:<MODE> без маски (follow_root).
+   ROOT→NODE: fault:yellow_blink:0x00A0:1,2:reason1,reason2.
 
    === FIX NODE-STATUS-ROOT-FORMAT ===
-   STATUS от NODE теперь в формате ROOT (SR/NET/TRAFFIC/FAULT/
-   LINK/NODE/NODE_FAULT/RS485/CAN/RTT/ch00..ch15 + "role":"node"
-   в хвосте). mqtt_fault_publish_node_json проверяет
-   strstr(json, "\"role\":\"node\"") — поле в хвосте, strstr
-   его найдёт. Парсинг FAULT.mode — как у ROOT.
+   STATUS от NODE в формате ROOT + "role":"node" в хвосте.
+
+   === FIX LINK-LOSS-8S-NO-FALSE-ALLOFF ===
+   s_root_comm_lost_all_off блокирует снятие ALL_OFF через
+   mqtt_fault_apply_remote(NONE). Снимается только через
+   wifi_mqtt_set_root_comm_lost(false) — вызывается в
+   root_wd.c → root_node_watchdog_task в ветках
+   wait_node_ack (node_confirmed || timeout) и
+   has_node && !was_connected (success).
+
+   Проблема: если ROOT в ALL_OFF из-за FIX LINK-LOSS-8S и
+   параллельно NODE восстановился (своё ALL_OFF → RUNNING),
+   NODE шлёт STATUS с FAULT.mode="NONE". mqtt_fault_apply_remote
+   видит nf==NONE, s_root_comm_lost_all_off==true → IGNORE.
+   ROOT остаётся в ALL_OFF, пока свой watchdog не выйдет через
+   wait_node_ack → timeout (3 с). Это работает, но 3 с задержки.
+
+   Дополнительно: если NODE шлёт FAULT.mode="ALL_OFF" (его
+   собственный watchdog), nf==ALL_OFF — блокировка не срабатывает,
+   ROOT применяет ALL_OFF у себя. Это правильно (симметрия).
+
+   s_root_comm_lost_all_off оставляем как защиту от «ложного
+   NONE» — NODE мог сам выставить ALL_OFF из-за root_lost, и его
+   NONE в первые секунды после восстановления связи не должен
+   снимать ALL_OFF на ROOT, пока ROOT сам не решит (через свой
+   watchdog-таймер).
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -102,21 +110,6 @@ void mqtt_fault_publish_node(const char *fault_str, size_t len) {
 /* ============================================================
    parse_fault_report
    === FIX FAULT-LOCAL-FORMAT ===
-   Поддерживаем оба формата:
-     ROOT→NODE: "fault:yellow_blink:0x00A0:1,2:reason1,reason2"
-                "fault:all_off:..."
-                "fault:none:..."
-     NODE→ROOT: "fault:local:YELLOW_BLINK"
-                "fault:local:ALL_OFF"
-                "fault:local:NONE"
-
-   Стратегия:
-   1. Пропускаем "fault:".
-   2. Берём ВТОРУЮ часть (между первым и вторым ':' после
-      "fault:") — это для ROOT→NODE формат.
-      Для NODE→ROOT первая часть == "local", вторая == "YELLOW_BLINK".
-   3. Приводим к нижнему регистру, сравниваем с
-      "yellow_blink"/"all_off"/"none".
    ============================================================ */
 static void parse_fault_report(const char *fault_str, size_t len,
                                traffic_fault_t *out_nf, char *out_mode, size_t mode_sz)
@@ -129,22 +122,17 @@ static void parse_fault_report(const char *fault_str, size_t len,
 
     const char *p    = fault_str + 6;
     const char *end  = fault_str + len;
-    const char *c1   = memchr(p, ':', end - p);   /* после первой части */
+    const char *c1   = memchr(p, ':', end - p);
 
-    /* Первая часть после "fault:" — либо MODE (ROOT→NODE: "yellow_blink"),
-       либо "local" (NODE→ROOT). */
     const char *mode_start;
     if (c1) {
         size_t first_len = c1 - p;
         if (first_len == 5 && strncmp(p, "local", 5) == 0) {
-            /* NODE→ROOT: fault:local:<MODE> — MODE после c1+1. */
             mode_start = c1 + 1;
         } else {
-            /* ROOT→NODE: fault:<MODE>:... — MODE = первая часть. */
             mode_start = p;
         }
     } else {
-        /* Нет ':' после "fault:" — единственная часть. */
         mode_start = p;
     }
 
@@ -156,8 +144,6 @@ static void parse_fault_report(const char *fault_str, size_t len,
     memcpy(out_mode, mode_start, mlen);
     out_mode[mlen] = '\0';
 
-    /* Приводим к нижнему регистру для совместимости:
-       "YELLOW_BLINK" → "yellow_blink", "NONE" → "none". */
     for (size_t i = 0; i < mlen; i++) {
         if (out_mode[i] >= 'A' && out_mode[i] <= 'Z')
             out_mode[i] = out_mode[i] - 'A' + 'a';
@@ -176,11 +162,27 @@ void mqtt_fault_apply_remote(const char *fault_str, size_t len) {
     traffic_fault_t nf = TRAFFIC_FAULT_NONE;
     parse_fault_report(fault_str, len, &nf, mode, sizeof(mode));
 
+    /* === FIX LINK-LOSS-8S-NO-FALSE-ALLOFF ===
+       Оставляем защиту: s_root_comm_lost_all_off блокирует
+       только ложный NONE (NODE мог сам выставить ALL_OFF из-за
+       root_lost и сразу прислать NONE — это не повод снимать
+       ALL_OFF на ROOT, пока ROOT сам не выйдет через свой
+       watchdog-таймер).
+
+       Снятие — через wifi_mqtt_set_root_comm_lost(false) из
+       root_wd.c → root_node_watchdog_task
+       (wait_node_ack → node_confirmed || timeout, и
+        has_node && !was_connected → success).
+
+       ALL_OFF от NODE (nf==ALL_OFF) — не блокируется
+       (симметрия, ROOT применяет ALL_OFF у себя). */
     if (s_root_comm_lost_all_off && nf == TRAFFIC_FAULT_NONE) {
-        ESP_LOGI(TAG, "remote fault NONE ignored (comm-lost ALL_OFF)");
+        ESP_LOGI(TAG, "remote fault NONE ignored (comm-lost ALL_OFF locked, "
+                      "will clear via ROOT watchdog)");
         mqtt_fault_publish_node(fault_str, len);
         return;
     }
+    /* === END FIX LINK-LOSS-8S-NO-FALSE-ALLOFF === */
 
     mqtt_set_node_fault_internal(nf);
     traffic_fault_t root_fault = traffic_light_get_fault();
@@ -226,9 +228,6 @@ void mqtt_fault_apply_remote(const char *fault_str, size_t len) {
 
 /* ============================================================
    parse_node_json_fault
-   Извлекает FAULT из JSON-объекта NODE-STATUS.
-   Формат FAULT — как у ROOT: {"FAULT":{"mode":"NONE","count":0,
-   "channels":[],"reasons":[]},...}
    ============================================================ */
 static bool parse_node_json_fault(const char *json, traffic_fault_t *out_nf,
                                   char *out_mode, size_t mode_sz) {
@@ -281,9 +280,6 @@ static bool parse_node_json_fault(const char *json, traffic_fault_t *out_nf,
 /* ============================================================
    mqtt_fault_publish_node_json
    === FIX NODE-STATUS-ROOT-FORMAT ===
-   NODE-STATUS теперь в формате ROOT + "role":"node" в хвосте.
-   Проверка "role":"node" через strstr — найдёт (поле в конце).
-   Раньше поле было в начале; на совместимость не влияет.
    ============================================================ */
 void mqtt_fault_publish_node_json(const char *json, size_t len) {
     if (!json || len == 0) return;
@@ -339,7 +335,7 @@ void mqtt_fault_publish_node_json(const char *json, size_t len) {
         }
 
         if (s_root_comm_lost_all_off && nf == TRAFFIC_FAULT_NONE) {
-            ESP_LOGI(TAG, "NODE.FAULT=NONE ignored (comm-lost ALL_OFF)");
+            ESP_LOGI(TAG, "NODE.FAULT=NONE ignored (comm-lost ALL_OFF locked)");
         } else if (nf == TRAFFIC_FAULT_NONE &&
                    root_fault != TRAFFIC_FAULT_NONE) {
             ESP_LOGI(TAG, "NODE.FAULT=NONE (root was %s) → root NONE",
