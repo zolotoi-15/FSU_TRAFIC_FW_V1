@@ -17,6 +17,13 @@
      fault:none:...
    Парсинг старого формата работает: mode — часть между
    первым и вторым ':' после "fault:".
+
+   === FIX NODE-STATUS-ROOT-FORMAT ===
+   STATUS от NODE теперь в формате ROOT (SR/NET/TRAFFIC/FAULT/
+   LINK/NODE/NODE_FAULT/RS485/CAN/RTT/ch00..ch15 + "role":"node"
+   в хвосте). mqtt_fault_publish_node_json проверяет
+   strstr(json, "\"role\":\"node\"") — поле в хвосте, strstr
+   его найдёт. Парсинг FAULT.mode — как у ROOT.
    ============================================================ */
 
 #include "mqtt_internal.h"
@@ -128,8 +135,6 @@ static void parse_fault_report(const char *fault_str, size_t len,
        либо "local" (NODE→ROOT). */
     const char *mode_start;
     if (c1) {
-        /* Есть ':' после первой части — mode может быть первой частью
-           (ROOT→NODE) или второй (NODE→ROOT: "local:MODE"). */
         size_t first_len = c1 - p;
         if (first_len == 5 && strncmp(p, "local", 5) == 0) {
             /* NODE→ROOT: fault:local:<MODE> — MODE после c1+1. */
@@ -219,6 +224,12 @@ void mqtt_fault_apply_remote(const char *fault_str, size_t len) {
     wifi_mqtt_publish_now();
 }
 
+/* ============================================================
+   parse_node_json_fault
+   Извлекает FAULT из JSON-объекта NODE-STATUS.
+   Формат FAULT — как у ROOT: {"FAULT":{"mode":"NONE","count":0,
+   "channels":[],"reasons":[]},...}
+   ============================================================ */
 static bool parse_node_json_fault(const char *json, traffic_fault_t *out_nf,
                                   char *out_mode, size_t mode_sz) {
     *out_nf = TRAFFIC_FAULT_NONE;
@@ -267,6 +278,13 @@ static bool parse_node_json_fault(const char *json, traffic_fault_t *out_nf,
     return true;
 }
 
+/* ============================================================
+   mqtt_fault_publish_node_json
+   === FIX NODE-STATUS-ROOT-FORMAT ===
+   NODE-STATUS теперь в формате ROOT + "role":"node" в хвосте.
+   Проверка "role":"node" через strstr — найдёт (поле в конце).
+   Раньше поле было в начале; на совместимость не влияет.
+   ============================================================ */
 void mqtt_fault_publish_node_json(const char *json, size_t len) {
     if (!json || len == 0) return;
 

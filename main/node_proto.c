@@ -31,12 +31,17 @@
    UTC_DELTA_MAX_MS_LOCAL 500 → 3000.
 
    === FIX T_CHANNELS ===
-   NODE раз в 60 с шлёт T_CHANNELS с 16 каналами.
+   NODE раз в NODE_CHANNELS_PERIOD_MS (60 с) шлёт отдельный
+   T_CHANNELS с 16 каналами. ROOT публикует в
+   <base>/Node/Channels.
 
    === FIX TIME-APPLY-IN-ALIGNED ===
    time: применяется на NODE всегда.
+<<<<<<< HEAD
 <<<<<<< Updated upstream
 =======
+=======
+>>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
 
    === FIX NODE-STATUS-ROOT-FORMAT ===
    STATUS от NODE в формате ROOT (SR/NET/TRAFFIC/FAULT/LINK/
@@ -48,15 +53,30 @@
    LINK.rssi), т.к. LINK теперь — объект с root/node.
 
    === FIX STATUS-NO-CHANNELS ===
+<<<<<<< HEAD
    STATUS без ch00..ch15 → ~686 байт = 17 фрагментов по LoRa.
    Без ACK на каждом фрагменте (T_STATUS = noack) потеря
    любого фрагмента → frag gap → отбрасывание всего пакета.
    Каналы NODE остаются в T_CHANNELS (раз в 60 с, публикуется
    в <base>/Node/Channels).
+=======
+   КЛЮЧЕВАЯ ПРАВКА.
+   Раньше STATUS включал ch00..ch15 → ~1500 байт = 46 фрагментов
+   по LoRa. Без ACK на каждом фрагменте (T_STATUS = noack) потеря
+   любого фрагмента → frag gap → отбрасывание всего пакета →
+   ROOT не собирает STATUS → MQTT <base>/Node не обновляется.
+
+   Теперь STATUS — только SR/NET/TRAFFIC/FAULT/LINK/NODE/
+   NODE_FAULT/RS485/CAN/RTT/role → ~400 байт = 10 фрагментов.
+   Каналы NODE остаются в T_CHANNELS (раз в 60 с, публикуется
+   в <base>/Node/Channels). Вероятность потери 1 из 10 гораздо
+   ниже, чем 1 из 46.
+>>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
 
    === FIX T-CHANNELS-NOT-COMBINED ===
    T_CHANNELS и STATUS больше НЕ шлются в одной итерации
    node_send_task. После T_CHANNELS — пауза 3000 мс + continue.
+<<<<<<< HEAD
 
    === FIX UTC-SKIP-PM-RESET ===
    КЛЮЧЕВАЯ ПРАВКА.
@@ -72,6 +92,10 @@
    ph=0 (ALL_OFF) и insert-фазы — для них pm применяется
    как есть (это управляющие команды, не нормальная фаза).
 >>>>>>> Stashed changes
+=======
+   Иначе 30+10=40 фрагментов подряд → ROOT шлёт c: каждые
+   LORA_SYNC_INTERVAL_MS → гарантированные коллизии.
+>>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
    ============================================================ */
 
 #include "node_proto.h"
@@ -120,11 +144,15 @@ volatile bool s_node_channels_valid = false;
 static uint32_t s_last_channels_ms = 0;
 /* === END FIX T_CHANNELS === */
 
+<<<<<<< HEAD
 <<<<<<< Updated upstream
 #define NODE_STATUS_PERIOD_MS      5000
 =======
 #define NODE_STATUS_PERIOD_MS      10000
 >>>>>>> Stashed changes
+=======
+#define NODE_STATUS_PERIOD_MS      8000
+>>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
 #define NODE_STATUS_FAULT_MS       1000
 #define NODE_STATUS_SYNC_MS        500
 #define STATUS_FORCE_MS            5000
@@ -134,6 +162,7 @@ static uint32_t s_last_channels_ms = 0;
 #define UTC_DELTA_MAX_MS_LOCAL     3000
 #define SYNC_MAX_DRIFT_MS_LOCAL    500
 
+<<<<<<< HEAD
 <<<<<<< Updated upstream
 =======
 /* === FIX STATUS-NO-CHANNELS ===
@@ -153,6 +182,14 @@ static uint32_t s_last_channels_ms = 0;
 /* === END FIX UTC-SKIP-PM-RESET === */
 
 >>>>>>> Stashed changes
+=======
+/* === FIX STATUS-NO-CHANNELS ===
+   Буфер STATUS уменьшен: новый формат без ch00..ch15 ≈ 400 байт.
+   1024 — с запасом (FAULT.reasons может быть длинным при аварии). */
+#define NODE_STATUS_BUF_SIZE       1024
+/* === END FIX STATUS-NO-CHANNELS === */
+
+>>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
 volatile bool s_fault_from_remote_ex = false;
 volatile bool s_node_running = false;
 
@@ -389,15 +426,7 @@ static void on_cmd_from_root(const char *cmd, size_t len)
     }
 
     if (strncmp(buf, "fault:none", 10) == 0) {
-        /* === FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE ===
-           ROOT снимает YELLOW_BLINK после try_recovery по СВОИМ
-           каналам. Но авария была на NODE (short to GND на ch02).
-           У NODE short продолжается → s_fault_count > 0. NODE НЕ
-           должен снимать YELLOW_BLINK по fault:none от ROOT.
-
-           Если NODE в standby (s_root_lost_flag) — снимаем
-           (это уже сделано выше в FIX ROOT-RETURN-CLEARS-LOCAL-ALL-OFF,
-           повторно не нужно). */
+        /* === FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE === */
         uint8_t local_cnt = traffic_light_get_fault_count();
         if (traffic_light_fault_has_priority() && local_cnt > 0) {
             ESP_LOGW(TAG, "fault:none from ROOT IGNORED: NODE has %u "
@@ -721,6 +750,10 @@ void node_handle_local_cmd(const char *cmd)
 
 /* ============================================================
    on_node_status_from_transport (ROOT)
+   === FIX NODE-STATUS-ROOT-FORMAT ===
+   LINK теперь в формате ROOT: {"root":{"rssi":...,...},"node":{...}}.
+   Из NODE приходит LINK.root (его RX-метрики) + LINK.node=null.
+   ROOT берёт LINK.root как «качество последнего RX от NODE».
    ============================================================ */
 static void on_node_status_from_transport(const char *json, size_t len)
 {
@@ -736,28 +769,43 @@ static void on_node_status_from_transport(const char *json, size_t len)
                            (now - s_last_node_pub_ms) >= 2000);
     if (should_publish) {
         s_last_node_pub_ms = now;
+        /* Диагностика: видно, доходит ли STATUS до MQTT. */
+        ESP_LOGI(TAG, "STATUS→MQTT: len=%u mqtt=%d role_found=%d",
+                 (unsigned)len,
+                 wifi_mqtt_is_connected() ? 1 : 0,
+                 strstr(json, "\"role\":\"node\"") ? 1 : 0);
         wifi_mqtt_publish_node_json(json, len);
     }
 
     if (g_config.role != DEVICE_ROLE_MASTER || !json || len == 0) return;
 
+    /* === FIX NODE-STATUS-ROOT-FORMAT ===
+       LINK.root.rssi — LoRa-метрики NODE (его RX). */
     {
         const char *lk = (const char *)memmem(json, len, "\"LINK\":{", 8);
         if (lk) {
-            float rssi = 0.0f, snr = 0.0f, sig_rssi = 0.0f;
-            unsigned long age = 0;
-            if (sscanf(lk,
-                       "\"LINK\":{\"rssi\":%f,\"snr\":%f,\"sig_rssi\":%f,"
-                       "\"age_ms\":%lu",
-                       &rssi, &snr, &sig_rssi, &age) == 4) {
-                s_node_link_rssi     = rssi;
-                s_node_link_snr      = snr;
-                s_node_link_sig_rssi = sig_rssi;
-                s_node_link_age_ms   = (uint32_t)age;
-                s_node_link_valid    = true;
+            const char *root_p = (const char *)memmem(lk,
+                                                      (json + len) - lk,
+                                                      "\"root\":{\"rssi\":",
+                                                      15);
+            if (root_p) {
+                float rssi = 0.0f, snr = 0.0f, sig_rssi = 0.0f;
+                unsigned long age = 0;
+                int valid = 0;
+                if (sscanf(root_p,
+                           "\"root\":{\"rssi\":%f,\"snr\":%f,"
+                           "\"sig_rssi\":%f,\"age_ms\":%lu,\"valid\":%d",
+                           &rssi, &snr, &sig_rssi, &age, &valid) >= 4) {
+                    s_node_link_rssi     = rssi;
+                    s_node_link_snr      = snr;
+                    s_node_link_sig_rssi = sig_rssi;
+                    s_node_link_age_ms   = (uint32_t)age;
+                    s_node_link_valid    = (valid != 0) && (rssi != 0.0f);
+                }
             }
         }
     }
+    /* === END FIX NODE-STATUS-ROOT-FORMAT === */
 
     sync_handshake_root_on_rx(json, len);
 
@@ -950,8 +998,11 @@ static void on_evt_from_node(const char *evt, size_t len)
 
 /* ============================================================
    node_send_task
+<<<<<<< HEAD
 <<<<<<< Updated upstream
 =======
+=======
+>>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
    === FIX STATUS-NO-CHANNELS ===
    STATUS от NODE (формат ROOT, БЕЗ ch00..ch15):
      {"SR":{state+hex+outputs},"NET":{role=node,ppp,ip},
@@ -962,6 +1013,7 @@ static void on_evt_from_node(const char *evt, size_t len)
       "NODE":null,"NODE_FAULT":null,
       "RS485":{...},"CAN":{...},"RTT":{...},
       "role":"node"}
+<<<<<<< HEAD
    ≈ 686 байт = 17 фрагментов по LoRa.
 
    === FIX T-CHANNELS-NOT-COMBINED ===
@@ -969,14 +1021,25 @@ static void on_evt_from_node(const char *evt, size_t len)
    НЕ шлётся. Иначе 27+17 фрагментов подряд → коллизии с c:
    от ROOT → потеря фрагментов → ROOT не собирает пакет.
 >>>>>>> Stashed changes
+=======
+   ≈ 400 байт = 10 фрагментов по LoRa.
+
+   Каналы NODE (ch00..ch15) идут отдельным T_CHANNELS раз в 60 с.
+
+   === FIX T-CHANNELS-NOT-COMBINED ===
+   После T_CHANNELS — пауза + continue. STATUS в этой итерации
+   НЕ шлётся. Иначе 30+10 фрагментов подряд → коллизии с c:
+   от ROOT → потеря фрагментов → ROOT не собирает пакет.
+>>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
    ============================================================ */
 static void node_send_task(void *arg)
 {
-    char *json = malloc(2048);
+    char *json = malloc(NODE_STATUS_BUF_SIZE);
     if (!json) { vTaskDelete(NULL); return; }
 
-    ESP_LOGI(TAG, "node_send_task started (transport=%s)",
-             transport_is_lora() ? "LoRa" : "TCP");
+    ESP_LOGI(TAG, "node_send_task started (transport=%s, buf=%u)",
+             transport_is_lora() ? "LoRa" : "TCP",
+             (unsigned)NODE_STATUS_BUF_SIZE);
     vTaskDelay(pdMS_TO_TICKS(2000));
 
     while (1) {
@@ -996,11 +1059,11 @@ static void node_send_task(void *arg)
             mux_data_t md;
             bool have_md = mux_data_get(&md);
 
-            int off = snprintf(json, 2048,
+            int off = snprintf(json, NODE_STATUS_BUF_SIZE,
                                "{\"role\":\"node\",\"CHANNELS\":[");
             if (have_md) {
                 for (uint8_t ch = 0; ch < 16; ch++) {
-                    off += snprintf(json + off, 2048 - off,
+                    off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
                                     "%s{\"ch\":%u,\"V_IN\":%.2f,\"I_LOAD\":%d,"
                                     "\"V_IMON\":%d,\"STATE\":\"%s\","
                                     "\"SR\":%d,\"DIAG\":%d}",
@@ -1011,11 +1074,12 @@ static void node_send_task(void *arg)
                                     md.sr_state[ch], md.diag_en[ch]);
                 }
             }
-            off += snprintf(json + off, 2048 - off, "]}");
+            off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off, "]}");
 
             esp_err_t err = transport_send_channels(json, off);
             ESP_LOGI(TAG, "T_CHANNELS -> ROOT: %s (%d bytes)",
                      err == ESP_OK ? "OK" : esp_err_to_name(err), off);
+<<<<<<< HEAD
 <<<<<<< Updated upstream
 =======
 
@@ -1026,43 +1090,141 @@ static void node_send_task(void *arg)
             continue;
             /* === END FIX T-CHANNELS-NOT-COMBINED === */
 >>>>>>> Stashed changes
+=======
+
+            /* === FIX T-CHANNELS-NOT-COMBINED ===
+               После T_CHANNELS — пауза и continue: STATUS в этой
+               итерации НЕ отправляем. Иначе 30+10 фрагментов
+               подряд → коллизии с c: от ROOT. */
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+            /* === END FIX T-CHANNELS-NOT-COMBINED === */
+>>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
         }
         /* === END FIX T_CHANNELS === */
 
-        uint16_t sr = sr_get_state();
-        traffic_fault_t cur_fault = traffic_light_get_fault();
+        /* === FIX STATUS-NO-CHANNELS ===
+           STATUS в формате ROOT БЕЗ ch00..ch15. */
+        uint16_t sr_state = sr_get_state();
         const char *state_str = traffic_light_state_str();
         const char *fault_str = traffic_light_fault_str();
+        uint8_t fault_cnt = traffic_light_get_fault_count();
 
         lora_link_stats_t ls = {0};
         bool have_ls = lora_get_last_rx_stats(&ls);
 
-        uint8_t disp_ch = g_config.traffic.pins.cross_ped.ped_display;
-        if (disp_ch >= 16) disp_ch = SYNC_DISPLAY_CH;
-        int disp_bit = sr_get_output(disp_ch) ? 1 : 0;
+        rs485_stats_t rs;
+        rs485_get_stats(&rs);
+        can_bus_stats_t cs;
+        can_bus_get_stats(&cs);
 
-        int off = snprintf(json, 2048,
-                           "{\"role\":\"node\",\"SR\":{\"state\":%u},"
-                           "\"TRAFFIC\":{\"state\":\"%s\",\"mode\":%d,\"phase\":%d,"
-                           "\"phase_ms\":%lu,\"duration_ms\":%lu},"
-                           "\"FAULT\":{\"mode\":\"%s\",\"count\":%u},"
-                           "\"LINK\":{\"rssi\":%.1f,\"snr\":%.1f,"
-                           "\"sig_rssi\":%.1f,\"age_ms\":%lu},"
-                           "\"disp\":%d"
-                           "}",
-                           sr,
-                           state_str,
-                           traffic_light_get_mode(),
-                           traffic_light_get_phase(),
-                           (unsigned long)traffic_light_get_phase_ms(),
-                           (unsigned long)traffic_light_get_phase_duration_ms(),
-                           fault_str,
-                           traffic_light_get_fault_count(),
-                           have_ls ? ls.rssi : 0.0f,
-                           have_ls ? ls.snr : 0.0f,
-                           have_ls ? ls.sig_rssi : 0.0f,
-                           (unsigned long)(have_ls ? ls.age_ms : 0),
-                           disp_bit);
+        int off = 0;
+
+        /* SR */
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
+            "{\"SR\":{\"state\":%u,\"hex\":\"0x%04X\",\"outputs\":[",
+            sr_state, sr_state);
+        bool first = true;
+        for (int i = 0; i < SR_OUTPUT_COUNT; i++) {
+            if (sr_state & (1U << i)) {
+                off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
+                                "%s%d", first ? "" : ",", i);
+                first = false;
+            }
+        }
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off, "]},");
+
+        /* NET — у NODE нет своего PPP, role=node */
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
+            "\"NET\":{\"role\":\"node\",\"ppp\":0,\"ip\":\"0.0.0.0\"},");
+
+        /* TRAFFIC — как у ROOT (phase_duration_ms, phase_count) */
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
+            "\"TRAFFIC\":{\"state\":\"%s\",\"mode\":%d,\"phase\":%d,"
+            "\"phase_ms\":%lu,\"phase_duration_ms\":%lu,\"phase_count\":%u},",
+            state_str, traffic_light_get_mode(),
+            traffic_light_get_phase(),
+            (unsigned long)traffic_light_get_phase_ms(),
+            (unsigned long)traffic_light_get_phase_duration_ms(),
+            traffic_light_get_phase_count());
+
+        /* FAULT — как у ROOT (mode+count+channels+reasons) */
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
+            "\"FAULT\":{\"mode\":\"%s\",\"count\":%u,\"channels\":[",
+            fault_str, fault_cnt);
+        for (uint8_t i = 0; i < fault_cnt && i < TRAFFIC_FAULT_MAX; i++) {
+            traffic_fault_info_t info;
+            traffic_light_get_fault_info(i, &info);
+            off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off, "%s%u",
+                            (i == 0) ? "" : ",", info.channel);
+        }
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off, "],\"reasons\":[");
+        for (uint8_t i = 0; i < fault_cnt && i < TRAFFIC_FAULT_MAX; i++) {
+            traffic_fault_info_t info;
+            traffic_light_get_fault_info(i, &info);
+            char safe[sizeof(info.text) * 2];
+            size_t j = 0;
+            for (size_t k = 0; info.text[k] && j + 2 < sizeof(safe); k++) {
+                char c = info.text[k];
+                if (c == '"' || c == '\\') safe[j++] = '\\';
+                safe[j++] = c;
+            }
+            safe[j] = '\0';
+            off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
+                            "%s\"%s\"", (i == 0) ? "" : ",", safe);
+        }
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off, "]},");
+
+        /* LINK — как у ROOT: {"root":{...},"node":{...}}.
+           LINK.root — LoRa-метрики NODE (его RX).
+           LINK.node — null (у NODE нет «своего NODE»). */
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
+            "\"LINK\":{\"root\":{\"rssi\":%.1f,\"snr\":%.1f,"
+            "\"sig_rssi\":%.1f,\"age_ms\":%lu,\"valid\":%d},"
+            "\"node\":{\"rssi\":0.0,\"snr\":0.0,\"sig_rssi\":0.0,"
+            "\"age_ms\":0,\"valid\":0}},",
+            have_ls ? ls.rssi : 0.0f,
+            have_ls ? ls.snr : 0.0f,
+            have_ls ? ls.sig_rssi : 0.0f,
+            (unsigned long)(have_ls ? ls.age_ms : 0),
+            have_ls ? 1 : 0);
+
+        /* NODE / NODE_FAULT — для NODE это null */
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
+            "\"NODE\":null,\"NODE_FAULT\":null,");
+
+        /* RS485 — как у ROOT */
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
+            "\"RS485\":{\"rx_bytes\":%lu,\"rx_frames\":%lu,\"rx_overflows\":%lu,"
+            "\"tx_bytes\":%lu,\"tx_errors\":%lu},",
+            (unsigned long)rs.rx_bytes, (unsigned long)rs.rx_frames,
+            (unsigned long)rs.rx_overflows, (unsigned long)rs.tx_bytes,
+            (unsigned long)rs.tx_errors);
+
+        /* CAN — как у ROOT */
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
+            "\"CAN\":{\"rx_frames\":%lu,\"tx_frames\":%lu,\"tx_errors\":%lu,"
+            "\"bus_off\":%lu,\"recovery\":%lu,\"error_passive\":%lu,\"state\":%lu},",
+            (unsigned long)cs.rx_frames, (unsigned long)cs.tx_frames,
+            (unsigned long)cs.tx_errors, (unsigned long)cs.bus_off_count,
+            (unsigned long)cs.recovery_count,
+            (unsigned long)cs.error_passive_count,
+            (unsigned long)cs.last_state);
+
+        /* RTT — у NODE нули (RTT измеряется на ROOT) */
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
+            "\"RTT\":{\"us\":0,\"delay_us\":0,\"samples\":0}");
+
+        /* role — в хвосте. mqtt_fault.c проверяет strstr, найдёт. */
+        off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off,
+                        ",\"role\":\"node\"}");
+
+        if (off <= 0 || off >= NODE_STATUS_BUF_SIZE) {
+            ESP_LOGE(TAG, "STATUS build overflow (off=%d), skip", off);
+            vTaskDelay(pdMS_TO_TICKS(NODE_STATUS_PERIOD_MS));
+            continue;
+        }
+        /* === END FIX STATUS-NO-CHANNELS === */
 
         bool force = s_status_now ||
                      (s_status_force_until_ms != 0 &&
@@ -1075,19 +1237,21 @@ static void node_send_task(void *arg)
 
         if (force) {
             esp_err_t err = transport_send_status_noack(json, off);
-            ESP_LOGI(TAG, "STATUS forced -> ROOT: %s",
-                     err == ESP_OK ? "OK" : esp_err_to_name(err));
+            ESP_LOGI(TAG, "STATUS forced -> ROOT: %s (%d bytes)",
+                     err == ESP_OK ? "OK" : esp_err_to_name(err), off);
         } else {
             esp_err_t err = transport_send_status(json, off);
             if (err != ESP_OK) {
                 ESP_LOGW(TAG, "STATUS failed: %s", esp_err_to_name(err));
+            } else {
+                ESP_LOGI(TAG, "STATUS -> ROOT: OK (%d bytes)", off);
             }
         }
 
         uint32_t period;
         if (force)                                     period = 200;
         else if (sync_handshake_node_is_syncing())     period = NODE_STATUS_SYNC_MS;
-        else if (cur_fault != TRAFFIC_FAULT_NONE)      period = NODE_STATUS_FAULT_MS;
+        else if (traffic_light_get_fault() != TRAFFIC_FAULT_NONE) period = NODE_STATUS_FAULT_MS;
         else                                           period = NODE_STATUS_PERIOD_MS;
         vTaskDelay(pdMS_TO_TICKS(period));
     }
