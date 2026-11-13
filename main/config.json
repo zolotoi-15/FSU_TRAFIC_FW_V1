@@ -14,10 +14,10 @@
 
   "mqtt": {
     "enabled": true,
-    "uri": "mqtt://m2.wqtt.ru",
-    "port": 13257,
-    "user": "u_GGENLB",
-    "password": "LTHNW22D",
+    "uri": "mqtt://mqtt.xologie.ru",
+    "port": 1883,
+    "user": "LS2024",
+    "password": "Zavulon56",
     "base_topic": "FSU_Trafic",
     "timepause_min": 5
   },
@@ -77,11 +77,11 @@
       "request_mode": "insert",
       "insert_timeout_ms": 30000,
       "min_recall_s": 15,
-      "insert_sequence": [4, 5, 1, 6, 7],
-      "insert_lead_ms": 10000,
-      "insert_red_ms": 3000,
+      "insert_sequence": [5, 1, 6, 7, 1, 2],
+      "insert_lead_ms": 0,
+      "insert_red_ms": 0,
       "return_to_hold": true,
-      "safe_exit_sequence": [1, 2]
+      "safe_exit_sequence": []
     },
 
     "stages_dd": [
@@ -143,7 +143,7 @@
       }
     ],
 
-    "sequence": [1, 2, 3, 4, 5, 6, 7, 1, 2],
+    "sequence": [1, 2, 3],
 
     "conflicting_channels": [
       [2, 10],

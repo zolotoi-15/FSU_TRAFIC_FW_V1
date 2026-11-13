@@ -61,7 +61,9 @@
 #include "app_shared.h"
 #include "ble_transport.h"
 #include "sync_config.h"
-
+#include "connectivity.h"
+#include "modem_ppp.h"          /* ← ДОБАВИТЬ: modem_ppp_get_netif() */
+#include "fault_handler.h"
 
 extern const uint8_t config_json_start[] asm("_binary_config_json_start");
 extern const uint8_t config_json_end[]   asm("_binary_config_json_end");
@@ -226,6 +228,25 @@ static void on_got_ip(void *arg, esp_event_base_t base,
     if (g_config.role != DEVICE_ROLE_MASTER) return;
 
     ESP_LOGI(TAG, "GOT_IP → starting SNTP + MQTT");
+
+    /* === FIX DEFAULT-NETIF-BEFORE-SNTP ===
+       on_got_ip вызывается ИЗНУТРИ modem_ppp_start (IP_EVENT PPP).
+       esp_netif_set_default_netif в connectivity.c выполнится
+       ПОСЛЕ возврата modem_ppp_start, т.е. уже после
+       time_sync_start_sntp(). SNTP-сокет создастся на старом
+       default netif (ethernet/STA) → ответа от pool.ntp.org
+       не будет → time_sync не станет valid → root_wd вечно
+       висит в "time_sync not valid → wait".
+       Выставляем default netif ЗДЕСЬ, до SNTP. */
+    esp_netif_t *ppp_netif = modem_ppp_get_netif();
+    if (ppp_netif) {
+        esp_netif_set_default_netif(ppp_netif);
+        ESP_LOGI(TAG, "on_got_ip: default netif → PPPoS (before SNTP)");
+    } else {
+        ESP_LOGW(TAG, "on_got_ip: modem_ppp_get_netif() = NULL");
+    }
+    /* === END FIX === */
+
     time_sync_start_sntp();
     sntp_started = true;
 

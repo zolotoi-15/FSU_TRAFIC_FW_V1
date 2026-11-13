@@ -33,7 +33,15 @@ pi4ioe5v6408_config_t expander_b = {
    В момент read-modify-write OUTPUT_PORT пара transmit+receive
    для read_register может вернуть мусор → ложное «нажатие P7».
    Экспортируем board_expander_mutex() — buttons.c берёт его
-   вокруг p7_read_raw. */
+   вокруг p7_read_raw.
+
+   === FIX I2C-EXPANDER-RECURSIVE ===
+   board_read_iload_raw берёт board_expander_mutex() вокруг
+   пары diag_en + mux_select + ADC. board_diag_en_set тоже
+   берёт этот мьютекс. Non-recursive → deadlock. Делаем
+   recursive: board_read_iload_raw → take, внутри →
+   board_diag_en_set → take (recursive OK), give, затем
+   внешний give. */
 static SemaphoreHandle_t s_diag_en_mtx = NULL;
 
 SemaphoreHandle_t board_expander_mutex(void) { return s_diag_en_mtx; }
@@ -46,15 +54,16 @@ static const diag_en_map_t s_diag_en_map[] = {
 };
 #define DIAG_EN_MAP_SIZE (sizeof(s_diag_en_map)/sizeof(s_diag_en_map[0]))
 
+/* === FIX I2C-EXPANDER-RECURSIVE === */
 esp_err_t board_diag_en_set(uint8_t channel, bool enable) {
     for (size_t i = 0; i < DIAG_EN_MAP_SIZE; i++) {
         const diag_en_map_t *m = &s_diag_en_map[i];
         if (m->channel != channel) continue;
         pi4ioe5v6408_config_t *exp = (m->expander == 0) ? &expander_a : &expander_b;
 
-        if (s_diag_en_mtx) xSemaphoreTake(s_diag_en_mtx, portMAX_DELAY);
+        if (s_diag_en_mtx) xSemaphoreTakeRecursive(s_diag_en_mtx, portMAX_DELAY);
         esp_err_t ret = pi4ioe5v6408_set_pin_output(exp, m->pin, enable);
-        if (s_diag_en_mtx) xSemaphoreGive(s_diag_en_mtx);
+        if (s_diag_en_mtx) xSemaphoreGiveRecursive(s_diag_en_mtx);
         return ret;
     }
     return ESP_ERR_NOT_FOUND;
@@ -65,11 +74,12 @@ void board_diag_en_all_off(void) {
         const diag_en_map_t *m = &s_diag_en_map[i];
         pi4ioe5v6408_config_t *exp = (m->expander == 0) ? &expander_a : &expander_b;
 
-        if (s_diag_en_mtx) xSemaphoreTake(s_diag_en_mtx, portMAX_DELAY);
+        if (s_diag_en_mtx) xSemaphoreTakeRecursive(s_diag_en_mtx, portMAX_DELAY);
         pi4ioe5v6408_set_pin_output(exp, m->pin, false);
-        if (s_diag_en_mtx) xSemaphoreGive(s_diag_en_mtx);
+        if (s_diag_en_mtx) xSemaphoreGiveRecursive(s_diag_en_mtx);
     }
 }
+/* === END FIX I2C-EXPANDER-RECURSIVE === */
 
 static void configure_diag_en_outputs(void) {
     bool used_a[8] = {0}, used_b[8] = {0};
@@ -93,6 +103,17 @@ static imon_state_t classify_imon(int mv) {
     return imon_classify(mv, g_config.traffic.fault.imin_mv);
 }
 
+/* ============================================================
+   board_read_iload_raw
+   === FIX I2C-EXPANDER-RECURSIVE ===
+   DIAG_EN + mux_select + ADC — атомарно под board_expander_mutex().
+   Иначе mux_task для ch02 и try_recovery для ch05 на одном
+   expander_b делают RMW OUTPUT_PORT → V_IN может вернуться
+   = 1.4 В (как в логе), что даёт ложный SHORT_GND.
+
+   Мьютекс recursive: внутри board_diag_en_set снова берёт его —
+   это OK.
+   ============================================================ */
 int board_read_iload_raw(uint8_t channel, imon_state_t *out_state, int *out_mv) {
     if (out_state) *out_state = IMON_STATE_UNKNOWN;
     if (out_mv)    *out_mv    = 0;
@@ -102,9 +123,19 @@ int board_read_iload_raw(uint8_t channel, imon_state_t *out_state, int *out_mv) 
         return 0;
     }
 
+    SemaphoreHandle_t exp_mtx = board_expander_mutex();
+    if (exp_mtx) xSemaphoreTakeRecursive(exp_mtx, portMAX_DELAY);
+
     esp_err_t ret = board_diag_en_set(channel, true);
-    if (ret == ESP_ERR_NOT_FOUND) { if (out_state) *out_state = IMON_STATE_NO_DIAG; return 0; }
-    if (ret != ESP_OK) return -1;
+    if (ret == ESP_ERR_NOT_FOUND) {
+        if (exp_mtx) xSemaphoreGiveRecursive(exp_mtx);
+        if (out_state) *out_state = IMON_STATE_NO_DIAG;
+        return 0;
+    }
+    if (ret != ESP_OK) {
+        if (exp_mtx) xSemaphoreGiveRecursive(exp_mtx);
+        return -1;
+    }
     esp_rom_delay_us(200);
 
     mux_select_channel(channel);
@@ -114,12 +145,14 @@ int board_read_iload_raw(uint8_t channel, imon_state_t *out_state, int *out_mv) 
     int mv_vin = mux_read_sig1_avg_mv(4);
     if (mv_vin < 0) {
         board_diag_en_set(channel, false);
+        if (exp_mtx) xSemaphoreGiveRecursive(exp_mtx);
         if (out_state) *out_state = IMON_STATE_UNKNOWN;
         return -1;
     }
     float v_in = (float)mv_vin * MUX1_DIVIDER_RATIO / 1000.0f;
     if (v_in < g_config.traffic.fault.vin_on_min_v) {
         board_diag_en_set(channel, false);
+        if (exp_mtx) xSemaphoreGiveRecursive(exp_mtx);
         if (out_state) *out_state = IMON_STATE_UNKNOWN;
         ESP_LOGW(TAG, "ch%02d: V_IN=%.2f V < %.2f V (UVLO), skip IMON",
                  channel, v_in, g_config.traffic.fault.vin_on_min_v);
@@ -128,6 +161,7 @@ int board_read_iload_raw(uint8_t channel, imon_state_t *out_state, int *out_mv) 
 
     int mv = mux_read_sig2_avg_mv(8);
     board_diag_en_set(channel, false);
+    if (exp_mtx) xSemaphoreGiveRecursive(exp_mtx);
 
     if (mv < 0) return -1;
     imon_state_t st = classify_imon(mv);
@@ -143,8 +177,15 @@ int board_read_iload_raw(uint8_t channel, imon_state_t *out_state, int *out_mv) 
     return (int)(((float)corr * TPS27S100B_K_IMON) / TPS27S100B_R_IMON);
 }
 
+/* ============================================================
+   board_hw_init
+   === FIX I2C-EXPANDER-RECURSIVE ===
+   s_diag_en_mtx = xSemaphoreCreateRecursiveMutex().
+   ============================================================ */
 esp_err_t board_hw_init(void) {
-    if (!s_diag_en_mtx) s_diag_en_mtx = xSemaphoreCreateMutex();
+    if (!s_diag_en_mtx) {
+        s_diag_en_mtx = xSemaphoreCreateRecursiveMutex();
+    }
     if (!s_diag_en_mtx) return ESP_ERR_NO_MEM;
 
     if (i2c_bus_init() != ESP_OK) return ESP_FAIL;

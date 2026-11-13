@@ -128,10 +128,10 @@ void wifi_mqtt_load_config(void)
 {
     nvs_handle_t nvs;
     mqtt_config_t def = {
-        .broker_url = "mqtt://m2.wqtt.ru",
-        .port       = 13257,
-        .username   = "u_GGENLB",
-        .password   = "LTHNW22D",
+        .broker_url = "mqtt://mqtt.xologie.ru",
+        .port       = 1883,
+        .username   = "LS2024",
+        .password   = "Zavulon56",
         .base_topic = "FSU_Trafic",
         .lwt_msg    = "offline"
     };
@@ -290,7 +290,7 @@ uint32_t wifi_mqtt_get_down_ms(void)
 void wifi_mqtt_force_restart_modem(void)
 {
     ESP_LOGE(TAG, "wifi_mqtt: force restart modem (PPP stop)");
-    modem_ppp_stop();
+   // modem_ppp_stop();
 }
 
 static void mqtt_event_handler(void *args, esp_event_base_t base,

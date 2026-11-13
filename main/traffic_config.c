@@ -32,6 +32,13 @@
    === FIX BLINK-PERIOD-MIN ===
    phase_blink_period_ms ≥ BLINK_MIN_PERIOD_MS (50 мс), иначе
    blink «не виден» (включён всегда или выключен всегда).
+
+   === FIX HOLD-PHASE ===
+   Добавлена stage_is_hold(seq_idx). Возвращает true, если
+   фаза seq_idx соответствует одному из hold.stage_ids
+   (например, зелёный транспортный, который держится до
+   нажатия кнопки). traffic_task_loop использует её, чтобы
+   не переходить на следующую фазу в hold-состоянии.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -84,6 +91,33 @@ bool stage_is_transport_green(uint8_t seq_idx)
     }
     return false;
 }
+
+/* === FIX HOLD-PHASE ===
+   TRUE, если фаза seq_idx — hold-фаза (зелёный транспортный,
+   который держится до нажатия кнопки).
+
+   Сравниваем не seq_idx с hold.stage_ids, а stage_id (id стадии
+   из stages_dd) с hold.stage_ids. Например, hold.stage_ids = [3],
+   sequence = [1, 2, 3] → stage_is_hold(2) == true (sequence[2]=3).
+
+   Возвращает false, если:
+     - hold.enabled == false,
+     - hold.stage_count == 0,
+     - seq_idx вне sequence_count,
+     - stage_id не найден среди hold.stage_ids. */
+bool stage_is_hold(uint8_t seq_idx)
+{
+    if (!g_config.traffic.hold.enabled) return false;
+    if (g_config.traffic.hold.stage_count == 0) return false;
+    if (seq_idx >= g_config.traffic.sequence_count) return false;
+
+    uint8_t stage_id = g_config.traffic.sequence[seq_idx];
+    for (int i = 0; i < g_config.traffic.hold.stage_count; i++) {
+        if (g_config.traffic.hold.stage_ids[i] == stage_id) return true;
+    }
+    return false;
+}
+/* === END FIX HOLD-PHASE === */
 
 uint8_t next_phase_smooth_ped(uint8_t cur_seq)
 {
@@ -173,8 +207,18 @@ uint16_t traffic_light_expected_sr_mask_internal(void)
     return traffic_light_stage_sr_mask_internal();
 }
 
+/* ============================================================
+   set_all_off
+   === FIX FAULT-HAS-TOP-PRIORITY ===
+   Если авария активна — все каналы уже в fault-состоянии,
+   НЕ трогаем их (иначе мигание прервётся).
+   ============================================================ */
 void set_all_off(void)
 {
+    if (fault_active()) {
+        /* Не трогаем каналы: ими управляет apply_fault_mode/fault_blink. */
+        return;
+    }
     for (int i = 0; i < 16; i++) sr_output_off(i);
 }
 
@@ -246,40 +290,37 @@ bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq)
 
 /* ============================================================
    apply_stage_dd
-   === FIX APPLY-STAGE-DD-NODE-FOLLOW-ROOT ===
-   NODE в follow_root НЕ применяет маску по stage_dd — только
-   set_all_off. ROOT пришлёт c: с маской. Иначе NODE сам зажжёт
-   on_mask своего stage_dd, а ROOT пришлёт другой on_mask —
-   двойное состояние и мигание расходится.
-
-   === FIX BLINK-CLEAR-BEFORE-APPLY ===
-   На ROOT при смене стадии сбрасываем s_blink_on, чтобы
-   мигающие каналы стартовали с чистого состояния. На NODE
-   этого делать нельзя — s_blink_on управляется apply_mask.
+   === FIX FAULT-HAS-TOP-PRIORITY ===
+   При активной аварии НЕ трогаем каналы — fault уже управляет
+   ими. NODE в follow_root по-прежнему ждёт c: — но если он в
+   аварии, c: игнорируется (см. traffic_light_apply_mask).
    ============================================================ */
 void apply_stage_dd(uint8_t seq_idx)
 {
     if (seq_idx >= g_config.traffic.sequence_count) return;
+
+    /* === FIX FAULT-HAS-TOP-PRIORITY === */
+    if (fault_active()) {
+        ESP_LOGD(TAG, "apply_stage_dd(%u): fault active (%s), skip "
+                      "(fault priority)", seq_idx,
+                 traffic_light_fault_str());
+        return;
+    }
+    /* === END FIX === */
+
     const traffic_stage_dd_t *st = find_stage(g_config.traffic.sequence[seq_idx]);
     if (!st) {
         ESP_LOGE(TAG, "Stage id=%u not found", g_config.traffic.sequence[seq_idx]);
         return;
     }
 
-    /* === FIX APPLY-STAGE-DD-NODE-FOLLOW-ROOT ===
-       NODE в follow_root НЕ применяет маску — ждёт c: от ROOT.
-       s_blink_mask сброшен в 0, чтобы не мигать по устаревшей маске
-       между apply_stage_dd и приходом c:. */
     if (s_follow_root) {
         set_all_off();
         s_blink_mask = 0;
-        /* s_blink_on / s_blink_last_phase НЕ трогаем —
-           ими управляет apply_mask. */
         ESP_LOGD(TAG, "apply_stage_dd: NODE follow_root → all off "
                       "(wait c: from ROOT)");
         return;
     }
-    /* === END FIX APPLY-STAGE-DD-NODE-FOLLOW-ROOT === */
 
     uint16_t will_be_on = 0;
     for (int i = 0; i < st->on_count; i++)
@@ -302,20 +343,17 @@ void apply_stage_dd(uint8_t seq_idx)
         return;
     }
 
-    /* Гасим активные каналы предыдущей стадии */
     uint16_t active = traffic_light_active_sr_mask_internal();
     for (int ch = 0; ch < 16; ch++) {
         if (active & (1u << ch)) sr_output_off(ch);
     }
 
-    /* Включаем on_mask */
     uint16_t on_mask = 0;
     for (int i = 0; i < st->on_count; i++) {
         on_mask |= (1u << st->outputs_on[i]);
         sr_output_on(st->outputs_on[i]);
     }
 
-    /* blink_mask — для ROOT, мигание будет по s_phase_start_ms */
     uint16_t blink_mask = 0;
     for (int i = 0; i < st->blink_count; i++) {
         blink_mask |= (1u << st->outputs_blink[i]);
@@ -324,13 +362,8 @@ void apply_stage_dd(uint8_t seq_idx)
 
     s_blink_mask = blink_mask;
 
-    /* === FIX BLINK-CLEAR-BEFORE-APPLY (ROOT only) ===
-       Сбрасываем s_blink_on, чтобы в первом же тике task blink
-       стартовал с чистого состояния. На NODE этот блок
-       недостижим (return выше). */
     s_blink_on = false;
     s_blink_last_phase = 0;
-    /* === END FIX BLINK-CLEAR-BEFORE-APPLY === */
 
     uint32_t dur = stage_duration_ms(seq_idx);
     ESP_LOGD(TAG, "Stage → %u (%s) kind=%u dur=%lu on=0x%04X blink=0x%04X%s",

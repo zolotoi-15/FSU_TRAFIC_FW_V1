@@ -2,32 +2,39 @@
    node_proto.c — NODE/ROOT протокол.
 
    === FIX C-BUFFER-BEFORE-START ===
-       Если c: приходит раньше, чем NODE перешёл в RUNNING
-       (s_node_running == false), сохраняем его в s_pending_c_*
-       и применяем сразу после traffic:start.
+   Если c: приходит раньше, чем NODE перешёл в RUNNING —
+   сохраняем в s_pending_c_* и применяем сразу после
+   traffic:start.
+
+   === FIX FAULT-HAS-TOP-PRIORITY ===
+   Авария — наивысший приоритет. c: не применяется при
+   s_fault != NONE; traffic:start не снимает локальный fault;
+   fault:yellow_blink с mask=0 → ALL_OFF.
+
+   === FIX ROOT-RETURN-CLEARS-LOCAL-ALL-OFF ===
+   Если NODE сам выставил ALL_OFF из-за потери ROOT
+   (s_root_lost_flag=true), то ЛЮБОЙ пакет от ROOT означает
+   «ROOT вернулся» → снимаем локальный ALL_OFF ДО проверки
+   traffic_light_fault_has_priority().
+
+   === FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE ===
+   fault:none от ROOT НЕ снимает YELLOW_BLINK на NODE, если
+   у NODE есть активные аварии (s_fault_count > 0). ROOT
+   проверил СВОИ каналы (try_recovery), но авария была на
+   NODE. NODE сам сбросит fault через try_recovery.
+
+   === FIX ROOT-MIRROR-NODE-FAULT ===
+   (в on_evt_from_node) fault:local:<MODE> от NODE → ROOT
+   применяет у себя ту же аварию.
 
    === FIX UTC-DELTA-MAX ===
-       UTC_DELTA_MAX_MS 500 → 3000, SYNC_MAX_DRIFT_MS 250 → 500.
-
-   === FIX APPLY-MASK-PM-UTC ===
-       При c: с валидным end_utc применяем pm_utc, НЕ pm из c:.
-
-   === FIX SYNC-HANDSHAKE ===
-       on_cmd_from_root:
-         - "sync:probe" — ack.
-         - "sync:lock:..." — применяем маску + pong.
-         - "sync:done" — IDLE (если в ALIGNED).
-         - "sync:ack" — PROBE → TIME.
-       on_evt_from_node (ROOT): передаёт sync:probe в
-       sync_handshake_root_on_rx.
+   UTC_DELTA_MAX_MS_LOCAL 500 → 3000.
 
    === FIX T_CHANNELS ===
-       NODE раз в 60 с шлёт T_CHANNELS с 16 каналами.
+   NODE раз в 60 с шлёт T_CHANNELS с 16 каналами.
 
    === FIX TIME-APPLY-IN-ALIGNED ===
-       time: применяется на NODE всегда, независимо от
-       sync-состояния. Иначе во время ALIGNED часы NODE
-       уплывают, disp не совпадает, ROOT висит в ALIGNED.
+   time: применяется на NODE всегда.
    ============================================================ */
 
 #include "node_proto.h"
@@ -53,6 +60,7 @@
 #include "freertos/task.h"
 #include <string.h>
 #include <stdlib.h>
+#include "traffic_internal.h"
 
 static const char *TAG = "node_proto";
 
@@ -82,13 +90,8 @@ static uint32_t s_last_channels_ms = 0;
 
 #define NODE_ROOT_LOST_MS          6000
 
-/* === FIX UTC-DELTA-MAX === */
 #define UTC_DELTA_MAX_MS_LOCAL     3000
-/* === END FIX UTC-DELTA-MAX === */
-
-/* === FIX SYNC-MAX-DRIFT === */
 #define SYNC_MAX_DRIFT_MS_LOCAL    500
-/* === END FIX SYNC-MAX-DRIFT === */
 
 volatile bool s_fault_from_remote_ex = false;
 volatile bool s_node_running = false;
@@ -102,9 +105,7 @@ static volatile uint32_t s_last_root_data_ms = 0;
 static volatile bool s_root_lost_flag = false;
 static volatile bool s_c_received_since_start = false;
 
-/* === FIX C-BUFFER-BEFORE-START ===
-   Если c: приходит раньше traffic:start, сохраняем его здесь
-   и применяем после перехода в RUNNING. */
+/* === FIX C-BUFFER-BEFORE-START === */
 static volatile bool     s_pending_c_valid = false;
 static volatile uint8_t  s_pending_c_phase = 0;
 static volatile uint32_t s_pending_c_pm    = 0;
@@ -133,9 +134,8 @@ static inline void node_note_root_data(void)
 }
 
 /* ============================================================
-   Применить c: (общая функция для on_cmd и для pending после
-   traffic:start).
-   === FIX APPLY-MASK-PM-UTC ===
+   node_apply_c_mask
+   === FIX FAULT-HAS-TOP-PRIORITY ===
    ============================================================ */
 static void node_apply_c_mask(uint8_t ph,
                               uint32_t pm,
@@ -145,6 +145,12 @@ static void node_apply_c_mask(uint8_t ph,
                               uint64_t end_utc_ms,
                               bool has_utc_field)
 {
+    if (traffic_light_fault_has_priority()) {
+        ESP_LOGW(TAG, "c: apply IGNORED (fault active: %s)",
+                 traffic_light_fault_str());
+        return;
+    }
+
     uint32_t apply_pm = pm;
     bool used_utc = false;
 
@@ -191,22 +197,32 @@ static void node_apply_c_mask(uint8_t ph,
 
 /* ============================================================
    on_cmd_from_root
+   === FIX ROOT-RETURN-CLEARS-LOCAL-ALL-OFF ===
+   === FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE ===
    ============================================================ */
 static void on_cmd_from_root(const char *cmd, size_t len)
 {
     link_monitor_note_ping_rx();
     node_note_root_data();
 
+    /* === FIX ROOT-RETURN-CLEARS-LOCAL-ALL-OFF === */
+    if (s_root_lost_flag) {
+        ESP_LOGW(TAG, "ROOT back (cmd='%.16s...') -> clear local ALL_OFF "
+                      "(was root-lost)",
+                 cmd ? cmd : "");
+        s_root_lost_flag = false;
+        SET_REMOTE_FLAG(true);
+        traffic_light_set_fault(TRAFFIC_FAULT_NONE);
+        SET_REMOTE_FLAG(false);
+    }
+    /* === END FIX ROOT-RETURN-CLEARS-LOCAL-ALL-OFF === */
+
     char buf[256];
     size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
     memcpy(buf, cmd, n);
     buf[n] = '\0';
 
-    /* === FIX TIME-APPLY-IN-ALIGNED ===
-       time: применяем ДО обработки sync:*, чтобы не зависеть
-       от состояния. Если NODE в ALIGNED и ROOT шлёт time: —
-       часы NODE подтягиваются, disp синхронизируется,
-       ROOT выходит из ALIGNED. */
+    /* === FIX TIME-APPLY-IN-ALIGNED === */
     if (strncmp(buf, "time:", 5) == 0) {
         unsigned long sec = 0;
         unsigned int ms = 0;
@@ -226,12 +242,9 @@ static void on_cmd_from_root(const char *cmd, size_t len)
             }
             time_sync_set((uint32_t)sec, (uint16_t)ms, (uint32_t)rtt);
         }
-        /* Sync-handshake тоже должен знать о time: (PROBE/TIME →
-           PHASE), но только если NODE ещё не в ALIGNED. */
         sync_handshake_node_on_rx(buf, n);
         return;
     }
-    /* === END FIX TIME-APPLY-IN-ALIGNED === */
 
     /* === FIX SYNC-HANDSHAKE === */
     if (len >= 5 && strncmp(buf, "sync:", 5) == 0) {
@@ -241,9 +254,14 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         if (strncmp(buf, "sync:done", 9) == 0) return;
         if (strncmp(buf, "sync:ack", 8) == 0) return;
     }
-    /* === END FIX SYNC-HANDSHAKE === */
 
     if (buf[0] == 'c' && buf[1] == ':') {
+        if (traffic_light_fault_has_priority()) {
+            ESP_LOGW(TAG, "c: IGNORED (fault active: %s)",
+                     traffic_light_fault_str());
+            return;
+        }
+
         unsigned int ph = 0;
         unsigned long pm = 0;
         unsigned int on_mask = 0;
@@ -260,9 +278,7 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         }
 
         if (!s_node_running) {
-            /* === FIX C-BUFFER-BEFORE-START ===
-               NODE ещё не перешёл в RUNNING — сохраняем c: и
-               применим после traffic:start. */
+            /* === FIX C-BUFFER-BEFORE-START === */
             ESP_LOGW(TAG, "c: NODE not RUNNING → stash for later "
                           "(ph=%u)", ph);
             s_pending_c_phase = (uint8_t)ph;
@@ -277,15 +293,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         }
 
         s_c_received_since_start = true;
-
-        if (s_root_lost_flag) {
-            ESP_LOGW(TAG, "c: ROOT back -> clear local ALL_OFF/YELLOW_BLINK");
-            s_root_lost_flag = false;
-            SET_REMOTE_FLAG(true);
-            traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-            SET_REMOTE_FLAG(false);
-        }
-
         s_fault_from_remote_ex = false;
 
         node_apply_c_mask((uint8_t)ph, (uint32_t)pm,
@@ -296,6 +303,24 @@ static void on_cmd_from_root(const char *cmd, size_t len)
     }
 
     if (strncmp(buf, "fault:none", 10) == 0) {
+        /* === FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE ===
+           ROOT снимает YELLOW_BLINK после try_recovery по СВОИМ
+           каналам. Но авария была на NODE (short to GND на ch02).
+           У NODE short продолжается → s_fault_count > 0. NODE НЕ
+           должен снимать YELLOW_BLINK по fault:none от ROOT.
+
+           Если NODE в standby (s_root_lost_flag) — снимаем
+           (это уже сделано выше в FIX ROOT-RETURN-CLEARS-LOCAL-ALL-OFF,
+           повторно не нужно). */
+        uint8_t local_cnt = traffic_light_get_fault_count();
+        if (traffic_light_fault_has_priority() && local_cnt > 0) {
+            ESP_LOGW(TAG, "fault:none from ROOT IGNORED: NODE has %u "
+                          "active local fault(s), wait try_recovery",
+                     local_cnt);
+            return;
+        }
+        /* === END FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE === */
+
         ESP_LOGW(TAG, "fault:none from ROOT -> clear local fault");
         s_root_lost_flag = false;
         SET_REMOTE_FLAG(true);
@@ -311,11 +336,37 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         node_send_status_for_ms(2000);
         return;
     }
+
     if (strncmp(buf, "fault:yellow_blink", 18) == 0) {
-        ESP_LOGW(TAG, "fault:yellow_blink from ROOT -> YELLOW_BLINK");
-        SET_REMOTE_FLAG(true);
-        traffic_light_set_fault(TRAFFIC_FAULT_YELLOW_BLINK);
-        SET_REMOTE_FLAG(false);
+        unsigned int mask = 0;
+        const char *p = buf + 18;
+        if (*p == ':') p++;
+        bool have_mask = false;
+        if (sscanf(p, "0x%4x", &mask) == 1 ||
+            sscanf(p, "0X%4x", &mask) == 1 ||
+            sscanf(p, "%4x", &mask) == 1) {
+            have_mask = true;
+        }
+
+        if (have_mask && mask != 0) {
+            s_fault_yellow_mask_from_root = (uint16_t)mask;
+            s_fault_mask_valid = true;
+            ESP_LOGW(TAG, "fault:yellow_blink from ROOT, mask=0x%04X "
+                          "→ NODE blinks by ROOT mask",
+                     s_fault_yellow_mask_from_root);
+            SET_REMOTE_FLAG(true);
+            traffic_light_set_fault(TRAFFIC_FAULT_YELLOW_BLINK);
+            SET_REMOTE_FLAG(false);
+        } else {
+            s_fault_yellow_mask_from_root = 0;
+            s_fault_mask_valid = false;
+            ESP_LOGE(TAG, "fault:yellow_blink from ROOT but mask=0 → "
+                          "treat as ALL_OFF (safe)");
+            SET_REMOTE_FLAG(true);
+            traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
+            SET_REMOTE_FLAG(false);
+        }
+        node_send_status_for_ms(2000);
         return;
     }
 
@@ -423,15 +474,17 @@ static void on_cmd_from_root(const char *cmd, size_t len)
 
     if (strcmp(buf, "traffic:start") == 0) {
         ESP_LOGW(TAG, "traffic:start from ROOT");
+
+        if (traffic_light_fault_has_priority()) {
+            ESP_LOGW(TAG, "traffic:start IGNORED: fault active (%s), "
+                          "wait fault:none",
+                     traffic_light_fault_str());
+            node_send_status_for_ms(2000);
+            return;
+        }
+
         bool was_running = s_node_running;
         if (!was_running) s_c_received_since_start = false;
-
-        if (s_root_lost_flag) {
-            s_root_lost_flag = false;
-            SET_REMOTE_FLAG(true);
-            traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-            SET_REMOTE_FLAG(false);
-        }
 
         traffic_light_set_follow_root(true);
 
@@ -440,11 +493,6 @@ static void on_cmd_from_root(const char *cmd, size_t len)
             ESP_LOGW(TAG, "traffic:start: NODE recover → start_with_red");
             traffic_light_start_with_red();
         } else {
-            if (traffic_light_get_fault() != TRAFFIC_FAULT_NONE) {
-                SET_REMOTE_FLAG(true);
-                traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-                SET_REMOTE_FLAG(false);
-            }
             traffic_light_start();
         }
 
@@ -452,9 +500,7 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         node_note_root_data();
         node_send_status_for_ms(STATUS_FORCE_MS);
 
-        /* === FIX C-BUFFER-BEFORE-START ===
-           Если c: пришёл раньше traffic:start — применяем его
-           СЕЙЧАС. */
+        /* === FIX C-BUFFER-BEFORE-START === */
         if (s_pending_c_valid) {
             ESP_LOGI(TAG, "traffic:start → apply stashed c: ph=%u",
                      s_pending_c_phase);
@@ -499,14 +545,27 @@ static void on_cmd_from_root(const char *cmd, size_t len)
         if (sscanf(buf, "relay:%d:%d", &relay, &state) == 2 ||
             sscanf(buf, "sr:%d:%d",    &relay, &state) == 2) {
             if (relay >= 0 && relay < SR_OUTPUT_COUNT) {
+                if (traffic_light_fault_has_priority()) {
+                    ESP_LOGW(TAG, "relay:%d:%d IGNORED (fault active)",
+                             relay, state);
+                    return;
+                }
                 if (state) sr_output_on(relay);
                 else       sr_output_off(relay);
             }
             return;
         }
     }
-    if (strcmp(buf, "all:on")  == 0) { sr_all_on();  return; }
-    if (strcmp(buf, "all:off") == 0) { sr_all_off(); return; }
+    if (strcmp(buf, "all:on")  == 0) {
+        if (traffic_light_fault_has_priority()) {
+            ESP_LOGW(TAG, "all:on IGNORED (fault active)");
+            return;
+        }
+        sr_all_on();  return;
+    }
+    if (strcmp(buf, "all:off") == 0) {
+        sr_all_off(); return;
+    }
 }
 
 /* ============================================================
@@ -632,7 +691,7 @@ static void on_node_status_from_transport(const char *json, size_t len)
         ESP_LOGW(TAG, "STATUS: NODE no longer RUNNING");
     }
 
-    if (running) {
+    if (running && !traffic_light_fault_has_priority()) {
         const char *ph_p = memmem(json, len, "\"phase\":", 8);
         const char *pm_p = memmem(json, len, "\"phase_ms\":", 11);
         if (ph_p && pm_p) {
@@ -709,6 +768,7 @@ static void on_node_channels_from_transport(const char *json, size_t len)
 
 /* ============================================================
    on_evt_from_node (ROOT)
+   === FIX ROOT-MIRROR-NODE-FAULT ===
    ============================================================ */
 static void on_evt_from_node(const char *evt, size_t len)
 {
@@ -742,25 +802,58 @@ static void on_evt_from_node(const char *evt, size_t len)
     if (len > 5 && strncmp(buf, "pong:", 5) == 0) return;
     if (len > 5 && strncmp(buf, "time:", 5) == 0) return;
 
+    /* === FIX FAULT-FROM-NODE ===
+       ВАЖНО: проверять "fault:" ДО "fault:recover_ok". */
     if (len > 6 && strncmp(buf, "fault:", 6) == 0) {
+        if (strncmp(buf, "fault:recover_ok", 16) == 0) {
+            if (traffic_light_get_fault() != TRAFFIC_FAULT_NONE) {
+                ESP_LOGW(TAG, "NODE recover_ok but ROOT still in fault - ignore");
+                return;
+            }
+            ESP_LOGW(TAG, "NODE recover_ok, ROOT ok -> send fault:none");
+            transport_send_cmd_noack("fault:none", 10);
+            return;
+        }
+
+        /* === FIX ROOT-MIRROR-NODE-FAULT ===
+           fault:local:<MODE> от NODE — NODE сам обнаружил аварию
+           (short to GND, V_IN low). ROOT применяет ту же аварию
+           у себя, чтобы оба контроллера были в одном состоянии.
+           Формат: "fault:local:YELLOW_BLINK" / "fault:local:ALL_OFF". */
+        if (strncmp(buf, "fault:local:", 12) == 0) {
+            const char *mode = buf + 12;
+            traffic_fault_t nf = TRAFFIC_FAULT_NONE;
+            if (strcmp(mode, "YELLOW_BLINK") == 0) {
+                nf = TRAFFIC_FAULT_YELLOW_BLINK;
+            } else if (strcmp(mode, "ALL_OFF") == 0) {
+                nf = TRAFFIC_FAULT_ALL_OFF;
+            }
+            if (nf != TRAFFIC_FAULT_NONE) {
+                ESP_LOGW(TAG, "NODE local fault '%s' → ROOT applies %s",
+                         mode,
+                         nf == TRAFFIC_FAULT_ALL_OFF
+                             ? "ALL_OFF" : "YELLOW_BLINK");
+                SET_REMOTE_FLAG(true);
+                traffic_light_set_fault(nf);
+                SET_REMOTE_FLAG(false);
+                return;
+            }
+        }
+        /* === END FIX ROOT-MIRROR-NODE-FAULT === */
+
         SET_REMOTE_FLAG(true);
         wifi_mqtt_apply_remote_fault(evt, len);
         SET_REMOTE_FLAG(false);
         return;
     }
-
-    if (strncmp(buf, "fault:recover_ok", 16) == 0) {
-        if (traffic_light_get_fault() != TRAFFIC_FAULT_NONE) {
-            ESP_LOGW(TAG, "NODE recover_ok but ROOT still in fault - ignore");
-            return;
-        }
-        ESP_LOGW(TAG, "NODE recover_ok, ROOT ok -> send fault:none");
-        transport_send_cmd_noack("fault:none", 10);
-        return;
-    }
+    /* === END FIX FAULT-FROM-NODE === */
 
     if (strcmp(buf, "pedestrian:request") == 0) {
         if (!traffic_light_ped_button_enabled()) return;
+        if (traffic_light_fault_has_priority()) {
+            ESP_LOGW(TAG, "pedestrian:request from NODE ignored (fault active)");
+            return;
+        }
         ESP_LOGW(TAG, "pedestrian:request from NODE -> apply locally on ROOT");
         traffic_light_request_pedestrian_ex(true);
         return;

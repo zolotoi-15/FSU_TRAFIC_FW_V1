@@ -1,3 +1,24 @@
+/* ============================================================
+   mqtt_fault.c — mirror fault между ROOT и NODE (через MQTT).
+
+   === FIX FAULT-LOCAL-FORMAT ===
+   NODE шлёт fault:local:<MODE> без маски, когда сам обнаружил
+   аварию (follow_root). Форматы:
+     fault:local:YELLOW_BLINK
+     fault:local:ALL_OFF
+     fault:local:NONE
+   parse_fault_report теперь парсит <MODE> из последней части
+   (после последнего ':'), приводит к нижнему регистру и
+   сравнивает с "yellow_blink"/"all_off"/"none".
+
+   ROOT→NODE формат остаётся:
+     fault:yellow_blink:0x00A0:1,2:reason1,reason2
+     fault:all_off:...
+     fault:none:...
+   Парсинг старого формата работает: mode — часть между
+   первым и вторым ':' после "fault:".
+   ============================================================ */
+
 #include "mqtt_internal.h"
 #include "config_manager.h"
 #include "traffic_light.h"
@@ -71,26 +92,82 @@ void mqtt_fault_publish_node(const char *fault_str, size_t len) {
     free(out);
 }
 
+/* ============================================================
+   parse_fault_report
+   === FIX FAULT-LOCAL-FORMAT ===
+   Поддерживаем оба формата:
+     ROOT→NODE: "fault:yellow_blink:0x00A0:1,2:reason1,reason2"
+                "fault:all_off:..."
+                "fault:none:..."
+     NODE→ROOT: "fault:local:YELLOW_BLINK"
+                "fault:local:ALL_OFF"
+                "fault:local:NONE"
+
+   Стратегия:
+   1. Пропускаем "fault:".
+   2. Берём ВТОРУЮ часть (между первым и вторым ':' после
+      "fault:") — это для ROOT→NODE формат.
+      Для NODE→ROOT первая часть == "local", вторая == "YELLOW_BLINK".
+   3. Приводим к нижнему регистру, сравниваем с
+      "yellow_blink"/"all_off"/"none".
+   ============================================================ */
 static void parse_fault_report(const char *fault_str, size_t len,
-                               traffic_fault_t *out_nf, char *out_mode, size_t mode_sz) {
+                               traffic_fault_t *out_nf, char *out_mode, size_t mode_sz)
+{
     *out_nf = TRAFFIC_FAULT_NONE;
+    if (mode_sz > 0) out_mode[0] = '\0';
     snprintf(out_mode, mode_sz, "NONE");
+
     if (len < 6 || strncmp(fault_str, "fault:", 6) != 0) return;
-    const char *p = fault_str + 6;
-    const char *c1 = memchr(p, ':', len - 6);
-    if (!c1) return;
-    size_t mlen = c1 - p;
+
+    const char *p    = fault_str + 6;
+    const char *end  = fault_str + len;
+    const char *c1   = memchr(p, ':', end - p);   /* после первой части */
+
+    /* Первая часть после "fault:" — либо MODE (ROOT→NODE: "yellow_blink"),
+       либо "local" (NODE→ROOT). */
+    const char *mode_start;
+    if (c1) {
+        /* Есть ':' после первой части — mode может быть первой частью
+           (ROOT→NODE) или второй (NODE→ROOT: "local:MODE"). */
+        size_t first_len = c1 - p;
+        if (first_len == 5 && strncmp(p, "local", 5) == 0) {
+            /* NODE→ROOT: fault:local:<MODE> — MODE после c1+1. */
+            mode_start = c1 + 1;
+        } else {
+            /* ROOT→NODE: fault:<MODE>:... — MODE = первая часть. */
+            mode_start = p;
+        }
+    } else {
+        /* Нет ':' после "fault:" — единственная часть. */
+        mode_start = p;
+    }
+
+    const char *mode_end = memchr(mode_start, ':', end - mode_start);
+    if (!mode_end) mode_end = end;
+
+    size_t mlen = mode_end - mode_start;
     if (mlen >= mode_sz) mlen = mode_sz - 1;
-    memcpy(out_mode, p, mlen);
+    memcpy(out_mode, mode_start, mlen);
     out_mode[mlen] = '\0';
+
+    /* Приводим к нижнему регистру для совместимости:
+       "YELLOW_BLINK" → "yellow_blink", "NONE" → "none". */
+    for (size_t i = 0; i < mlen; i++) {
+        if (out_mode[i] >= 'A' && out_mode[i] <= 'Z')
+            out_mode[i] = out_mode[i] - 'A' + 'a';
+    }
+
     if (strcmp(out_mode, "all_off") == 0)           *out_nf = TRAFFIC_FAULT_ALL_OFF;
     else if (strcmp(out_mode, "yellow_blink") == 0) *out_nf = TRAFFIC_FAULT_YELLOW_BLINK;
+    else if (strcmp(out_mode, "none") == 0)         *out_nf = TRAFFIC_FAULT_NONE;
 }
+/* === END FIX FAULT-LOCAL-FORMAT === */
 
 void mqtt_fault_apply_remote(const char *fault_str, size_t len) {
     if (!fault_str || len < 6) return;
 
-    char mode[16];
+    char mode[24];
     traffic_fault_t nf = TRAFFIC_FAULT_NONE;
     parse_fault_report(fault_str, len, &nf, mode, sizeof(mode));
 

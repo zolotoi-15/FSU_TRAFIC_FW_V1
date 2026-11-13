@@ -1,33 +1,31 @@
 /* ============================================================
    traffic_light.c — основной цикл traffic_task + force_phase.
 
-   === FIX BLINK-VIA-MASK-FIRST ===
-   Блок blink крутится ПЕРВЫМ в traffic_task_loop, ДО всех
-   проверок sync_handshake и s_follow_root. Это гарантирует:
-     - NODE мигает, даже если застрял в sync_handshake;
-     - ROOT мигает, даже если потерял NODE и запустил sync;
-     - мигание не зависит от состояния state/phase, если
-       s_state=RUNNING и s_blink_mask != 0.
+   === FIX FAULT-HAS-TOP-PRIORITY ===
+   Авария — наивысший приоритет. Все функции управления
+   каналами (start/stop/reset/force_phase/apply_mask/
+   manual_override/night_mode/priority_*) проверяют
+   fault_active() и НЕ трогают каналы, пока s_fault != NONE.
 
-   === FIX ROOT-SEND-FIRST ===
-   ROOT при смене фазы СНАЧАЛА отправляет c: на NODE, ждёт
-   lead_ms (runtime, g_sync_lead_ms, дефолт 150 мс ≈ LoRa ToA +
-   обработка NODE), и только потом применяет маску у себя.
+   === FIX ALL-OFF-STANDBY-NOT-FAULT ===
+   mqtt_apply_config_runtime для ROOT больше НЕ ставит
+   TRAFFIC_FAULT_ALL_OFF. ROOT просто в STOPPED + set_all_off().
+   Это позволяет send_channels_to_node_impl отправить
+   первичный c:0:...:red ДО первого трафика (иначе
+   fault_has_priority блокирует и NODE никогда не выйдет из
+   standby).
 
-   === FIX LEAD-MS-RUNTIME ===
-   Задержка читается через sync_config_get_lead_ms(), меняется
-   на лету из MQTT (sync_lead:<ms>) или BLE (sync.set).
-
-   === FIX APPLY-MASK-PM-DRIFT-TOLERANCE ===
-   При refresh от ROOT pm в c: может отличаться от текущего pm
-   на LoRa ToA (~112 мс). Если применять «в лоб» —
-   s_phase_start_ms откатывается каждые 300 мс → blink замирает.
-   Толерантность 250 мс: меньший дрейф игнорируем (не двигаем
-   начало фазы), больший — синхронизируемся.
-
-   === FIX BLINK-DEBUG-LOGI ===
-   BLINK ON/OFF печатается на ESP_LOGI (временно), чтобы видеть
-   в мониторе, крутится ли blink. Потом вернуть на ESP_LOGD.
+   === FIX HOLD-PHASE ===
+   Добавлена hold-ветка в traffic_task_loop. Если текущая фаза
+   — hold-фаза (например, зелёный транспортный) и нет активного
+   ped-запроса/insert, контроллер НЕ переходит на следующую
+   фазу. Держится до:
+     - нажатия кнопки (s_ped_request || s_insert_pending),
+     - истечения hold.max_hold_ms (если >0).
+   Возврат из insert в hold (return_to_hold) — через
+   root_apply_stage_sync_first(hold_seq, ...), после чего
+   следующая итерация цикла снова увидит stage_is_hold()==true
+   и останется в зелёном.
    ============================================================ */
 
 #include "traffic_internal.h"
@@ -83,8 +81,9 @@ volatile uint16_t        s_fault_yellow_mask = 0;
 volatile bool            s_blink_on = false;
 volatile uint32_t        s_blink_last_phase = 0;
 volatile uint32_t        s_sync_delay_us = 0;
-uint8_t                  s_suspect_counter[16] = {0};
-uint8_t                  s_vin_off_counter[16] = {0};
+uint8_t                  s_suspect_counter[16]   = {0};
+uint8_t                  s_vin_off_counter[16]   = {0};
+uint8_t                  s_short_gnd_counter[16] = {0};
 uint8_t                  s_ok_streak = 0;
 volatile bool            s_mux_reading = false;
 volatile uint32_t        s_last_recovery_ok_ms = 0;
@@ -120,11 +119,27 @@ static volatile uint32_t s_all_red_next_dur_ms = 0;
 
 static volatile bool    s_manual_override = false;
 static volatile uint8_t s_manual_seq = 0;
-
-static volatile bool     s_hold_pm_frozen = false;
+static volatile bool    s_hold_pm_frozen = false;
 
 static uint16_t s_prev_blink_mask = 0;
 static uint16_t s_prev_on_mask    = 0;
+
+static volatile traffic_fault_t s_last_pushed_fault = TRAFFIC_FAULT_NONE;
+
+/* === FIX FAULT-HAS-TOP-PRIORITY === */
+bool traffic_light_fault_has_priority(void)
+{
+    return (s_fault != TRAFFIC_FAULT_NONE);
+}
+/* === END FIX FAULT-HAS-TOP-PRIORITY === */
+
+/* === FIX ALL-OFF-STANDBY-NOT-FAULT === */
+bool traffic_light_in_standby(void)
+{
+    return (s_state == TRAFFIC_STATE_STOPPED &&
+            s_fault == TRAFFIC_FAULT_NONE);
+}
+/* === END FIX ALL-OFF-STANDBY-NOT-FAULT === */
 
 bool traffic_light_get_fault_blink_state(void) { return s_fault_blink_state; }
 
@@ -148,6 +163,9 @@ void traffic_light_set_follow_root(bool en)
 
 void traffic_light_ped_display_set(bool on)
 {
+    /* === FIX FAULT-HAS-TOP-PRIORITY === */
+    if (fault_active()) return;
+    /* === END FIX === */
     uint8_t ch = g_config.traffic.pins.cross_ped.ped_display;
     if (ch >= 16) return;
     if (on) sr_output_on(ch);
@@ -160,9 +178,6 @@ static inline void traffic_display_force_off(void)
     if (ch < 16) sr_output_off(ch);
 }
 
-/* ============================================================
-   Прямое применение blink-бита для всех каналов из s_blink_mask
-   ============================================================ */
 static inline void apply_blink_bit(uint16_t mask, bool on)
 {
     for (int ch = 0; ch < 16; ch++) {
@@ -174,16 +189,69 @@ static inline void apply_blink_bit(uint16_t mask, bool on)
 }
 
 /* ============================================================
-   === FIX ROOT-SEND-FIRST ===
-   === FIX LEAD-MS-RUNTIME ===
+   root_push_fault_to_node
+   ============================================================ */
+void root_push_fault_to_node(traffic_fault_t fault)
+{
+    if (g_config.role != DEVICE_ROLE_MASTER) return;
+    if (!transport_is_lora()) return;
 
-   ROOT: отправить маску на NODE → подождать lead_ms (runtime,
-   g_sync_lead_ms) → применить у себя. Вызывается БЕЗ s_mutex.
+    if (fault == s_last_pushed_fault &&
+        fault != TRAFFIC_FAULT_NONE) {
+        return;
+    }
 
-   Для NODE (или если transport не LoRa) — просто apply_stage_dd().
+    char fbuf[256];
+    size_t fn = traffic_light_build_fault_report(fbuf, sizeof(fbuf));
+
+    if (fault == TRAFFIC_FAULT_ALL_OFF) {
+        if (fn > 0) transport_send_cmd_noack(fbuf, fn);
+
+        uint64_t utc = time_sync_get_utc_ms();
+        uint32_t dur = 1000;
+        uint64_t end = utc ? utc + dur : 0;
+        char cbuf[80];
+        int cn = snprintf(cbuf, sizeof(cbuf),
+                          "c:0:0:0000:0000:%lu:%llu",
+                          (unsigned long)dur,
+                          (unsigned long long)end);
+        if (cn > 0) transport_send_cmd_noack(cbuf, cn);
+        ESP_LOGW(TAG, "ROOT FAULT-PUSH → NODE: ALL_OFF (%s)", cbuf);
+    }
+    else if (fault == TRAFFIC_FAULT_YELLOW_BLINK) {
+        if (fn > 0) transport_send_cmd_noack(fbuf, fn);
+        ESP_LOGW(TAG, "ROOT FAULT-PUSH → NODE: YELLOW_BLINK (%s)", fbuf);
+    }
+    else {
+        if (fn > 0) transport_send_cmd_noack(fbuf, fn);
+        if (traffic_light_get_state() == TRAFFIC_STATE_RUNNING) {
+            uint8_t  ph  = traffic_light_get_phase();
+            uint32_t pm  = traffic_light_get_phase_ms();
+            uint32_t dur = traffic_light_get_phase_duration_ms();
+            send_sync_to_node_async_ex(ph, pm, dur, true, NULL);
+            ESP_LOGW(TAG, "ROOT FAULT-PUSH → NODE: NONE (c: ph=%u pm=%lu dur=%lu)",
+                     ph, (unsigned long)pm, (unsigned long)dur);
+        } else {
+            ESP_LOGW(TAG, "ROOT FAULT-PUSH → NODE: NONE (state not RUNNING)");
+        }
+    }
+
+    s_last_pushed_fault = fault;
+}
+
+/* ============================================================
+   root_apply_stage_sync_first
+   === FIX FAULT-HAS-TOP-PRIORITY ===
+   При активной аварии НЕ трогаем каналы и НЕ шлём c:.
    ============================================================ */
 static void root_apply_stage_sync_first(uint8_t seq_idx, uint32_t dur_ms)
 {
+    if (fault_active()) {
+        ESP_LOGW(TAG, "root_apply_stage_sync_first(%u): fault active (%s), "
+                      "skip (fault priority)", seq_idx,
+                 traffic_light_fault_str());
+        return;
+    }
     if (g_config.role != DEVICE_ROLE_MASTER || !transport_is_lora()) {
         apply_stage_dd(seq_idx);
         return;
@@ -193,30 +261,28 @@ static void root_apply_stage_sync_first(uint8_t seq_idx, uint32_t dur_ms)
         dur_ms = effective_stage_duration_ms(seq_idx);
     }
 
-    /* 1. Отправляем c: на NODE (pm=0, force=true) */
     send_sync_to_node_async_ex(seq_idx, 0, dur_ms, true, NULL);
-
-    /* 2. Ждём lead_ms (runtime). При lead=0 vTaskDelay(0) не
-       блокирует — apply_stage_dd выполнится сразу, без
-       синхронизма с NODE (пользователь сам выбрал). */
     uint32_t lead = sync_config_get_lead_ms();
     vTaskDelay(pdMS_TO_TICKS(lead));
-
-    /* 3. Применяем маску локально — синхронно с NODE */
     apply_stage_dd(seq_idx);
 }
-/* === END FIX ROOT-SEND-FIRST + LEAD-MS-RUNTIME === */
+/* === END FIX FAULT-HAS-TOP-PRIORITY === */
 
 /* ============================================================
    traffic_light_request_pedestrian_ex
    ============================================================ */
 void traffic_light_request_pedestrian_ex(bool from_remote)
 {
+    if (fault_active()) {
+        ESP_LOGW(TAG, "pedestrian request ignored: fault active (%s)",
+                 traffic_light_fault_str());
+        return;
+    }
+
     if (!g_config.traffic.pedestrian.button_enabled) {
         ESP_LOGW(TAG, "pedestrian request ignored: button disabled in config");
         return;
     }
-
     if (s_follow_root) {
         ESP_LOGI(TAG, "pedestrian request: follow_root → delegate to ROOT "
                       "(wait 'c:' per phase)");
@@ -293,7 +359,6 @@ void traffic_light_request_pedestrian_ex(bool from_remote)
         return;
     }
 
-    /* PED_REQUEST_MODE_STAGE */
     s_ped_request = true;
     s_ped_request_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
     s_ped_display_done = false;
@@ -317,10 +382,7 @@ void traffic_light_request_pedestrian(void)
 
 bool traffic_light_ped_button_enabled(void) { return g_config.traffic.pedestrian.button_enabled; }
 
-void traffic_light_set_sync_delay_us(uint32_t delay_us)
-{
-    s_sync_delay_us = delay_us;
-}
+void traffic_light_set_sync_delay_us(uint32_t delay_us) { s_sync_delay_us = delay_us; }
 uint32_t traffic_light_get_sync_delay_us(void) { return s_sync_delay_us; }
 void traffic_light_set_mux_reading(bool en) { s_mux_reading = en; }
 
@@ -346,10 +408,23 @@ static uint32_t insert_duration_ms(uint8_t seq_idx)
 
 /* ============================================================
    traffic_task_loop
-   === FIX BLINK-VIA-MASK-FIRST ===
-       Blink — ПЕРВЫМ блоком. До проверок sync_handshake,
-       follow_root, state, fault. NODE мигает, даже если он
-       застрял в sync (sync:done не пришёл).
+   === FIX FAULT-HAS-TOP-PRIORITY ===
+   === FIX ALL-OFF-STANDBY-NOT-FAULT ===
+   В standby (STOPPED + no fault) НЕ выполняем автоматику: смена
+   фаз, insert, hold, ALL_RED. Но и НЕ блокируем цикл полностью —
+   просто `continue` в конце проверки, как только увидели, что
+   state != RUNNING.
+
+   === FIX HOLD-PHASE ===
+   Если текущая фаза — hold-фаза (например, зелёный транспортный)
+   и нет активного ped-запроса/insert:
+     - max_hold_ms == 0 → держим бесконечно (continue);
+     - max_hold_ms > 0  → держим до истечения, потом обычная
+       смена фазы.
+   Нажатие кнопки (s_ped_request/s_insert_pending) снимает hold —
+   дальше идёт insert-логика. После return_to_hold
+   root_apply_stage_sync_first(hold_seq) снова ставит hold-фазу,
+   и следующая итерация цикла снова уходит в hold (continue).
    ============================================================ */
 void traffic_task_loop(void *arg)
 {
@@ -368,12 +443,7 @@ void traffic_task_loop(void *arg)
 
         uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
-        /* === FIX BLINK-VIA-MASK-FIRST ===
-           Blink работает ВСЕГДА, когда s_state=RUNNING и
-           s_blink_mask != 0. НЕ блокируется sync_handshake и
-           follow_root. Это критично: NODE может застрять в
-           ALIGNED (sync:done не пришёл от ROOT) — но blink
-           должен крутиться по маске из c:. */
+        /* === FIX BLINK-VIA-MASK-FIRST === */
         if (s_fault == TRAFFIC_FAULT_NONE &&
             s_state == TRAFFIC_STATE_RUNNING &&
             s_blink_mask != 0) {
@@ -384,19 +454,35 @@ void traffic_task_loop(void *arg)
             if (want_on != s_blink_on) {
                 s_blink_on = want_on;
                 apply_blink_bit(bm, s_blink_on);
-                /* === FIX BLINK-DEBUG-LOGI ===
-                   Временно LOGI (не LOGD), чтобы видеть в мониторе.
-                   Потом вернуть на LOGD. */
-                ESP_LOGI(TAG, "BLINK %s ch=0x%04X pos=%lu per=%lu",
-                         want_on ? "ON" : "OFF", bm,
-                         (unsigned long)pos, (unsigned long)per);
             }
         }
-        /* === END FIX BLINK-VIA-MASK-FIRST === */
 
-        /* === FIX PED-DISPLAY (ROOT only) === */
+        /* === FIX FAULT-BLINK-ALWAYS-FIRST === */
+        if (s_fault == TRAFFIC_FAULT_YELLOW_BLINK) {
+            uint32_t per = fault_blink_period_ms();
+            if (s_fault_blink_last_ms == 0 ||
+                (now - s_fault_blink_last_ms) >= per) {
+                s_fault_blink_last_ms = now;
+                s_fault_blink_on = !s_fault_blink_on;
+                fault_blink_yellow(s_fault_blink_on);
+            }
+        }
+
+        /* === FIX FAULT-HAS-TOP-PRIORITY ===
+           try_recovery только для YELLOW_BLINK, не для ALL_OFF. */
+        if (fault_active()) {
+            if (s_fault == TRAFFIC_FAULT_YELLOW_BLINK &&
+                !s_fault_blink_state &&
+                (now - s_last_recovery_ms >=
+                 g_config.traffic.fault.recovery_ms)) {
+                try_recovery(now, NULL);
+            }
+            continue;
+        }
+        /* === END FIX FAULT-HAS-TOP-PRIORITY === */
+
+        /* PED-DISPLAY (ROOT only) */
         if (g_config.role == DEVICE_ROLE_MASTER && !s_follow_root &&
-            s_fault == TRAFFIC_FAULT_NONE &&
             s_state == TRAFFIC_STATE_RUNNING) {
             uint8_t disp_ch = g_config.traffic.pins.cross_ped.ped_display;
             if (disp_ch < 16) {
@@ -412,12 +498,7 @@ void traffic_task_loop(void *arg)
                 }
             }
         }
-        /* === END FIX PED-DISPLAY === */
 
-        /* === FIX SYNC-HANDSHAKE (ПОСЛЕ blink) ===
-           Sync-handshake блокирует только ЛОГИКУ выбора фазы
-           (hold, insert, next_phase, all_red, recovery), но не
-           мигание каналов. */
         if (g_config.role == DEVICE_ROLE_MASTER &&
             sync_handshake_root_is_syncing()) {
             continue;
@@ -426,7 +507,6 @@ void traffic_task_loop(void *arg)
             sync_handshake_node_is_syncing()) {
             continue;
         }
-        /* === END FIX SYNC-HANDSHAKE === */
 
         if (now - last_phase_log_ms >= 5000) {
             last_phase_log_ms = now;
@@ -449,13 +529,10 @@ void traffic_task_loop(void *arg)
         if (s_state != TRAFFIC_STATE_RUNNING &&
             s_state != TRAFFIC_STATE_NIGHT_YELLOW_BLINK) continue;
 
-        /* === NODE (follow_root): NODE не решает фазу сам === */
         if (s_follow_root) {
             continue;
         }
-        /* === END NODE follow_root === */
 
-        /* stale ALL_OFF watchdog (ROOT) */
         if (s_state == TRAFFIC_STATE_RUNNING &&
             s_fault == TRAFFIC_FAULT_ALL_OFF) {
             if (all_off_since_ms == 0) {
@@ -467,6 +544,7 @@ void traffic_task_loop(void *arg)
                 s_fault_count = 0;
                 s_phase_start_ms = now;
                 s_force_resync_pending = true;
+                s_last_pushed_fault = TRAFFIC_FAULT_NONE;
                 root_apply_stage_sync_first(s_phase,
                     effective_stage_duration_ms(s_phase));
             }
@@ -475,8 +553,7 @@ void traffic_task_loop(void *arg)
         }
 
         if (s_state == TRAFFIC_STATE_NIGHT_YELLOW_BLINK) {
-            uint32_t per = g_config.traffic.phases_ms.fault_blink_period;
-            if (per < BLINK_MIN_PERIOD_MS) per = 500;
+            uint32_t per = fault_blink_period_ms();
             if (s_fault_blink_last_ms == 0 ||
                 (now - s_fault_blink_last_ms) >= per) {
                 s_fault_blink_last_ms = now;
@@ -504,9 +581,7 @@ void traffic_task_loop(void *arg)
                 xSemaphoreGive(s_mutex);
             }
             s_in_force_phase = true;
-            /* === FIX ROOT-SEND-FIRST === */
             root_apply_stage_sync_first(next_seq, next_dur);
-            /* === END FIX ROOT-SEND-FIRST === */
             s_in_force_phase = false;
             phase_change_cancel_pending();
             continue;
@@ -519,72 +594,6 @@ void traffic_task_loop(void *arg)
                 ESP_LOGW(TAG, "pedestrian INSERT timeout (%lu ms) → cancel",
                          (unsigned long)age);
                 s_ped_request = false;
-            }
-        }
-
-        if (s_fault != TRAFFIC_FAULT_NONE) {
-            if (s_fault == TRAFFIC_FAULT_YELLOW_BLINK) {
-                uint32_t per = g_config.traffic.phases_ms.fault_blink_period;
-                if (per < BLINK_MIN_PERIOD_MS) per = 500;
-                if (s_fault_blink_last_ms == 0 ||
-                    (now - s_fault_blink_last_ms) >= per) {
-                    s_fault_blink_last_ms = now;
-                    s_fault_blink_on = !s_fault_blink_on;
-                    fault_blink_yellow(s_fault_blink_on);
-                }
-                if (!s_fault_blink_state &&
-                    (now - s_last_recovery_ms >= g_config.traffic.fault.recovery_ms)) {
-                    try_recovery(now, NULL);
-                }
-            }
-            continue;
-        }
-
-        /* hold detection */
-        {
-            bool cur_hold = false;
-            if (g_config.traffic.hold.enabled) {
-                for (int i = 0; i < g_config.traffic.hold.stage_count; i++) {
-                    if (g_config.traffic.sequence[s_phase] ==
-                        g_config.traffic.hold.stage_ids[i]) {
-                        cur_hold = true;
-                        break;
-                    }
-                }
-            }
-            if (cur_hold != s_hold_active) {
-                ESP_LOGW(TAG, "hold: %s (phase %u seq=%u)",
-                         cur_hold ? "ENTER" : "EXIT",
-                         g_config.traffic.sequence[s_phase], s_phase);
-                s_hold_active = cur_hold;
-                if (cur_hold) {
-                    s_hold_pm_frozen = true;
-                    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
-                        s_phase_start_ms = now;
-                        xSemaphoreGive(s_mutex);
-                    }
-                } else {
-                    s_hold_pm_frozen = false;
-                }
-            }
-        }
-
-        if (s_hold_active && !s_insert_pending) {
-            if (s_pending_sync_phase != 0xFF) {
-                continue;
-            }
-            if (g_config.traffic.hold.max_hold_ms > 0 &&
-                (now - s_phase_start_ms) >= g_config.traffic.hold.max_hold_ms) {
-                ESP_LOGW(TAG, "hold: max_hold_ms=%lu reached → force next",
-                         (unsigned long)g_config.traffic.hold.max_hold_ms);
-            } else {
-                if (s_hold_pm_frozen) {
-                    if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
-                        s_phase_start_ms = now;
-                        xSemaphoreGive(s_mutex);
-                    }
-                }
-                continue;
             }
         }
 
@@ -728,7 +737,6 @@ void traffic_task_loop(void *arg)
                     ESP_LOGW(TAG, "insert DONE → safe_exit[1/%u] id=%u (seq=%u) dur=%lu",
                              exit_count, next_id, seq_idx, (unsigned long)dur_ex);
 
-                    s_insert_pending  = false;
                     s_ped_display_done = true;
 
                     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
@@ -778,7 +786,6 @@ void traffic_task_loop(void *arg)
                              exit_step + 1, exit_count, next_id, seq_idx,
                              (unsigned long)dur_ex);
 
-                    s_insert_pending  = false;
                     s_ped_display_done = true;
 
                     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) == pdTRUE) {
@@ -835,13 +842,44 @@ void traffic_task_loop(void *arg)
                 }
             }
 
-            ESP_LOGW(TAG, "insert COMPLETE: idx=%u/%u → clear pending",
-                     s_insert_idx, s_insert_count);
-            s_insert_pending = false;
-            s_insert_idx = 0;
-            s_insert_count = 0;
+            if (s_insert_pending) {
+                ESP_LOGW(TAG, "insert COMPLETE: idx=%u/%u → clear pending",
+                         s_insert_idx, s_insert_count);
+                s_insert_pending = false;
+                s_insert_idx = 0;
+                s_insert_count = 0;
+            }
             continue;
         }
+
+        /* === FIX HOLD-PHASE ===
+           Держим hold-фазу, пока не нажата кнопка и не истёк
+           max_hold_ms. Работает только для RUNNING + no fault.
+           s_ped_request / s_insert_pending снимают hold — тогда
+           управление уйдёт в INSERT block выше (insert_pending)
+           или в обычную смену фаз (ped_request, mode=STAGE). */
+        if (s_state == TRAFFIC_STATE_RUNNING &&
+            s_fault == TRAFFIC_FAULT_NONE &&
+            !s_ped_request && !s_insert_pending &&
+            stage_is_hold(s_phase)) {
+
+            s_hold_active = true;
+
+            if (g_config.traffic.hold.max_hold_ms > 0 &&
+                (now - s_phase_start_ms) >= g_config.traffic.hold.max_hold_ms) {
+                ESP_LOGW(TAG, "hold max_hold_ms=%lu expired → leave hold seq=%u",
+                         (unsigned long)g_config.traffic.hold.max_hold_ms,
+                         s_phase);
+                s_hold_active = false;
+                /* падаем в обычную смену фазы ниже */
+            } else {
+                /* остаёмся в hold-фазе */
+                continue;
+            }
+        } else {
+            s_hold_active = false;
+        }
+        /* === END FIX HOLD-PHASE === */
 
         bool need_fault = false;
         {
@@ -873,6 +911,7 @@ void traffic_task_loop(void *arg)
             apply_fault_mode(TRAFFIC_FAULT_YELLOW_BLINK);
             s_fault_blink_state = false;
             if (s_fault_notify) s_fault_notify(TRAFFIC_FAULT_YELLOW_BLINK);
+            root_push_fault_to_node(TRAFFIC_FAULT_YELLOW_BLINK);
             continue;
         }
 
@@ -968,13 +1007,8 @@ void traffic_task_loop(void *arg)
         s_hold_pm_frozen = false;
         xSemaphoreGive(s_mutex);
 
-        /* === FIX ROOT-SEND-FIRST ===
-           ROOT: сначала c: на NODE → lead_ms → apply_stage_dd.
-           NODE: сразу apply_stage_dd (но NODE сюда не попадает —
-           у него follow_root и return выше). */
         uint32_t dur_next = effective_stage_duration_ms(s_phase);
         root_apply_stage_sync_first(s_phase, dur_next);
-        /* === END FIX ROOT-SEND-FIRST === */
 
         if (s_ped_min_recall && stage_is_pedestrian(s_phase)) {
             ESP_LOGW(TAG, "MIN_RECALL: ped phase min %lu s applied",
@@ -1066,6 +1100,11 @@ esp_err_t traffic_light_set_mode(traffic_mode_t mode)
         ESP_LOGW(TAG, "Cannot change mode while running");
         return ESP_ERR_INVALID_STATE;
     }
+    if (fault_active()) {
+        ESP_LOGW(TAG, "Cannot change mode while fault active (%s)",
+                 traffic_light_fault_str());
+        return ESP_ERR_INVALID_STATE;
+    }
     s_mode = mode;
     g_config.traffic.mode = (uint8_t)mode;
     s_phase = 0;
@@ -1085,14 +1124,17 @@ esp_err_t traffic_light_set_mode(traffic_mode_t mode)
     s_insert_pending = false;
     s_insert_count = 0;
     s_insert_idx = 0;
+    s_last_pushed_fault = TRAFFIC_FAULT_NONE;
     set_all_off();
     ESP_LOGI(TAG, "Mode set to %d", mode);
     return ESP_OK;
 }
 
 /* ============================================================
-   start / stop / pause / resume / reset / next / force_phase /
-   apply_mask
+   start / stop / pause / resume / reset / next / force_phase
+   === FIX ALL-OFF-STANDBY-NOT-FAULT ===
+   traffic_light_start() больше НЕ ставит s_fault = ALL_OFF —
+   s_fault только про аварию. В standby s_fault == NONE.
    ============================================================ */
 esp_err_t traffic_light_start(void)
 {
@@ -1110,6 +1152,7 @@ esp_err_t traffic_light_start(void)
         return ESP_OK;
     }
 
+    bool was_fault = (s_fault != TRAFFIC_FAULT_NONE);
     s_state = TRAFFIC_STATE_RUNNING;
     s_phase = 0;
     s_phase_start_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -1122,27 +1165,26 @@ esp_err_t traffic_light_start(void)
         s_active_mask_from_root   = 0;
     }
 
-    traffic_fault_t f = s_fault;
-    if (f == TRAFFIC_FAULT_NONE) {
+    if (!was_fault) {
         s_fault_count = 0;
         s_fault_yellow_mask = 0;
-        s_recovery_attempts = 0;
-        s_ok_streak = 0;
-        s_last_recovery_ms = s_phase_start_ms;
-    } else {
-        s_last_recovery_ms = s_phase_start_ms;
-        s_fault_blink_state = false;
     }
+    s_last_recovery_ms = s_phase_start_ms;
     xSemaphoreGive(s_mutex);
+
+    if (was_fault) {
+        ESP_LOGW(TAG, "START while fault active (%s) — channels stay in fault",
+                 traffic_light_fault_str());
+        if (s_follow_root) set_all_off();
+        return ESP_OK;
+    }
 
     if (s_follow_root) {
         ESP_LOGI(TAG, "START (follow_root=true) — STANDBY, "
                       "waiting 'c:' from ROOT (channels OFF)");
         set_all_off();
-    } else if (f == TRAFFIC_FAULT_NONE) {
-        apply_stage_dd(0);
     } else {
-        apply_fault_mode(f);
+        apply_stage_dd(0);
     }
 
     ESP_LOGI(TAG, "START (mode=%d, seq=%u, fault=%s, follow_root=%d, hold=%d)",
@@ -1183,6 +1225,7 @@ void traffic_light_set_state_recovering(void)
     s_fault_yellow_mask_from_root = 0;
     s_fault_mask_valid            = false;
     s_fault_blink_state = false;
+    s_last_pushed_fault = TRAFFIC_FAULT_NONE;
     xSemaphoreGive(s_mutex);
 
     set_all_off();
@@ -1228,6 +1271,7 @@ esp_err_t traffic_light_start_with_red(void)
     s_insert_count = 0;
     s_insert_idx = 0;
     s_ped_display_done = false;
+    s_last_pushed_fault = TRAFFIC_FAULT_NONE;
 
     traffic_display_force_off();
 
@@ -1257,23 +1301,17 @@ esp_err_t traffic_light_stop(void)
     }
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
+    bool was_fault = (s_fault != TRAFFIC_FAULT_NONE);
     s_state = TRAFFIC_STATE_STOPPED;
     s_phase = 0;
-    s_fault = TRAFFIC_FAULT_NONE;
-    s_fault_count = 0;
-    s_fault_yellow_mask = 0;
-    s_fault_yellow_mask_from_root = 0;
-    s_fault_mask_valid            = false;
     s_recovery_attempts = 0;
     s_ok_streak = 0;
     s_last_recovery_ok_ms = 0;
-    s_last_recovery_ms = 0;
     s_phase_start_ms = 0;
     s_blink_mask = 0;
     s_blink_on = false;
     s_blink_last_phase = 0;
     s_last_fault_notify_ms = 0;
-    s_fault_blink_state = false;
     s_ped_request = false;
     s_ped_min_recall = false;
     s_mask_received = false;
@@ -1290,9 +1328,19 @@ esp_err_t traffic_light_stop(void)
     s_active_mask_from_root   = 0;
     s_prev_blink_mask = 0;
     s_prev_on_mask    = 0;
+    if (!was_fault) {
+        s_fault = TRAFFIC_FAULT_NONE;
+        s_fault_count = 0;
+        s_fault_yellow_mask = 0;
+        s_fault_yellow_mask_from_root = 0;
+        s_fault_mask_valid            = false;
+        s_last_recovery_ms = 0;
+        s_fault_blink_state = false;
+        s_last_pushed_fault = TRAFFIC_FAULT_NONE;
+    }
     xSemaphoreGive(s_mutex);
-    set_all_off();
-    ESP_LOGI(TAG, "STOP");
+    if (!was_fault) set_all_off();
+    ESP_LOGI(TAG, "STOP%s", was_fault ? " (fault channels kept)" : "");
     return ESP_OK;
 }
 
@@ -1338,23 +1386,17 @@ esp_err_t traffic_light_reset(void)
     }
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
+    bool was_fault = (s_fault != TRAFFIC_FAULT_NONE);
     s_phase = 0;
     s_state = TRAFFIC_STATE_STOPPED;
-    s_fault = TRAFFIC_FAULT_NONE;
-    s_fault_count = 0;
-    s_fault_yellow_mask = 0;
-    s_fault_yellow_mask_from_root = 0;
-    s_fault_mask_valid            = false;
     s_recovery_attempts = 0;
     s_ok_streak = 0;
     s_last_recovery_ok_ms = 0;
-    s_last_recovery_ms = 0;
     s_phase_start_ms = 0;
     s_blink_mask = 0;
     s_blink_on = false;
     s_blink_last_phase = 0;
     s_last_fault_notify_ms = 0;
-    s_fault_blink_state = false;
     s_ped_request = false;
     s_ped_min_recall = false;
     s_mask_received = false;
@@ -1371,14 +1413,29 @@ esp_err_t traffic_light_reset(void)
     s_active_mask_from_root   = 0;
     s_prev_blink_mask = 0;
     s_prev_on_mask    = 0;
+    if (!was_fault) {
+        s_fault = TRAFFIC_FAULT_NONE;
+        s_fault_count = 0;
+        s_fault_yellow_mask = 0;
+        s_fault_yellow_mask_from_root = 0;
+        s_fault_mask_valid            = false;
+        s_last_recovery_ms = 0;
+        s_fault_blink_state = false;
+        s_last_pushed_fault = TRAFFIC_FAULT_NONE;
+    }
     xSemaphoreGive(s_mutex);
-    set_all_off();
-    ESP_LOGI(TAG, "RESET");
+    if (!was_fault) set_all_off();
+    ESP_LOGI(TAG, "RESET%s", was_fault ? " (fault kept)" : "");
     return ESP_OK;
 }
 
 esp_err_t traffic_light_next_phase(void)
 {
+    if (fault_active()) {
+        ESP_LOGW(TAG, "next_phase ignored: fault active (%s)",
+                 traffic_light_fault_str());
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!s_mutex) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
@@ -1433,26 +1490,38 @@ esp_err_t traffic_light_force_phase(uint8_t phase, uint32_t phase_ms,
                                          : effective_stage_duration_ms(phase);
     xSemaphoreGive(s_mutex);
 
-    if (!in_fault) {
-        s_in_force_phase = true;
-        root_apply_stage_sync_first(phase, dur_use);
-        s_in_force_phase = false;
-        phase_change_cancel_pending();
+    if (in_fault) {
+        ESP_LOGW(TAG, "force_phase(%u): fault active (%s) — only state updated",
+                 phase, traffic_light_fault_str());
+        return ESP_OK;
     }
+
+    s_in_force_phase = true;
+    root_apply_stage_sync_first(phase, dur_use);
+    s_in_force_phase = false;
+    phase_change_cancel_pending();
     return ESP_OK;
 }
 
 /* ============================================================
-   traffic_light_apply_mask
-   === FIX APPLY-MASK-PM-DRIFT-TOLERANCE ===
-       apply_mask вызывается ТОЛЬКО на NODE (из c:).
-       pm в c: может отличаться от текущего на LoRa ToA.
-       Применяем только если |diff| > 250 мс (сильный дрейф).
+   traffic_light_apply_mask (NODE из c:)
+   === FIX FAULT-HAS-TOP-PRIORITY ===
+   === FIX ALL-OFF-STANDBY-NOT-FAULT ===
+   При standby (STOPPED + no fault) разрешаем c: — это «первичный
+   старт» от ROOT. Но всё ещё не разрешаем при YELLOW_BLINK.
    ============================================================ */
 void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
                               uint8_t phase, uint32_t phase_ms,
                               uint32_t duration_ms)
 {
+    if (fault_active() && !traffic_light_in_standby()) {
+        ESP_LOGW(TAG, "APPLY MASK ph=%u IGNORED: fault active (%s), "
+                      "on=0x%04X blink=0x%04X",
+                 phase, traffic_light_fault_str(), (unsigned)on_mask,
+                 (unsigned)blink_mask);
+        return;
+    }
+
     if (!s_mutex) return;
 
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
@@ -1485,7 +1554,6 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
         phase_ms = 0;
     }
 
-    /* Гасим display, если он не в on/blink */
     {
         uint8_t disp_ch = g_config.traffic.pins.cross_ped.ped_display;
         if (disp_ch < 16 &&
@@ -1495,19 +1563,16 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
         }
     }
 
-    /* Гасим всё, что не в новой маске */
     for (int ch = 0; ch < 16; ch++) {
         if (!(on_mask & (1u << ch)) &&
             !(blink_mask & (1u << ch))) {
             sr_output_off(ch);
         }
     }
-    /* Включаем on_mask */
     for (int ch = 0; ch < 16; ch++) {
         if (on_mask & (1u << ch))
             sr_output_on(ch);
     }
-    /* Гасим stale из предыдущего blink */
     if (blink_mask != s_prev_blink_mask || on_mask != s_prev_on_mask) {
         uint16_t stale = s_prev_blink_mask & ~(on_mask | blink_mask);
         for (int ch = 0; ch < 16; ch++) {
@@ -1517,9 +1582,6 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
         s_prev_on_mask    = on_mask;
     }
 
-    /* === FIX APPLY-MASK-PM-DRIFT-TOLERANCE ===
-       |diff| > 250 мс → синхронизируемся.
-       |diff| <= 250 мс → не двигаем s_phase_start_ms. */
     #define PM_DRIFT_TOLERANCE_MS  250
     if (s_state == TRAFFIC_STATE_RUNNING && s_phase == phase) {
         uint32_t cur_pm = now - s_phase_start_ms;
@@ -1529,7 +1591,6 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
             phase_ms = cur_pm;
         }
     }
-    /* === END FIX APPLY-MASK-PM-DRIFT-TOLERANCE === */
 
     s_phase            = phase;
     s_phase_start_ms   = now - phase_ms;
@@ -1566,6 +1627,7 @@ void traffic_light_apply_mask(uint16_t on_mask, uint16_t blink_mask,
              phase, (unsigned long)phase_ms, (unsigned long)duration_ms,
              (unsigned)on_mask, (unsigned)blink_mask);
 }
+/* === END FIX ALL-OFF-STANDBY-NOT-FAULT === */
 
 esp_err_t traffic_light_force_phase_masked(uint8_t phase,
                                            uint32_t phase_ms,
@@ -1574,9 +1636,6 @@ esp_err_t traffic_light_force_phase_masked(uint8_t phase,
     return traffic_light_force_phase(phase, phase_ms, duration_ms);
 }
 
-/* ============================================================
-   Геттеры
-   ============================================================ */
 uint16_t traffic_light_get_phase_on_mask(void)
 {
     if (g_config.traffic.sequence_count == 0) return 0;
@@ -1682,6 +1741,10 @@ uint16_t traffic_light_expected_sr_mask(void) { return traffic_light_expected_sr
 
 bool traffic_light_test_channel(uint8_t ch)
 {
+    if (fault_active()) {
+        ESP_LOGW(TAG, "test_channel(%u) ignored: fault active", ch);
+        return false;
+    }
     ESP_LOGI(TAG, "Testing ch%02d...", ch);
     uint16_t saved = sr_get_state();
     uint16_t yellow = 0;
@@ -1725,6 +1788,11 @@ uint32_t traffic_light_stage_duration_ms(uint8_t seq_idx)
 
 esp_err_t traffic_light_set_night_mode(bool enable)
 {
+    if (fault_active()) {
+        ESP_LOGW(TAG, "night_mode ignored: fault active (%s)",
+                 traffic_light_fault_str());
+        return ESP_ERR_INVALID_STATE;
+    }
     if (!s_mutex) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
@@ -1787,6 +1855,11 @@ bool traffic_light_is_night_mode(void) { return s_night_mode; }
 
 esp_err_t traffic_light_manual_override(uint8_t seq_idx)
 {
+    if (fault_active()) {
+        ESP_LOGW(TAG, "manual_override ignored: fault active (%s)",
+                 traffic_light_fault_str());
+        return ESP_ERR_INVALID_STATE;
+    }
     if (seq_idx >= g_config.traffic.sequence_count) return ESP_ERR_INVALID_ARG;
     if (!s_mutex) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
@@ -1827,6 +1900,7 @@ bool traffic_light_is_manual_override(void) { return s_manual_override; }
 
 esp_err_t traffic_light_priority_extend(uint32_t ms)
 {
+    if (fault_active()) return ESP_ERR_INVALID_STATE;
     if (!s_mutex) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
         return ESP_ERR_TIMEOUT;
@@ -1847,6 +1921,7 @@ esp_err_t traffic_light_priority_extend(uint32_t ms)
 
 esp_err_t traffic_light_priority_shorten(uint32_t ms)
 {
+    if (fault_active()) return ESP_ERR_INVALID_STATE;
     if (!s_mutex) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(s_mutex, pdMS_TO_TICKS(MUTEX_TIMEOUT_MS)) != pdTRUE)
         return ESP_ERR_TIMEOUT;

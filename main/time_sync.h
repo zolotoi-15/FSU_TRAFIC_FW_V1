@@ -53,6 +53,7 @@ void time_sync_node_report(void);
 void    time_sync_note_delta_ms(int32_t delta_ms);
 int32_t time_sync_get_delta_ms(void);
 uint32_t time_sync_get_delta_age_ms(void);
+bool time_sync_is_sntp_pending(void);
 
 #ifdef __cplusplus
 }

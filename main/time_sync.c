@@ -3,19 +3,24 @@
    ESP32-S3 (NVS + опциональный DS1307 + SNTP/LoRa).
 
    === FIX TIME-NVS-WRITE-FAST ===
-   NVS_WRITE_MIN_S 60 → 10. Раньше после reboot NVS-время
-   отставало до 60 с, time_sync_get возвращал устаревшее
-   время, |delta| при первом time: был огромным (десятки
-   секунд) — end_utc отбрасывался, NODE отставал от ROOT
-   на секунды. Теперь NVS-время обновляется раз в 10 с —
-   после reboot отставание ≤ 10 с.
+   NVS пишется не чаще раза в 10 с (было 60).
 
    === FIX TIME-DELTA-RESET-ON-INIT ===
-   s_last_delta_ms и s_last_delta_update_ms сбрасываются
-   в time_sync_init(). Раньше после reset они хранили
-   значение из прошлой жизни (до reboot) и попадали в
-   отчёт «delta=183710 ms» даже когда time_sync_get()
-   уже возвращал корректное время.
+   s_last_delta_ms сбрасывается в time_sync_init().
+
+   === FIX SNTP-PENDING-DIAG ===
+   time_sync_start_sntp() теперь:
+     - пишет s_sntp_started_ms;
+     - пишет s_sntp_sync_ms (последний callback);
+     - предоставляет time_sync_is_sntp_pending() — TRUE, пока
+       SNTP запущен, но callback ещё не приходил дольше
+       SNTP_PENDING_WARN_MS;
+     - в on_got_ip (blink_example_main.c) default netif = PPPoS
+       выставляется ДО time_sync_start_sntp() → SNTP-сокет
+       идёт через PPP.
+   time_sync_is_sntp_pending() используется в root_wd.c как
+   мягкий индикатор: если SNTP не отвечает >WAIT_TIME_SYNC_MAX_MS,
+   ROOT стартует без UTC (см. root_wd.c).
    ============================================================ */
 
 #include "time_sync.h"
@@ -54,13 +59,20 @@ static volatile uint32_t s_last_delta_update_ms = 0;
 static uint32_t s_last_push_ms   = 0;
 static uint32_t s_last_report_ms = 0;
 
-/* === FIX TIME-NVS-PERSIST + TIME-NVS-WRITE-FAST ===
-   NVS пишется не чаще раза в 10 секунд (было 60). */
+/* === FIX SNTP-PENDING-DIAG === */
+#define SNTP_PENDING_WARN_MS   (30 * 1000)
+
+static volatile bool     s_sntp_started    = false;
+static volatile bool     s_sntp_synced     = false;
+static volatile uint32_t s_sntp_started_ms = 0;
+static volatile uint32_t s_sntp_sync_ms    = 0;
+/* === END FIX === */
+
+/* === FIX TIME-NVS-PERSIST + TIME-NVS-WRITE-FAST === */
 #define NVS_NS_TIME        "time_save"
 #define NVS_KEY_UTC        "last_utc"
 #define NVS_TIME_MIN_YEAR  2024
 #define NVS_WRITE_MIN_S    10
-/* === END FIX === */
 
 static time_t s_last_nvs_write = 0;
 
@@ -201,12 +213,17 @@ esp_err_t time_sync_init(void)
     if (!s_mtx) s_mtx = xSemaphoreCreateMutex();
     if (!s_mtx) return ESP_ERR_NO_MEM;
 
-    /* === FIX TIME-DELTA-RESET-ON-INIT ===
-       Сбрасываем delta в 0 — иначе после reboot в отчёте
-       висит delta=183710 из прошлой жизни. */
+    /* === FIX TIME-DELTA-RESET-ON-INIT === */
     s_last_delta_ms = 0;
     s_last_delta_update_ms = 0;
-    /* === END FIX TIME-DELTA-RESET-ON-INIT === */
+    /* === END FIX === */
+
+    /* === FIX SNTP-PENDING-DIAG === */
+    s_sntp_started    = false;
+    s_sntp_synced     = false;
+    s_sntp_started_ms = 0;
+    s_sntp_sync_ms    = 0;
+    /* === END FIX === */
 
     time_t t_nvs = 0;
     if (nvs_time_read(&t_nvs)) {
@@ -287,27 +304,45 @@ uint32_t time_sync_get_delta_age_ms(void)
     return now - s_last_delta_update_ms;
 }
 
+/* === FIX SNTP-PENDING-DIAG === */
 static void sntp_sync_cb(struct timeval *tv)
 {
     if (!tv) return;
     ESP_LOGI(TAG, "SNTP sync: %ld.%06ld", (long)tv->tv_sec, (long)tv->tv_usec);
+    s_sntp_synced = true;
+    s_sntp_sync_ms = now_ms_tick();
     set_base((uint32_t)tv->tv_sec, (uint16_t)(tv->tv_usec / 1000), 0);
 }
 
 esp_err_t time_sync_start_sntp(void)
 {
-    static bool started = false;
-    if (started) return ESP_OK;
-    started = true;
+    if (s_sntp_started) return ESP_OK;
+    s_sntp_started = true;
 
     esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_set_time_sync_notification_cb(sntp_sync_cb);
     esp_sntp_init();
-    ESP_LOGI(TAG, "SNTP started (pool.ntp.org)");
+
+    s_sntp_started_ms = now_ms_tick();
+    ESP_LOGI(TAG, "SNTP started (pool.ntp.org), started_at=%lu ms",
+             (unsigned long)s_sntp_started_ms);
     return ESP_OK;
 }
 
+bool time_sync_is_sntp_pending(void)
+{
+    if (!s_sntp_started) return false;
+    if (s_sntp_synced)    return false;
+    if (s_sntp_started_ms == 0) return false;
+    uint32_t now = now_ms_tick();
+    return (now - s_sntp_started_ms) >= SNTP_PENDING_WARN_MS;
+}
+/* === END FIX SNTP-PENDING-DIAG === */
+
+/* ============================================================
+   time_sync_root_push_ex
+   ============================================================ */
 static void time_sync_root_push_ex(uint32_t rtt_us, bool force)
 {
     if (g_config.role != DEVICE_ROLE_MASTER) return;

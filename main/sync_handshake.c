@@ -2,25 +2,25 @@
    sync_handshake.c — ускоренное восстановление LoRa-связи
    с ритуалом синхронизации и синхронным миганием ЖДИТЕ.
 
-   === FIX NODE-ALIGNED-TIMEOUT (новое) ===
-       Если NODE в ALIGNED дольше SYNC_ALIGN_TIMEOUT_MS и
-       sync:done не пришёл — принудительно IDLE + display_off.
-       ROOT к этому моменту уже вышел из sync и шлёт c:/traffic:start.
-       Без этого фикса NODE висит в ALIGNED бесконечно,
-       traffic_task_loop уходит в continue, blink не крутится.
+   === FIX SYNC-PONG-UTC ===
+   NODE в sync:pong возвращает pm_utc, пересчитанный через
+   end_utc_ms из sync:lock. ROOT сравнивает по той же UTC-шкале.
+   ToA/RTT/обработка исключены из drift.
 
-   === FIX ALIGNED-TIMEOUT (ROOT) ===
-       ROOT в ALIGNED дольше SYNC_ALIGN_TIMEOUT_MS без disp_streak —
-       принудительный IDLE + traffic:start + c:.
+   === FIX FAULT-HAS-TOP-PRIORITY ===
+   Если s_fault != NONE (YELLOW_BLINK или ALL_OFF), ритуал
+   sync:probe/time/lock НЕ запускается: авария имеет наивысший
+   приоритет. В ALIGNED-ветке traffic:start + start_with_red
+   пропускаются при активной аварии. По завершении таймаута
+   ALIGNED при аварии — только sync:done + IDLE, без снятия
+   fault и без старта.
 
-   === FIX TIME-IN-ALIGNED ===
-       Пока ROOT в ALIGNED — time: раз в 1000 мс. Иначе часы NODE
-       уплывают, disp не совпадает.
-
-   === FIX ALIGNED-NO-RESET-STATE-MS ===
-       В ALIGNED при resend sync:display НЕ обновляем
-       s_root_state_ms / s_node_state_ms — иначе таймауты не
-       сработают.
+   === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
+   Перед traffic:start в ветках ALIGNED-timeout и disp-synced
+   ROOT отправляет явный fault:none + пауза. NODE мог сам уйти
+   в ALL_OFF из-за потери ROOT (node_link_watchdog_task) и
+   блокирует traffic:start/c: через
+   traffic_light_fault_has_priority() без fault:none.
    ============================================================ */
 
 #include "sync_handshake.h"
@@ -44,6 +44,18 @@ static const char *TAG = "sync_hs";
 
 extern volatile bool     s_node_running;
 extern volatile uint32_t s_last_node_msg_ms;
+
+/* === FIX SYNC-PONG-UTC ===
+   Fallback-порог для локального pm (когда UTC недоступен).
+   Покрывает ToA (112 мс SF8/BW250 для 40 байт) + RTT + обработку. */
+#define SYNC_ALIGN_DRIFT_LOCAL_MS    400
+/* === END FIX SYNC-PONG-UTC === */
+
+/* === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
+   Пауза между fault:none и traffic:start — чтобы LoRa успел
+   доставить первый пакет (ToA 10 байт ≈ 40-50 мс SF8/BW250). */
+#define FAULT_NONE_TO_START_GAP_MS   80
+/* === END FIX ROOT-RETURN-SENDS-FAULT-NONE === */
 
 /* ============================================================
    Общее: мигание ЖДИТЕ + выключение остальных
@@ -117,6 +129,19 @@ static inline void display_force_off(void)
     sr_output_off(ch);
 }
 
+/* === FIX SYNC-PONG-UTC: elapsed_ms по UTC === */
+static uint32_t utc_elapsed_ms(uint64_t end_utc_ms, uint32_t dur_ms)
+{
+    if (end_utc_ms == 0 || dur_ms == 0) return 0;
+    uint64_t now_utc = time_sync_get_utc_ms();
+    if (now_utc == 0) return 0;
+    if (now_utc >= end_utc_ms) return dur_ms;
+    uint64_t remain = end_utc_ms - now_utc;
+    if (remain > dur_ms) remain = dur_ms;
+    return (uint32_t)(dur_ms - remain);
+}
+/* === END FIX SYNC-PONG-UTC === */
+
 /* ============================================================
    ROOT
    ============================================================ */
@@ -136,6 +161,12 @@ static volatile uint32_t     s_root_node_pm = 0;
 static volatile uint8_t      s_root_node_phase = 0xFF;
 static volatile uint32_t     s_root_node_pm_ms = 0;
 static volatile bool         s_root_node_status_fresh = false;
+
+/* === FIX SYNC-PONG-UTC: параметры последнего lock === */
+static volatile uint64_t     s_root_lock_end_utc_ms = 0;
+static volatile uint32_t     s_root_lock_dur_ms     = 0;
+static volatile uint32_t     s_root_lock_phase      = 0;
+/* === END FIX SYNC-PONG-UTC === */
 
 static volatile uint8_t  s_root_node_disp       = 0xFF;
 static volatile uint32_t s_root_node_disp_ms    = 0;
@@ -165,6 +196,18 @@ static void root_set_state(sync_state_t st)
 
 void sync_handshake_root_start(void)
 {
+    /* === FIX FAULT-HAS-TOP-PRIORITY ===
+       При активной аварии ритуал sync:probe НЕ запускаем: каналы
+       принадлежат аварии. Как только авария снята (try_recovery
+       или ручной traffic:start), ритуал стартует. */
+    if (traffic_light_fault_has_priority()) {
+        ESP_LOGW(TAG, "ROOT sync: START ignored (fault active: %s)",
+                 traffic_light_fault_str());
+        return;
+    }
+    /* === END FIX FAULT-HAS-TOP-PRIORITY === */
+
+    for (int i = 0; i < 16; i++) sr_output_off(i);   // все выключены
     if (g_config.role != DEVICE_ROLE_MASTER) return;
     if (s_root_state != SYNC_STATE_IDLE) return;
 
@@ -175,6 +218,9 @@ void sync_handshake_root_start(void)
     s_root_lock_sent = 0;
     s_root_aligned_streak = 0;
     s_root_node_status_fresh = false;
+    s_root_lock_end_utc_ms = 0;
+    s_root_lock_dur_ms = 0;
+    s_root_lock_phase = 0;
 
     s_root_node_disp    = 0xFF;
     s_root_node_disp_ms = 0;
@@ -247,16 +293,43 @@ void sync_handshake_root_on_rx(const char *evt, size_t len)
             s_root_node_status_fresh = true;
 
             if (s_root_state == SYNC_STATE_PHASE) {
-                uint32_t my_pm = traffic_light_get_phase_ms();
-                int32_t  drift = (int32_t)pm - (int32_t)my_pm;
+                bool utc_used = false;
+                int32_t drift = 0;
+
+                if (s_root_lock_end_utc_ms != 0 &&
+                    s_root_lock_dur_ms != 0) {
+                    uint32_t my_pm_utc = utc_elapsed_ms(
+                        s_root_lock_end_utc_ms, s_root_lock_dur_ms);
+                    if (my_pm_utc != 0 || pm != 0) {
+                        drift = (int32_t)pm - (int32_t)my_pm_utc;
+                        utc_used = true;
+                        ESP_LOGD(TAG, "ROOT sync: pong pm_utc=%u my_pm_utc=%u "
+                                      "drift=%ld [utc]",
+                                 pm, my_pm_utc, (long)drift);
+                    }
+                }
+
+                if (!utc_used) {
+                    uint32_t my_pm = traffic_light_get_phase_ms();
+                    drift = (int32_t)pm - (int32_t)my_pm;
+                    ESP_LOGW(TAG, "ROOT sync: pong drift=%ld [local] "
+                                  "(UTC unavailable)",
+                             (long)drift);
+                }
+
                 if (drift < 0) drift = -drift;
                 s_root_last_drift_ms = drift;
 
-                if (drift <= SYNC_ALIGN_DRIFT_MS) {
+                int32_t threshold = utc_used ? SYNC_ALIGN_DRIFT_MS
+                                             : SYNC_ALIGN_DRIFT_LOCAL_MS;
+
+                if (drift <= threshold) {
                     s_root_aligned_streak++;
-                    ESP_LOGI(TAG, "ROOT sync: pong drift=%ld ms (streak %u/%u)",
+                    ESP_LOGI(TAG, "ROOT sync: pong drift=%ld ms "
+                                  "(streak %u/%u)%s",
                              (long)drift, s_root_aligned_streak,
-                             SYNC_ALIGN_STREAK);
+                             SYNC_ALIGN_STREAK,
+                             utc_used ? " [utc]" : " [local]");
                     if (s_root_aligned_streak >= SYNC_ALIGN_STREAK) {
                         ESP_LOGW(TAG, "ROOT sync: ALIGNED (drift %ld ms)",
                                  (long)drift);
@@ -265,7 +338,7 @@ void sync_handshake_root_on_rx(const char *evt, size_t len)
                 } else {
                     s_root_aligned_streak = 0;
                     ESP_LOGW(TAG, "ROOT sync: pong drift=%ld ms > %d → re-lock",
-                             (long)drift, SYNC_ALIGN_DRIFT_MS);
+                             (long)drift, threshold);
                     s_root_lock_sent = 0;
                 }
             }
@@ -324,6 +397,23 @@ void sync_handshake_root_tick(uint32_t now_ms)
     if (g_config.role != DEVICE_ROLE_MASTER) return;
     if (s_root_state == SYNC_STATE_IDLE) return;
 
+    /* === FIX FAULT-HAS-TOP-PRIORITY ===
+       При активной аварии ритуал не трогает каналы: авария
+       управляет ими. Форсим IDLE без sync:done и без start. */
+    if (traffic_light_fault_has_priority()) {
+        if (s_root_state != SYNC_STATE_IDLE) {
+            ESP_LOGW(TAG, "ROOT sync: fault active (%s) → force IDLE "
+                          "(no traffic:start)",
+                     traffic_light_fault_str());
+            display_only_stop();
+            display_force_off();
+            s_root_state = SYNC_STATE_IDLE;
+            s_root_state_ms = now_ms;
+        }
+        return;
+    }
+    /* === END FIX FAULT-HAS-TOP-PRIORITY === */
+
     bool use_utc = (s_root_state >= SYNC_STATE_TIME);
     display_only_blink(now_ms, use_utc);
 
@@ -336,15 +426,25 @@ void sync_handshake_root_tick(uint32_t now_ms)
                      (unsigned)(now_ms - s_root_sync_started_ms));
             display_only_stop();
             display_force_off();
-            s_fault_from_remote_ex = true;
-            traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-            s_fault_from_remote_ex = false;
-            traffic_light_set_follow_root(false);
-            traffic_light_start_with_red();
-            transport_send_cmd_noack("traffic:start", strlen("traffic:start"));
-            uint8_t ph = traffic_light_get_phase();
-            send_sync_to_node_async_ex(ph, 0,
-                traffic_light_get_phase_duration_ms(), true, NULL);
+            /* === FIX FAULT-HAS-TOP-PRIORITY ===
+               На случай, если fault поднялся ровно между проверкой
+               выше и этим блоком — не стартуем. */
+            if (!traffic_light_fault_has_priority()) {
+                /* === FIX ROOT-RETURN-SENDS-FAULT-NONE === */
+                transport_send_cmd_noack("fault:none", strlen("fault:none"));
+                vTaskDelay(pdMS_TO_TICKS(FAULT_NONE_TO_START_GAP_MS));
+                /* === END FIX === */
+
+                s_fault_from_remote_ex = true;
+                traffic_light_set_fault(TRAFFIC_FAULT_NONE);
+                s_fault_from_remote_ex = false;
+                traffic_light_set_follow_root(false);
+                traffic_light_start_with_red();
+                transport_send_cmd_noack("traffic:start", strlen("traffic:start"));
+                uint8_t ph = traffic_light_get_phase();
+                send_sync_to_node_async_ex(ph, 0,
+                    traffic_light_get_phase_duration_ms(), true, NULL);
+            }
             root_set_state(SYNC_STATE_IDLE);
             return;
         } else if (s_root_state != SYNC_STATE_ALIGNED) {
@@ -394,6 +494,7 @@ void sync_handshake_root_tick(uint32_t now_ms)
         break;
 
     case SYNC_STATE_PHASE: {
+        /* Resend time: в PHASE (для тех, кто пропустил) */
         if (s_root_last_phase_time_ms == 0 ||
             (now_ms - s_root_last_phase_time_ms) >= 1000) {
             s_root_last_phase_time_ms = now_ms;
@@ -415,6 +516,10 @@ void sync_handshake_root_tick(uint32_t now_ms)
                 uint32_t dur = traffic_light_get_phase_duration_ms();
                 uint64_t utc = time_sync_get_utc_ms();
                 uint64_t end_utc = utc + (dur > pm ? dur - pm : dur);
+
+                s_root_lock_end_utc_ms = end_utc;
+                s_root_lock_dur_ms     = dur;
+                s_root_lock_phase      = ph;
 
                 char lcmd[128];
                 int ln = snprintf(lcmd, sizeof(lcmd),
@@ -441,36 +546,49 @@ void sync_handshake_root_tick(uint32_t now_ms)
     }
 
     case SYNC_STATE_ALIGNED: {
-        /* === FIX ALIGNED-TIMEOUT (ROOT) === */
         if ((now_ms - s_root_state_ms) >= SYNC_ALIGN_TIMEOUT_MS) {
             ESP_LOGE(TAG, "ROOT sync: ALIGNED timeout %u ms "
                           "(disp_streak=%u) → force IDLE + traffic:start",
                      (unsigned)(now_ms - s_root_state_ms),
                      s_root_disp_streak);
 
-            transport_send_cmd_noack("traffic:start",
-                                     strlen("traffic:start"));
             transport_send_cmd_noack("sync:done", 9);
 
-            s_fault_from_remote_ex = true;
-            traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-            s_fault_from_remote_ex = false;
-            traffic_light_set_follow_root(false);
-            traffic_light_start_with_red();
-            uint8_t ph = traffic_light_get_phase();
-            send_sync_to_node_async_ex(
-                ph, 0,
-                traffic_light_get_phase_duration_ms(),
-                true, NULL);
+            /* === FIX FAULT-HAS-TOP-PRIORITY ===
+               traffic:start + start_with_red только если авария
+               не поднялась во время ALIGNED. */
+            if (!traffic_light_fault_has_priority()) {
+                /* === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
+                   NODE мог сам уйти в ALL_OFF из-за потери ROOT.
+                   Шлём fault:none ПЕРЕД traffic:start, с паузой. */
+                transport_send_cmd_noack("fault:none", strlen("fault:none"));
+                vTaskDelay(pdMS_TO_TICKS(FAULT_NONE_TO_START_GAP_MS));
+                /* === END FIX === */
+
+                transport_send_cmd_noack("traffic:start",
+                                         strlen("traffic:start"));
+                s_fault_from_remote_ex = true;
+                traffic_light_set_fault(TRAFFIC_FAULT_NONE);
+                s_fault_from_remote_ex = false;
+                traffic_light_set_follow_root(false);
+                traffic_light_start_with_red();
+                uint8_t ph = traffic_light_get_phase();
+                send_sync_to_node_async_ex(
+                    ph, 0,
+                    traffic_light_get_phase_duration_ms(),
+                    true, NULL);
+            } else {
+                ESP_LOGW(TAG, "ROOT sync: ALIGNED timeout but fault active "
+                              "(%s) — skip start",
+                         traffic_light_fault_str());
+            }
 
             display_only_stop();
             display_force_off();
             root_set_state(SYNC_STATE_IDLE);
             break;
         }
-        /* === END FIX ALIGNED-TIMEOUT === */
 
-        /* === FIX TIME-IN-ALIGNED === */
         if (s_root_last_phase_time_ms == 0 ||
             (now_ms - s_root_last_phase_time_ms) >= 1000) {
             s_root_last_phase_time_ms = now_ms;
@@ -482,7 +600,6 @@ void sync_handshake_root_tick(uint32_t now_ms)
                 if (tn > 0) transport_send_cmd_noack(tcmd, tn);
             }
         }
-        /* === END FIX TIME-IN-ALIGNED === */
 
         static uint32_t s_last_display_sync_ms = 0;
         if (s_last_display_sync_ms == 0 ||
@@ -511,19 +628,33 @@ void sync_handshake_root_tick(uint32_t now_ms)
                           "traffic:start + sync:done + c: → IDLE",
                      s_root_disp_streak, SYNC_DISPLAY_STREAK_MIN);
 
-            transport_send_cmd_noack("traffic:start", strlen("traffic:start"));
             transport_send_cmd_noack("sync:done", 9);
 
-            s_fault_from_remote_ex = true;
-            traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-            s_fault_from_remote_ex = false;
-            traffic_light_set_follow_root(false);
-            traffic_light_start_with_red();
-            uint8_t ph = traffic_light_get_phase();
-            send_sync_to_node_async_ex(
-                ph, 0,
-                traffic_light_get_phase_duration_ms(),
-                true, NULL);
+            /* === FIX FAULT-HAS-TOP-PRIORITY === */
+            if (!traffic_light_fault_has_priority()) {
+                /* === FIX ROOT-RETURN-SENDS-FAULT-NONE === */
+                transport_send_cmd_noack("fault:none", strlen("fault:none"));
+                vTaskDelay(pdMS_TO_TICKS(FAULT_NONE_TO_START_GAP_MS));
+                /* === END FIX === */
+
+                transport_send_cmd_noack("traffic:start",
+                                         strlen("traffic:start"));
+                s_fault_from_remote_ex = true;
+                traffic_light_set_fault(TRAFFIC_FAULT_NONE);
+                s_fault_from_remote_ex = false;
+                traffic_light_set_follow_root(false);
+                traffic_light_start_with_red();
+                uint8_t ph = traffic_light_get_phase();
+                send_sync_to_node_async_ex(
+                    ph, 0,
+                    traffic_light_get_phase_duration_ms(),
+                    true, NULL);
+            } else {
+                ESP_LOGW(TAG, "ROOT sync: disp synced but fault active "
+                              "(%s) — skip start",
+                         traffic_light_fault_str());
+            }
+            /* === END FIX === */
 
             display_only_stop();
             display_force_off();
@@ -568,6 +699,9 @@ static volatile uint32_t     s_node_sync_started_ms = 0;
 static volatile uint32_t     s_node_lock_pm = 0;
 static volatile uint8_t      s_node_lock_phase = 0;
 
+static volatile uint64_t     s_node_lock_end_utc_ms = 0;
+static volatile uint32_t     s_node_lock_dur_ms     = 0;
+
 sync_state_t sync_handshake_node_state(void) { return s_node_state; }
 bool sync_handshake_node_is_syncing(void) { return s_node_state != SYNC_STATE_IDLE; }
 
@@ -581,6 +715,15 @@ static void node_set_state(sync_state_t st)
 
 void sync_handshake_node_start(void)
 {
+    /* === FIX FAULT-HAS-TOP-PRIORITY ===
+       При активной аварии ритуал sync:probe НЕ запускаем. */
+    if (traffic_light_fault_has_priority()) {
+        ESP_LOGW(TAG, "NODE sync: START ignored (fault active: %s)",
+                 traffic_light_fault_str());
+        return;
+    }
+    /* === END FIX FAULT-HAS-TOP-PRIORITY === */
+
     if (g_config.role != DEVICE_ROLE_SLAVE) return;
     if (s_node_state != SYNC_STATE_IDLE) return;
 
@@ -588,6 +731,8 @@ void sync_handshake_node_start(void)
     s_node_sync_started_ms = (uint32_t)(esp_timer_get_time() / 1000);
     s_node_last_probe_ms = 0;
     s_node_last_ack_ms = 0;
+    s_node_lock_end_utc_ms = 0;
+    s_node_lock_dur_ms = 0;
 
     for (int i = 0; i < 16; i++) sr_output_off(i);
 
@@ -646,6 +791,26 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
     }
 
     if (strncmp(buf, "sync:lock:", 10) == 0) {
+        /* === FIX FAULT-HAS-TOP-PRIORITY ===
+           Если NODE в аварии — не применяем sync:lock к каналам
+           (apply_mask и так заблокирован, но и состояние не
+           трогаем, чтобы не сбить s_phase_start_ms для recovery). */
+        if (traffic_light_fault_has_priority()) {
+            ESP_LOGW(TAG, "NODE sync: lock IGNORED (fault active: %s)",
+                     traffic_light_fault_str());
+            /* Отвечаем pong, чтобы ROOT не висел в PHASE — но
+               без применения маски. pm_to_send — 0, ROOT получит
+               drift = 0 - my_pm ≠ 0 → re-lock, но если ROOT тоже
+               в аварии, он не будет спрашивать. */
+            char pong[80];
+            int pn = snprintf(pong, sizeof(pong),
+                              "sync:pong:0:0:0:%u",
+                              (unsigned)traffic_light_get_phase());
+            if (pn > 0) transport_send_evt_noack(pong, pn);
+            return;
+        }
+        /* === END FIX === */
+
         unsigned int ph = 0, pm = 0, dur = 0;
         unsigned long long end_utc = 0;
         if (sscanf(buf + 10, "%u:%u:%u:%llu",
@@ -666,6 +831,9 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
             s_node_lock_phase = (uint8_t)ph;
             s_node_lock_pm    = pm;
 
+            s_node_lock_end_utc_ms = (uint64_t)end_utc;
+            s_node_lock_dur_ms     = (uint32_t)dur;
+
             if (s_mutex && xSemaphoreTake(s_mutex,
                         pdMS_TO_TICKS(100)) == pdTRUE) {
                 s_phase          = (uint8_t)ph;
@@ -675,19 +843,32 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
                 xSemaphoreGive(s_mutex);
             }
 
-            uint32_t my_pm = traffic_light_get_phase_ms();
+            uint32_t pm_utc = utc_elapsed_ms((uint64_t)end_utc,
+                                             (uint32_t)dur);
+            uint32_t pm_to_send;
+            bool utc_ok = (pm_utc != 0 || end_utc == 0);
+            if (end_utc != 0 && pm_utc != 0) {
+                pm_to_send = pm_utc;
+            } else {
+                pm_to_send = traffic_light_get_phase_ms();
+                utc_ok = false;
+            }
+
             uint32_t my_ph = traffic_light_get_phase();
             uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-            char pong[64];
+            char pong[80];
             int pn = snprintf(pong, sizeof(pong),
                               "sync:pong:%u:%u:%u:%u",
                               (unsigned)now_ms, (unsigned)now_ms,
-                              (unsigned)my_pm, (unsigned)my_ph);
+                              (unsigned)pm_to_send, (unsigned)my_ph);
             if (pn > 0) transport_send_evt_noack(pong, pn);
 
+            ESP_LOGW(TAG, "NODE sync: lock ph=%u pm=%u dur=%u end_utc=%llu "
+                          "→ pong pm_utc=%u (%s) my_ph=%u",
+                     ph, pm, dur, end_utc, pm_to_send,
+                     utc_ok ? "utc" : "local", my_ph);
+
             if (s_node_state == SYNC_STATE_PHASE) {
-                ESP_LOGW(TAG, "NODE sync: lock ph=%u pm=%u → pong (my pm=%u)",
-                         ph, pm, (unsigned)my_pm);
                 node_set_state(SYNC_STATE_ALIGNED);
             } else if (s_node_state == SYNC_STATE_ALIGNED) {
                 ESP_LOGD(TAG, "NODE sync: pong resent in ALIGNED");
@@ -697,6 +878,11 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
     }
 
     if (strncmp(buf, "sync:display:", 13) == 0) {
+        /* === FIX FAULT-HAS-TOP-PRIORITY ===
+           В аварии display-каналом управляет fault-мигание, а не
+           sync:display. */
+        if (traffic_light_fault_has_priority()) return;
+        /* === END FIX === */
         unsigned int bit = 0;
         unsigned long long next_edge = 0;
         if (sscanf(buf + 13, "%u:%llu", &bit, &next_edge) == 2) {
@@ -738,6 +924,10 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
             display_force_off();
             node_set_state(SYNC_STATE_IDLE);
         }
+        /* === FIX FAULT-HAS-TOP-PRIORITY ===
+           sync_handshake НЕ снимает fault и НЕ трогает каналы.
+           Снятие fault — только через fault:none от ROOT (см.
+           node_proto.c) или try_recovery. */
         return;
     }
 }
@@ -747,15 +937,25 @@ void sync_handshake_node_tick(uint32_t now_ms)
     if (g_config.role != DEVICE_ROLE_SLAVE) return;
     if (s_node_state == SYNC_STATE_IDLE) return;
 
+    /* === FIX FAULT-HAS-TOP-PRIORITY ===
+       При активной аварии ритуал не трогает каналы. Форсим IDLE
+       без display. */
+    if (traffic_light_fault_has_priority()) {
+        if (s_node_state != SYNC_STATE_IDLE) {
+            ESP_LOGW(TAG, "NODE sync: fault active (%s) → force IDLE",
+                     traffic_light_fault_str());
+            display_only_stop();
+            display_force_off();
+            s_node_state = SYNC_STATE_IDLE;
+            s_node_state_ms = now_ms;
+        }
+        return;
+    }
+    /* === END FIX FAULT-HAS-TOP-PRIORITY === */
+
     bool use_utc = (s_node_state >= SYNC_STATE_TIME);
     display_only_blink(now_ms, use_utc);
 
-    /* === FIX NODE-ALIGNED-TIMEOUT ===
-       Если NODE в ALIGNED дольше SYNC_ALIGN_TIMEOUT_MS и
-       sync:done не пришёл — принудительно IDLE + display_off.
-       ROOT к этому моменту уже вышел из sync и шлёт c:/traffic:start.
-       Без этого фикса NODE висит в ALIGNED бесконечно,
-       traffic_task_loop уходит в continue, blink не крутится. */
     if (s_node_state == SYNC_STATE_ALIGNED &&
         (now_ms - s_node_state_ms) >= SYNC_ALIGN_TIMEOUT_MS) {
         ESP_LOGE(TAG, "NODE sync: ALIGNED timeout %u ms → force IDLE",
@@ -765,7 +965,6 @@ void sync_handshake_node_tick(uint32_t now_ms)
         node_set_state(SYNC_STATE_IDLE);
         return;
     }
-    /* === END FIX NODE-ALIGNED-TIMEOUT === */
 
     /* Глобальный таймаут для PROBE/TIME/PHASE */
     if (s_node_sync_started_ms != 0 &&
@@ -788,17 +987,27 @@ void sync_handshake_node_tick(uint32_t now_ms)
         break;
 
     case SYNC_STATE_ALIGNED:
-        /* resend pong раз в 3 с. НЕ обновляем s_node_state_ms —
-           иначе ALIGNED-TIMEOUT никогда не сработает. */
+        /* resend pong раз в 3 с. НЕ обновляем s_node_state_ms — иначе
+           ALIGNED-TIMEOUT никогда не сработает. */
         if ((now_ms - s_node_state_ms) >= 3000) {
             ESP_LOGW(TAG, "NODE sync: no done for 3s → resend pong");
-            uint32_t my_pm = traffic_light_get_phase_ms();
+
+            uint32_t pm_to_send;
+            uint64_t end_utc = s_node_lock_end_utc_ms;
+            uint32_t dur     = s_node_lock_dur_ms;
+            uint32_t pm_utc  = utc_elapsed_ms(end_utc, dur);
+            if (end_utc != 0 && pm_utc != 0) {
+                pm_to_send = pm_utc;
+            } else {
+                pm_to_send = traffic_light_get_phase_ms();
+            }
+
             uint32_t my_ph = traffic_light_get_phase();
-            char pong[64];
+            char pong[80];
             int pn = snprintf(pong, sizeof(pong),
                               "sync:pong:%u:%u:%u:%u",
                               (unsigned)now_ms, (unsigned)now_ms,
-                              (unsigned)my_pm, (unsigned)my_ph);
+                              (unsigned)pm_to_send, (unsigned)my_ph);
             if (pn > 0) transport_send_evt_noack(pong, pn);
             /* НЕ трогаем s_node_state_ms */
         }

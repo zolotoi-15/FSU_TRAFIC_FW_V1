@@ -265,6 +265,7 @@ static void ip_event_handler(void *arg, esp_event_base_t base,
    ============================================================ */
 static void modem_hw_reset(void)
 {
+    s_sim_ready = false;
 #if MODEM_USE_RST
     ESP_LOGI(TAG, "HW reset модема on GPIO%d", MODEM_RST);
     gpio_config_t io = {
@@ -331,7 +332,22 @@ static esp_modem_dce_t *create_dce_synced(uint32_t baud, const char *apn)
    ============================================================ */
 esp_err_t modem_ppp_start(const char *apn, uint32_t timeout_ms)
 {
+    bool already_attached = false;
+if (s_dce) {
+    char resp[64];
+    if (esp_modem_at(s_dce, "AT+CGATT?", resp, 1000) == ESP_OK &&
+        strstr(resp, "+CGATT: 1")) {
+        already_attached = true;
+        ESP_LOGI(TAG, "modem already attached → skip reset+CGATT");
+    }
+}
+if (!already_attached) {
+    modem_hw_reset();
+    /* ... AT+CGATT=1, AT+CGDCONT=... */
+}
+
     if (s_dce) return ESP_OK;
+    
     if (!apn || strlen(apn) == 0) return ESP_ERR_INVALID_ARG;
 
     if (!s_state_mtx) s_state_mtx = xSemaphoreCreateMutex();
@@ -375,7 +391,28 @@ esp_err_t modem_ppp_start(const char *apn, uint32_t timeout_ms)
 
     /* 4. ATE0 */
     esp_modem_at(s_dce, "ATE0", NULL, 1000);
+/*
+// === DIAG: проверяем состояние модема === 
+char resp[256];
+esp_err_t e;
+e = esp_modem_at(s_dce, "AT+CPIN?",   resp, 2000); ESP_LOGI(TAG, "CPIN?: %s (err=%d)", e==ESP_OK?resp:"?", e);
+e = esp_modem_at(s_dce, "AT+CSQ",     resp, 2000); ESP_LOGI(TAG, "CSQ:   %s", e==ESP_OK?resp:"?");
+e = esp_modem_at(s_dce, "AT+CREG?",   resp, 2000); ESP_LOGI(TAG, "CREG?: %s", e==ESP_OK?resp:"?");
+e = esp_modem_at(s_dce, "AT+CGREG?",  resp, 2000); ESP_LOGI(TAG, "CGREG?:%s", e==ESP_OK?resp:"?");
+e = esp_modem_at(s_dce, "AT+CGATT?",  resp, 2000); ESP_LOGI(TAG, "CGATT?:%s", e==ESP_OK?resp:"?");
+e = esp_modem_at(s_dce, "AT+CGDCONT?",resp, 2000); ESP_LOGI(TAG, "CGDCONT?:%s", e==ESP_OK?resp:"?");
 
+// === Принудительно attach, если не attached === 
+esp_modem_at(s_dce, "AT+CGATT=1", NULL, 10000);
+
+// === Явно задаём PDP context === 
+char cmd[128];
+snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", apn);
+esp_modem_at(s_dce, cmd, NULL, 2000);
+esp_modem_at(s_dce, "AT+CGAUTH=1,0", NULL, 1000);   // no auth 
+esp_modem_at(s_dce, "AT+CGACT=0,1", NULL, 2000);
+esp_modem_at(s_dce, "AT+CGACT=1,1", NULL, 5000);
+*/
     /* 5. PPP data mode */
     ESP_LOGI(TAG, "entering PPP data mode...");
     esp_err_t err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_DATA);
@@ -384,6 +421,9 @@ esp_err_t modem_ppp_start(const char *apn, uint32_t timeout_ms)
         goto fail;
     }
 
+   /* esp_modem_at(s_dce, "AT+CGDCONT=1,\"IP\",\"internet\"", NULL, 2000);
+esp_modem_at(s_dce, "AT+CGAUTH=1,0", NULL, 1000);
+*/
     /* 6. Ждать IP */
     ESP_LOGI(TAG, "waiting for PPP IP (up to %lu ms)...",
              (unsigned long)timeout_ms);
@@ -406,6 +446,7 @@ fail:
 
 esp_err_t modem_ppp_stop(void)
 {
+    s_sim_ready = false;
     if (!s_dce) return ESP_OK;
 
     ESP_LOGI(TAG, "stopping PPP...");

@@ -50,46 +50,31 @@ extern volatile uint32_t        s_blink_last_phase;
 extern volatile uint32_t        s_sync_delay_us;
 extern uint8_t                  s_suspect_counter[16];
 extern uint8_t                  s_vin_off_counter[16];
+extern uint8_t                  s_short_gnd_counter[16];   /* === FIX SHORT-GND-CONFIRM === */
 extern uint8_t                  s_ok_streak;
 extern volatile bool            s_mux_reading;
 extern volatile uint32_t        s_last_recovery_ok_ms;
 extern volatile bool            s_fault_blink_state;
 
-/* === FIX YELLOW-BLINK-PAUSE-AFTER-ALL-OFF ===
-   Момент последнего переключения fault-мигания и его состояние.
-   Инициализируется в apply_fault_mode() (после set_all_off),
-   чтобы первый тик traffic_task_loop подождал fault_blink_period
-   (500 мс) → «все каналы OFF → пауза → мигание». */
 extern volatile uint32_t        s_fault_blink_last_ms;
 extern volatile bool            s_fault_blink_on;
-/* === END FIX YELLOW-BLINK-PAUSE-AFTER-ALL-OFF === */
 
-/* === FIX P0-1: NODE — получена ли первая маска от ROOT === */
 extern volatile bool            s_mask_received;
-/* === END FIX P0-1 === */
-
-/* === FIX INSERT-NO-DOUBLE-SYNC === */
 extern volatile bool            s_in_force_phase;
-/* === END FIX INSERT-NO-DOUBLE-SYNC === */
 
-/* === FIX 4: маска жёлтых от ROOT === */
 extern volatile uint16_t        s_fault_yellow_mask_from_root;
 extern volatile bool            s_fault_mask_valid;
-/* === END FIX 4 === */
 
-/* === HOLD/INSERT: state для hold + insert === */
+/* === HOLD/INSERT === */
 extern volatile bool            s_hold_active;
 extern volatile bool            s_insert_pending;
 extern volatile uint8_t         s_insert_queue[MAX_INSERT_SEQ];
 extern volatile uint8_t         s_insert_count;
 extern volatile uint8_t         s_insert_idx;
 extern volatile uint32_t        s_insert_request_ms;
-/* === END HOLD/INSERT === */
 
-/* === FIX INSERT-NO-DOUBLE-SYNC: доступ к pending из traffic_light.c === */
 extern volatile uint8_t         s_pending_sync_phase;
 void phase_change_cancel_pending(void);
-/* === END FIX INSERT-NO-DOUBLE-SYNC === */
 
 /* === Callbacks === */
 extern traffic_fault_notify_cb_t s_fault_notify;
@@ -97,13 +82,9 @@ extern traffic_phase_change_cb_t s_phase_change_cb;
 extern volatile uint16_t s_expected_mask_from_root;
 extern volatile uint16_t s_active_mask_from_root;
 
-/* === FIX PED-DISPLAY-AFTER-PED-GREEN ===
-   TRUE, если в текущем insert пешеходная фаза (ped_green или
-   ped_blink) уже наступила. ЖДИТЕ (display) после этого не
-   включается до следующего нажатия кнопки (сброс в
-   traffic_light_request_pedestrian_ex). */
 extern volatile bool s_ped_display_done;
-/* === END FIX PED-DISPLAY-AFTER-PED-GREEN === */
+
+void root_push_fault_to_node(traffic_fault_t fault);
 
 /* ============================================================
    traffic_config.c
@@ -120,34 +101,35 @@ uint16_t traffic_light_expected_sr_mask_internal(void);
 void     apply_stage_dd(uint8_t seq_idx);
 void     set_all_off(void);
 
-/* === FIX PED-DISPLAY ===
-   stage_is_ped_green_or_blink: TRUE, если стадия seq_idx —
-   ped_green или ped_blink (по duration_kind). Используется
-   для решения, показывать ли ЖДИТЕ (ped.display) в текущей
-   стадии: пока FALSE — показывать, TRUE — скрыть. */
 bool     stage_is_ped_green_or_blink(uint8_t seq_idx);
-/* === END FIX PED-DISPLAY === */
+bool     traffic_mask_has_conflict(uint16_t on_mask);
 
-/* === FIX GOST-CONFLICT-MATRIX === */
-bool traffic_mask_has_conflict(uint16_t on_mask);
-/* === END FIX GOST-CONFLICT-MATRIX === */
+/* === FIX HOLD-PHASE ===
+   TRUE, если фаза seq_idx входит в hold.stage_ids (например,
+   зелёный транспортный, который держится до нажатия кнопки).
+   В этом состоянии traffic_task_loop НЕ переходит на следующую
+   фазу, пока s_ped_request || s_insert_pending не подняты, либо
+   пока не истечёт hold.max_hold_ms (>0). */
+bool     stage_is_hold(uint8_t seq_idx);
+/* === END FIX HOLD-PHASE === */
 
-/* === FIX GOST-ALL-RED === */
 #define ALL_RED_MIN_MS   2000
-
 bool need_virtual_all_red(uint8_t from_seq, uint8_t to_seq);
-/* === END FIX GOST-ALL-RED === */
 
 /* ============================================================
    traffic_fault.c
    ============================================================ */
 void     apply_fault_mode(traffic_fault_t fault);
 void     fault_blink_yellow(bool on);
+uint32_t fault_blink_period_ms(void);   /* === FIX FAULT-BLINK-PERIOD-EXPORT === */
 void     try_recovery(uint32_t now_ms, uint32_t *blink_last);
 const char *reason_str(uint8_t reason);
 void     fill_reason_text(traffic_fault_info_t *fi, const char *detail, uint8_t paired);
 uint8_t  classify_channel(uint8_t ch, bool should_be_on,
                           const mux_data_t *data, const char **out_detail);
+
+/* === FIX FAULT-HAS-TOP-PRIORITY === */
+static inline bool fault_active(void) { return s_fault != TRAFFIC_FAULT_NONE; }
 
 /* ============================================================
    traffic_light.c — callbacks (extern)

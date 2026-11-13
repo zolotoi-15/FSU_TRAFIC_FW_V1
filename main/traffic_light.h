@@ -30,13 +30,7 @@ typedef struct {
     uint8_t axis_a2_red, axis_a2_yellow, axis_a2_green;
     uint8_t axis_a3_red, axis_a3_yellow, axis_a3_green;
     uint8_t ped_red,     ped_green;
-    /* === FIX PED-DISPLAY ===
-       "ЖДИТЕ" — выход, включается сразу после нажатия кнопки
-       пешеходом (s_ped_request || s_insert_pending) на ROOT и NODE
-       одновременно (через c: от ROOT), выключается, когда текущая
-       стадия — ped_green или ped_blink (stage_is_ped_green_or_blink). */
     uint8_t ped_display;
-    /* === END FIX PED-DISPLAY === */
 } traffic_pins_cross_ped_t;
 
 typedef enum {
@@ -82,7 +76,6 @@ typedef enum {
 #define TRAFFIC_UNDERLOAD_MAX_MA   50
 
 #define TRAFFIC_REASON_STR_LEN     96
-
 #define TRAFFIC_PHASE_OVERDUE_MS   5000
 
 typedef struct {
@@ -189,19 +182,27 @@ void traffic_light_request_pedestrian_ex(bool from_remote);
 void traffic_light_set_state_recovering(void);
 esp_err_t traffic_light_start_with_red(void);
 
-/* === FIX PED-DISPLAY ===
-   Прямое управление выходом «ЖДИТЕ» (g_config.traffic.pins.cross_ped.ped_display).
-   Обычно не вызывается напрямую — display управляется в traffic_task_loop
-   (ROOT) и через c: от ROOT (NODE). Но полезно для mqtt_cmd при
-   pedestrian:request, чтобы включить ЖДИТЕ мгновенно на ROOT. */
 void traffic_light_ped_display_set(bool on);
-
-/* === FIX PED-DISPLAY ===
-   Проверка «текущая стадия — ped_green или ped_blink» по duration_kind.
-   Используется для решения, показывать ли ЖДИТЕ (пока FALSE — показывать,
-   TRUE — скрыть). */
 bool stage_is_ped_green_or_blink(uint8_t seq_idx);
-/* === END FIX PED-DISPLAY === */
+
+/* === FIX FAULT-HAS-TOP-PRIORITY ===
+   TRUE, пока s_fault != NONE. Используется в root_wd.c
+   (send_channels_to_node_impl, phase_sync_task), node_proto.c
+   (c:/traffic:start apply), sync_handshake (ритуал IDLE) и т.д. */
+bool traffic_light_fault_has_priority(void);
+
+/* === FIX ALL-OFF-STANDBY-NOT-FAULT ===
+   TRUE, если контроллер в «standby перед стартом»: s_state ==
+   STOPPED и все каналы выключены, но это НЕ fault-авария.
+   Отличие от fault_has_priority: standby разрешает
+   send_channels / c: от ROOT (нужно для первичного c:0:...:red
+   до первого трафика), а fault — блокирует.
+   Возвращает true, если:
+     - role==MASTER и g_state==STOPPED и s_fault==NONE
+     - role==SLAVE  и g_state==STOPPED и s_fault==NONE
+   Т.е. это «нормальный простой», а не «аварийный простой». */
+bool traffic_light_in_standby(void);
+/* === END FIX ALL-OFF-STANDBY-NOT-FAULT === */
 
 #ifdef __cplusplus
 }
