@@ -12,7 +12,7 @@ extern "C" {
 #define SYNC_MIN_INTERVAL_MS      250
 #define TIME_PUSH_PERIOD_MS       10000
 #define HOLD_RESYNC_INTERVAL_MS   500
-#define LORA_SYNC_INTERVAL_MS     300
+#define LORA_SYNC_INTERVAL_MS     3000
 #define SYNC_MAX_DRIFT_MS         250
 #define UTC_DELTA_MAX_MS          5000
 
@@ -20,7 +20,7 @@ extern "C" {
    Runtime-переменная вместо #define. Значение по умолчанию
    задаётся в sync_config.c (150 мс). */
 #define SYNC_LEAD_MS_DEFAULT      150
-#define SYNC_LEAD_MS_MIN          50
+#define SYNC_LEAD_MS_MIN          0
 #define SYNC_LEAD_MS_MAX          1000
 
 extern volatile uint32_t g_sync_lead_ms;
