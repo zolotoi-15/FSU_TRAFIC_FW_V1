@@ -35,6 +35,43 @@
 
    === FIX TIME-APPLY-IN-ALIGNED ===
    time: применяется на NODE всегда.
+<<<<<<< Updated upstream
+=======
+
+   === FIX NODE-STATUS-ROOT-FORMAT ===
+   STATUS от NODE в формате ROOT (SR/NET/TRAFFIC/FAULT/LINK/
+   NODE/NODE_FAULT/RS485/CAN/RTT + "role":"node" в хвосте).
+   Позволяет потребителю читать ROOT и NODE одинаковым
+   парсером.
+
+   on_node_status_from_transport() парсит LINK.root.rssi (а не
+   LINK.rssi), т.к. LINK теперь — объект с root/node.
+
+   === FIX STATUS-NO-CHANNELS ===
+   STATUS без ch00..ch15 → ~686 байт = 17 фрагментов по LoRa.
+   Без ACK на каждом фрагменте (T_STATUS = noack) потеря
+   любого фрагмента → frag gap → отбрасывание всего пакета.
+   Каналы NODE остаются в T_CHANNELS (раз в 60 с, публикуется
+   в <base>/Node/Channels).
+
+   === FIX T-CHANNELS-NOT-COMBINED ===
+   T_CHANNELS и STATUS больше НЕ шлются в одной итерации
+   node_send_task. После T_CHANNELS — пауза 3000 мс + continue.
+
+   === FIX UTC-SKIP-PM-RESET ===
+   КЛЮЧЕВАЯ ПРАВКА.
+   Раньше при UTC skipped (delta > 3000 мс) NODE применял
+   pm из c: «как есть». Но pm от ROOT — это «сколько фаза
+   уже длится на ROOT». NODE применяет s_phase_start_ms =
+   now - pm → NODE прыгает в середину фазы (при pm=12040
+   сразу 12 секунд вперёд). При dur=15000 фаза на NODE
+   заканчивается через 3 с — рассинхронизация.
+
+   Теперь: если UTC skipped и pm > 3000 мс — применяем pm=0
+   (фаза начнётся с начала, доиграет свой dur). Исключение:
+   ph=0 (ALL_OFF) и insert-фазы — для них pm применяется
+   как есть (это управляющие команды, не нормальная фаза).
+>>>>>>> Stashed changes
    ============================================================ */
 
 #include "node_proto.h"
@@ -83,7 +120,11 @@ volatile bool s_node_channels_valid = false;
 static uint32_t s_last_channels_ms = 0;
 /* === END FIX T_CHANNELS === */
 
+<<<<<<< Updated upstream
 #define NODE_STATUS_PERIOD_MS      5000
+=======
+#define NODE_STATUS_PERIOD_MS      10000
+>>>>>>> Stashed changes
 #define NODE_STATUS_FAULT_MS       1000
 #define NODE_STATUS_SYNC_MS        500
 #define STATUS_FORCE_MS            5000
@@ -93,6 +134,25 @@ static uint32_t s_last_channels_ms = 0;
 #define UTC_DELTA_MAX_MS_LOCAL     3000
 #define SYNC_MAX_DRIFT_MS_LOCAL    500
 
+<<<<<<< Updated upstream
+=======
+/* === FIX STATUS-NO-CHANNELS ===
+   Буфер STATUS: новый формат без ch00..ch15 ≈ 686 байт.
+   1024 — с запасом (FAULT.reasons может быть длинным). */
+#define NODE_STATUS_BUF_SIZE       1024
+/* === END FIX STATUS-NO-CHANNELS === */
+
+/* === FIX UTC-SKIP-PM-RESET ===
+   Порог «подозрительно большой pm»: если UTC недоступен и
+   pm > этого порога — вероятно, ROOT давно в фазе, а NODE
+   только что получил c:. Применяем pm=0, чтобы фаза на NODE
+   началась с начала, а не прыгнула в середину.
+   Порог 3000 мс — типичный ToA/RTT + запас на несколько
+   потерянных c: подряд. */
+#define UTC_SKIP_PM_MAX_MS         3000
+/* === END FIX UTC-SKIP-PM-RESET === */
+
+>>>>>>> Stashed changes
 volatile bool s_fault_from_remote_ex = false;
 volatile bool s_node_running = false;
 
@@ -136,6 +196,7 @@ static inline void node_note_root_data(void)
 /* ============================================================
    node_apply_c_mask
    === FIX FAULT-HAS-TOP-PRIORITY ===
+   === FIX UTC-SKIP-PM-RESET ===
    ============================================================ */
 static void node_apply_c_mask(uint8_t ph,
                               uint32_t pm,
@@ -186,6 +247,31 @@ static void node_apply_c_mask(uint8_t ph,
             }
         }
     }
+
+    /* === FIX UTC-SKIP-PM-RESET ===
+       Если UTC не применился (used_utc == false) и pm большой —
+       NODE прыгнет в середину фазы. Это неправильно: лучше
+       начать фазу с начала (pm=0), пусть доиграет свой dur.
+       Исключения:
+         - ph=0 (ALL_OFF) — это управляющая команда, pm не важен;
+         - insert-фазы (insert_pending) — pm относится к текущей
+           фазе, но нам важнее применить on/blink маску.
+       Для них оставляем apply_pm = pm как есть. */
+    if (!used_utc && apply_pm > UTC_SKIP_PM_MAX_MS) {
+        bool is_all_off = (ph == 0 && on16 == 0 && blink16 == 0);
+        bool is_insert   = s_insert_pending;
+        if (!is_all_off && !is_insert) {
+            ESP_LOGW(TAG, "c: pm=%lu > %d without UTC → reset pm=0 "
+                          "(avoid jump into phase middle)",
+                     (unsigned long)apply_pm, UTC_SKIP_PM_MAX_MS);
+            apply_pm = 0;
+        } else {
+            ESP_LOGI(TAG, "c: pm=%lu > %d without UTC, but %s → keep pm",
+                     (unsigned long)apply_pm, UTC_SKIP_PM_MAX_MS,
+                     is_all_off ? "ALL_OFF" : "insert");
+        }
+    }
+    /* === END FIX UTC-SKIP-PM-RESET === */
 
     ESP_LOGI(TAG, "c: ph=%u pm=%lu→%lu on=0x%04X blink=0x%04X dur=%lu%s",
              ph, (unsigned long)pm, (unsigned long)apply_pm,
@@ -864,6 +950,25 @@ static void on_evt_from_node(const char *evt, size_t len)
 
 /* ============================================================
    node_send_task
+<<<<<<< Updated upstream
+=======
+   === FIX STATUS-NO-CHANNELS ===
+   STATUS от NODE (формат ROOT, БЕЗ ch00..ch15):
+     {"SR":{state+hex+outputs},"NET":{role=node,ppp,ip},
+      "TRAFFIC":{state,mode,phase,phase_ms,phase_duration_ms,
+                 phase_count},
+      "FAULT":{mode,count,channels,reasons},
+      "LINK":{"root":{...},"node":{...}},
+      "NODE":null,"NODE_FAULT":null,
+      "RS485":{...},"CAN":{...},"RTT":{...},
+      "role":"node"}
+   ≈ 686 байт = 17 фрагментов по LoRa.
+
+   === FIX T-CHANNELS-NOT-COMBINED ===
+   После T_CHANNELS — пауза + continue. STATUS в этой итерации
+   НЕ шлётся. Иначе 27+17 фрагментов подряд → коллизии с c:
+   от ROOT → потеря фрагментов → ROOT не собирает пакет.
+>>>>>>> Stashed changes
    ============================================================ */
 static void node_send_task(void *arg)
 {
@@ -911,6 +1016,16 @@ static void node_send_task(void *arg)
             esp_err_t err = transport_send_channels(json, off);
             ESP_LOGI(TAG, "T_CHANNELS -> ROOT: %s (%d bytes)",
                      err == ESP_OK ? "OK" : esp_err_to_name(err), off);
+<<<<<<< Updated upstream
+=======
+
+            /* === FIX T-CHANNELS-NOT-COMBINED ===
+               После T_CHANNELS — пауза и continue: STATUS в этой
+               итерации НЕ отправляем. */
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            continue;
+            /* === END FIX T-CHANNELS-NOT-COMBINED === */
+>>>>>>> Stashed changes
         }
         /* === END FIX T_CHANNELS === */
 

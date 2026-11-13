@@ -53,7 +53,7 @@ static SemaphoreHandle_t s_mtx      = NULL;
 static volatile int32_t  s_last_delta_ms = 0;
 static volatile uint32_t s_last_delta_update_ms = 0;
 
-#define TIME_SYNC_PUSH_PERIOD_MS   30000
+#define TIME_SYNC_PUSH_PERIOD_MS   10000
 #define TIME_SYNC_REPORT_PERIOD_MS 5000
 
 static uint32_t s_last_push_ms   = 0;
