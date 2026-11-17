@@ -1,3 +1,4 @@
+/*
 #include "wifi_ap.h"
 void wifi_init(void) {}
 esp_err_t wifi_start(void) { return ESP_OK; }
@@ -19,3 +20,4 @@ esp_err_t wifi_scan_for_fsu_ap(char *o, size_t l, int8_t *r, uint8_t *c, const c
     { (void)o;(void)l;(void)r;(void)c;(void)p; return ESP_ERR_NOT_SUPPORTED; }
 esp_err_t wifi_ap_suspend_for_parse(void) { return ESP_OK; }
 esp_err_t wifi_ap_resume_after_parse(void) { return ESP_OK; }
+*/

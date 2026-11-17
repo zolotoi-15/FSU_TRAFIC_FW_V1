@@ -157,9 +157,11 @@ int mqtt_build_json(char *json, size_t size) {
     /* === FIX BLE-NAME-CLASH ===
        Если телефон подключён — дублируем JSON в STATUS (Notify).
        Публикуется из mqtt_publish_task раз в MQTT_PUBLISH_PERIOD_MS. */
+  //  #if CONFIG_BT_ENABLED
     if (fsu_ble_is_connected()) {
         fsu_ble_notify_status(json, strlen(json));
     }
+//#endif
     /* === END FIX BLE-NAME-CLASH === */
 
     (void)TAG;

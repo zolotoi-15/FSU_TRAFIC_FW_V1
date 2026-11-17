@@ -4,17 +4,33 @@
 
    UART: TX=GPIO21 (ESP32 -> модем RX), RX=GPIO10 (модем TX -> ESP32).
    RST:  GPIO36 — input-only, НЕ используется (MODEM_USE_RST=0).
-   Baud: 115200, fallback 9600.
+   Baud: 115200, fallback 57600.
 
-   Команды (A76XX):
-     AT                          — sync
-     ATE0                        — выключить эхо
-     AT+CGDCONT=1,"IP","<APN>"   — PDP context (делает esp_modem)
-     ATD*99#                     — PPP (делает esp_modem)
+   === FIX MODEM-USE-RST-OFF ===
+       GPIO36 на ESP32-S3 не может быть OUTPUT. Ставим 0 —
+       никакого реального сброса нет, только wait 1500-15000 мс.
+       Если RST перепаян на выходной GPIO — задайте MODEM_RST в
+       board_pins.h и выставьте MODEM_USE_RST=1.
 
-   esp_modem 2.x: DCE+DTE создаются одной функцией esp_modem_new_dev().
+   === FIX MODEM-DOUBLE-RESET ===
+       Раньше modem_hw_reset() вызывался ДВА раза подряд:
+       в начале (if !already_attached) и после esp_netif_new().
+       Итого 3 с ожидания + путаница в логах. Убран второй вызов.
+
+   === FIX PPP-NETIF-DIAG ===
+       Логируется heap до/после esp_netif_new(ESP_NETIF_DEFAULT_PPP()),
+       чтобы при отказе "lwIP PPP connection cannot be created"
+       было видно, память ли виновата или sdkconfig (LWIP_PPP_SUPPORT).
+
+   === FIX CGATT-CGDCONT-BEFORE-NEWDEV ===
+       Раньше блок AT+CGATT=1 / AT+CGDCONT=... был только в
+       комментарии. Теперь выполняется реально перед esp_modem_new_dev().
    ============================================================ */
+
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
+
 #include "modem_ppp.h"
 #include "board_pins.h"
 
@@ -23,6 +39,7 @@
 #include "esp_netif_ppp.h"
 #include "esp_event.h"
 #include "esp_modem_api.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -36,8 +53,8 @@
 static const char *TAG = "modem_ppp";
 
 /* GPIO36 input-only — RST через него невозможен.
-   Если RST перепаян на выходной GPIO — задайте MODEM_RST в board_pins.h
-   и выставьте MODEM_USE_RST=1. */
+   Если RST перепаян на выходной GPIO — задайте MODEM_RST в
+   board_pins.h и выставьте MODEM_USE_RST=1. */
 #define MODEM_USE_RST   1
 
 #define MODEM_BAUD_DEFAULT   115200
@@ -48,7 +65,6 @@ static const char *TAG = "modem_ppp";
 #define PPP_GOT_IP_BIT   BIT0
 #define PPP_LOST_IP_BIT  BIT1
 
-/* esp_modem 2.x: s_dte не нужен — DTE внутри DCE */
 static esp_modem_dce_t   *s_dce        = NULL;
 static esp_netif_t       *s_ppp_netif  = NULL;
 static EventGroupHandle_t s_evt        = NULL;
@@ -58,20 +74,16 @@ static volatile bool s_connected = false;
 static char          s_ip[16]    = "0.0.0.0";
 static char          s_apn[64]   = {0};
 
-// === SIM READY: флаг, что модем ответил +CPIN: READY ===
+/* === SIM READY: флаг, что модем ответил +CPIN: READY === */
 static volatile bool s_sim_ready = false;
 
-
-/* Прямой UART-тест: шлём "AT\r\n", ждём "OK".
-   Возвращает baud, на котором модем ответил OK, или 0. */
+/* ============================================================
+   UART baud scan
+   Возвращает baud, на котором модем ответил OK, или 0.
+   ============================================================ */
 static uint32_t modem_uart_find_baud(void)
 {
-    /*static const uint32_t bauds[] = {
-        115200, 9600, 57600, 230400, 460800, 38400, 19200, 74880
-    };*/
-    static const uint32_t bauds[] = {
-        115200, 57600
-    };
+    static const uint32_t bauds[] = { 115200, 57600 };
     const uart_port_t uart_num = MODEM_UART_NUM;
 
     ESP_LOGW(TAG, "UART baud scan (TX=%d RX=%d)...", MODEM_TX, MODEM_RX);
@@ -105,25 +117,23 @@ static uint32_t modem_uart_find_baud(void)
             int n = uart_read_bytes(uart_num, rx, sizeof(rx),
                                     pdMS_TO_TICKS(800));
             if (n > 0) {
-                ESP_LOGW(TAG, "  rx %d bytes: '%.*s'",
-                         n, n, (char *)rx);
+                ESP_LOGW(TAG, "  rx %d bytes: '%.*s'", n, n, (char *)rx);
 
-                // === SIM READY: парсим +CPIN: READY в ответе модема ===
-                // Ответ может быть: "AT\r\nOK\r\n\r\n+CPIN: READY\r\n"
-                // Используем memmem, т.к. rx может содержать \0.
+                /* === SIM READY: парсим +CPIN: READY === */
                 if (memmem(rx, n, "+CPIN: READY", 12) != NULL) {
-    if (!s_sim_ready) {
-        ESP_LOGI(TAG, "SIM ready (+CPIN: READY) → PPPoS preferred over WiFi STA");
-        s_sim_ready = true;
-        // === НОВОЕ: мгновенно отключаем STA, чтобы IDF не спамил ===
-        
-       
-    }
-}
-
-                if (memmem(rx, n, "OK", 2)) {
-                    ok = true;
+                    if (!s_sim_ready) {
+                        ESP_LOGI(TAG, "SIM ready (+CPIN: READY) → "
+                                      "PPPoS preferred over WiFi STA");
+                        s_sim_ready = true;
+                    }
                 }
+
+                if (memmem(rx, n, "OK", 2) ||
+    memmem(rx, n, "ATREADY", 7) ||
+    memmem(rx, n, "+CPIN:", 6) ||
+    memmem(rx, n, "+CGEV:", 6)) {
+    ok = true;
+}
             }
         }
         uart_driver_delete(uart_num);
@@ -138,10 +148,13 @@ static uint32_t modem_uart_find_baud(void)
     return 0;
 }
 
-/* Прямой UART-тест: шлём "AT\r\n", ждём ответ 2 с.
-   Показывает, отвечает ли модем физически, минуя esp_modem.
-   Возвращает число принятых байт. */
-static int modem_uart_probe(uint32_t baud)
+/* ============================================================
+   Опциональная диагностика (не вызывается, оставлена для ручной
+   проверки: если PPP не поднимается и UART молчит, вызвать
+   вручную через GDB или из кода).
+   ============================================================ */
+static int __attribute__((unused))
+modem_uart_probe(uint32_t baud)
 {
     ESP_LOGW(TAG, "UART probe @ %lu baud (TX=%d RX=%d)",
              (unsigned long)baud, MODEM_TX, MODEM_RX);
@@ -157,17 +170,14 @@ static int modem_uart_probe(uint32_t baud)
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    /* Установить драйвер UART (или переустановить с новым baud) */
     uart_driver_install(uart_num, 1024, 1024, 0, NULL, 0);
     uart_param_config(uart_num, &cfg);
     uart_set_pin(uart_num, MODEM_TX, MODEM_RX,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 
-    /* Очистить буфер */
     uart_flush_input(uart_num);
     vTaskDelay(pdMS_TO_TICKS(50));
 
-    /* Шлём AT несколько раз — модем может быть в середине загрузки */
     int total_rx = 0;
     uint8_t rx[256];
 
@@ -176,7 +186,6 @@ static int modem_uart_probe(uint32_t baud)
         uart_write_bytes(uart_num, at, strlen(at));
         uart_wait_tx_done(uart_num, pdMS_TO_TICKS(100));
 
-        /* Ждём ответ до 1 с */
         int n = uart_read_bytes(uart_num, rx, sizeof(rx),
                                 pdMS_TO_TICKS(1000));
         if (n > 0) {
@@ -184,8 +193,6 @@ static int modem_uart_probe(uint32_t baud)
             ESP_LOGW(TAG, "probe attempt %d: rx %d bytes: '%.*s'",
                      attempt + 1, n, n, (char *)rx);
 
-            // === SIM READY: тоже парсим здесь (на случай, если
-            // modem_uart_find_baud не увидел +CPIN) ===
             if (memmem(rx, n, "+CPIN: READY", 12) != NULL) {
                 if (!s_sim_ready) {
                     ESP_LOGI(TAG, "SIM ready (+CPIN: READY) → "
@@ -210,7 +217,7 @@ static int modem_uart_probe(uint32_t baud)
 }
 
 /* ============================================================
-   Event handlers — ДОЛЖНЫ БЫТЬ ДО modem_ppp_start
+   Event handlers
    ============================================================ */
 static void ppp_netif_event_handler(void *arg, esp_event_base_t base,
                                     int32_t id, void *data)
@@ -261,7 +268,8 @@ static void ip_event_handler(void *arg, esp_event_base_t base,
 }
 
 /* ============================================================
-   HW reset (опционально)
+   HW reset (опционально — GPIO36 input-only, поэтому
+   MODEM_USE_RST=0 и просто wait).
    ============================================================ */
 static void modem_hw_reset(void)
 {
@@ -281,26 +289,31 @@ static void modem_hw_reset(void)
     gpio_set_level(MODEM_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(1500));
 #else
-    ESP_LOGI(TAG, "RST не используется (GPIO36 input-only). "
+    ESP_LOGI(TAG, "MODEM_USE_RST=0 (GPIO36 input-only). "
                   "Ждём загрузку модема %d мс", MODEM_BOOT_DELAY_MS);
     vTaskDelay(pdMS_TO_TICKS(MODEM_BOOT_DELAY_MS));
 #endif
 }
 
 /* ============================================================
-   FIX: создание DCE+DTE+netif одной функцией esp_modem_new_dev,
+   Создание DCE+DTE+netif одной функцией esp_modem_new_dev,
    sync с retries. Возвращает DCE или NULL.
    ============================================================ */
 static esp_modem_dce_t *create_dce_synced(uint32_t baud, const char *apn)
 {
     esp_modem_dte_config_t dte_cfg = ESP_MODEM_DTE_DEFAULT_CONFIG();
     dte_cfg.uart_config.port_num     = MODEM_UART_NUM;
-    dte_cfg.uart_config.tx_io_num    = MODEM_TX;   /* GPIO21 */
-    dte_cfg.uart_config.rx_io_num    = MODEM_RX;   /* GPIO10 */
+    dte_cfg.uart_config.tx_io_num    = MODEM_TX;
+    dte_cfg.uart_config.rx_io_num    = MODEM_RX;
     dte_cfg.uart_config.rts_io_num   = -1;
     dte_cfg.uart_config.cts_io_num   = -1;
     dte_cfg.uart_config.baud_rate    = baud;
     dte_cfg.uart_config.flow_control = ESP_MODEM_FLOW_CONTROL_NONE;
+
+    dte_cfg.uart_config.rx_buffer_size  = 512;
+    dte_cfg.uart_config.tx_buffer_size  = 512;
+    dte_cfg.uart_config.event_queue_size = 10;
+    dte_cfg.task_stack_size              = 3072;
 
     esp_modem_dce_config_t dce_cfg = ESP_MODEM_DCE_DEFAULT_CONFIG(apn);
 
@@ -332,22 +345,7 @@ static esp_modem_dce_t *create_dce_synced(uint32_t baud, const char *apn)
    ============================================================ */
 esp_err_t modem_ppp_start(const char *apn, uint32_t timeout_ms)
 {
-    bool already_attached = false;
-if (s_dce) {
-    char resp[64];
-    if (esp_modem_at(s_dce, "AT+CGATT?", resp, 1000) == ESP_OK &&
-        strstr(resp, "+CGATT: 1")) {
-        already_attached = true;
-        ESP_LOGI(TAG, "modem already attached → skip reset+CGATT");
-    }
-}
-if (!already_attached) {
-    modem_hw_reset();
-    /* ... AT+CGATT=1, AT+CGDCONT=... */
-}
-
     if (s_dce) return ESP_OK;
-    
     if (!apn || strlen(apn) == 0) return ESP_ERR_INVALID_ARG;
 
     if (!s_state_mtx) s_state_mtx = xSemaphoreCreateMutex();
@@ -355,13 +353,37 @@ if (!already_attached) {
     if (!s_state_mtx || !s_evt) return ESP_ERR_NO_MEM;
     snprintf(s_apn, sizeof(s_apn), "%s", apn);
 
-    esp_netif_init();
-    esp_event_loop_create_default();
+    esp_err_t err = esp_netif_init();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_netif_init: %s", esp_err_to_name(err));
+    }
+    err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "esp_event_loop_create_default: %s",
+                 esp_err_to_name(err));
+    }
+
+    /* === FIX PPP-NETIF-DIAG === */
+    ESP_LOGI(TAG, "before esp_netif_new(PPP): heap free=%u, largest=%u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_PPP();
     s_ppp_netif = esp_netif_new(&netif_cfg);
-    if (!s_ppp_netif) return ESP_FAIL;
+    if (!s_ppp_netif) {
+        ESP_LOGE(TAG, "esp_netif_new(PPP) FAILED — проверьте "
+                      "CONFIG_LWIP_PPP_SUPPORT=y в sdkconfig. "
+                      "heap free=%u, largest=%u",
+                 (unsigned)esp_get_free_heap_size(),
+                 (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "esp_netif_new(PPP) OK: heap free=%u, largest=%u",
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    /* === END FIX PPP-NETIF-DIAG === */
 
+    /* ОДИН modem_hw_reset — до UART scan. */
     modem_hw_reset();
 
     /* 1. Найти рабочий baud (UART-драйвер удаляется внутри) */
@@ -391,39 +413,42 @@ if (!already_attached) {
 
     /* 4. ATE0 */
     esp_modem_at(s_dce, "ATE0", NULL, 1000);
-/*
-// === DIAG: проверяем состояние модема === 
-char resp[256];
-esp_err_t e;
-e = esp_modem_at(s_dce, "AT+CPIN?",   resp, 2000); ESP_LOGI(TAG, "CPIN?: %s (err=%d)", e==ESP_OK?resp:"?", e);
-e = esp_modem_at(s_dce, "AT+CSQ",     resp, 2000); ESP_LOGI(TAG, "CSQ:   %s", e==ESP_OK?resp:"?");
-e = esp_modem_at(s_dce, "AT+CREG?",   resp, 2000); ESP_LOGI(TAG, "CREG?: %s", e==ESP_OK?resp:"?");
-e = esp_modem_at(s_dce, "AT+CGREG?",  resp, 2000); ESP_LOGI(TAG, "CGREG?:%s", e==ESP_OK?resp:"?");
-e = esp_modem_at(s_dce, "AT+CGATT?",  resp, 2000); ESP_LOGI(TAG, "CGATT?:%s", e==ESP_OK?resp:"?");
-e = esp_modem_at(s_dce, "AT+CGDCONT?",resp, 2000); ESP_LOGI(TAG, "CGDCONT?:%s", e==ESP_OK?resp:"?");
 
-// === Принудительно attach, если не attached === 
-esp_modem_at(s_dce, "AT+CGATT=1", NULL, 10000);
+    /* === FIX CGATT-CGDCONT-BEFORE-NEWDEV ===
+       Явно ставим PDP context и attach, если ещё не attached.
+       (esp_modem_set_mode(DATA) сам делает ATD*99#, но CGDCONT и
+       CGATT должен быть подготовлен ДО — иначе модем отвечает
+       "NO CARRIER" или "ERROR".) */
+    {
+        char resp[128];
+        bool attached = false;
+        if (esp_modem_at(s_dce, "AT+CGATT?", resp, 1000) == ESP_OK &&
+            strstr(resp, "+CGATT: 1")) {
+            attached = true;
+            ESP_LOGI(TAG, "modem already attached (CGATT=1)");
+        }
+        if (!attached) {
+            ESP_LOGI(TAG, "AT+CGATT=1 (attach to PS)");
+            esp_modem_at(s_dce, "AT+CGATT=1", NULL, 10000);
 
-// === Явно задаём PDP context === 
-char cmd[128];
-snprintf(cmd, sizeof(cmd), "AT+CGDCONT=1,\"IP\",\"%s\"", apn);
-esp_modem_at(s_dce, cmd, NULL, 2000);
-esp_modem_at(s_dce, "AT+CGAUTH=1,0", NULL, 1000);   // no auth 
-esp_modem_at(s_dce, "AT+CGACT=0,1", NULL, 2000);
-esp_modem_at(s_dce, "AT+CGACT=1,1", NULL, 5000);
-*/
+            char cmd[128];
+            snprintf(cmd, sizeof(cmd),
+                     "AT+CGDCONT=1,\"IP\",\"%s\"", apn);
+            ESP_LOGI(TAG, "AT+CGDCONT: %s", cmd);
+            esp_modem_at(s_dce, cmd, NULL, 2000);
+            esp_modem_at(s_dce, "AT+CGAUTH=1,0", NULL, 1000);
+        }
+    }
+    /* === END FIX CGATT-CGDCONT-BEFORE-NEWDEV === */
+
     /* 5. PPP data mode */
     ESP_LOGI(TAG, "entering PPP data mode...");
-    esp_err_t err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_DATA);
+    err = esp_modem_set_mode(s_dce, ESP_MODEM_MODE_DATA);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "set_mode(DATA): %s", esp_err_to_name(err));
         goto fail;
     }
 
-   /* esp_modem_at(s_dce, "AT+CGDCONT=1,\"IP\",\"internet\"", NULL, 2000);
-esp_modem_at(s_dce, "AT+CGAUTH=1,0", NULL, 1000);
-*/
     /* 6. Ждать IP */
     ESP_LOGI(TAG, "waiting for PPP IP (up to %lu ms)...",
              (unsigned long)timeout_ms);
@@ -483,7 +508,6 @@ const char *modem_ppp_get_ip(void)
     return s_ip;
 }
 
-// === SIM READY: публичный геттер ===
 bool modem_ppp_sim_ready(void)
 {
     return s_sim_ready;

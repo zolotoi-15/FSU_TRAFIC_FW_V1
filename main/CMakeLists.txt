@@ -16,6 +16,7 @@ idf_component_register(
         "mux.c"
         "shift_register.c"
         "config_manager.c"
+        "wifi_ap.c"
         "wifi_mqtt.c"
         "mux_data.c"
         "traffic_light.c"
@@ -25,11 +26,10 @@ idf_component_register(
         "can_bus.c"
         "time_sync.c"
         "lora_nvs.c"
-        "ble_transport.c"
-        "ble_config.c"
         "sync_handshake.c"
         "sync_config.c"
-        
+        # "eth_w5500.c" — если используете W5500
+
     INCLUDE_DIRS "." "include"
     REQUIRES
         driver esp_driver_gpio esp_driver_uart esp_driver_spi freertos
@@ -37,8 +37,20 @@ idf_component_register(
         esp_adc esp_wifi esp_event esp_http_server lwip nvs_flash
         espressif__esp_modem
         espp__sx126x
-        bt
         cjson
 )
+
+# === BLE: собираем только если BT включён в sdkconfig ===
+if(CONFIG_BT_ENABLED)
+    target_sources(${COMPONENT_LIB} PRIVATE
+        "ble_transport.c"
+        "ble_config.c"
+    )
+    target_link_libraries(${COMPONENT_LIB} PRIVATE bt)
+    message(STATUS "BLE: ble_transport.c + ble_config.c включены")
+else()
+    message(WARNING "BLE disabled (CONFIG_BT_ENABLED=n): ble_transport.c/ble_config.c НЕ собираются")
+endif()
+# === END ===
 
 target_add_binary_data(${COMPONENT_LIB} "config.json" TEXT)

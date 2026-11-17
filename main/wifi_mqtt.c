@@ -17,6 +17,14 @@
 #include <stdlib.h>
 #include "time_sync.h"
 
+/* === FIX MQTT-TLS-CA ===
+   Без этого заголовка не видно esp_crt_bundle_attach(). Компонент
+   esp-tls (транзитивно тянется esp-mqtt), содержит CA bundle из
+   CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL (~200 публичных CA:
+   Let's Encrypt, DigiCert, GlobalSign, ISRG и т.д.). */
+#include "esp_crt_bundle.h"
+/* === END FIX MQTT-TLS-CA === */
+
 static const char *TAG = "wifi_mqtt";
 
 esp_mqtt_client_handle_t g_mqtt_client = NULL;
@@ -30,16 +38,8 @@ char       s_json_topic[192];
 char       s_layer_topic[192];
 char       s_kp_topic[192];
 char       s_node_json_topic[192];
-/* === FIX T_CHANNELS === */
 char       s_node_channels_topic[192];
-/* === END FIX T_CHANNELS === */
-
-/* === FIX MQTT-EVENTS ===
-   s_events_topic объявлен ЗДЕСЬ, один раз, и инициализируется
-   в build_topics(). Раньше он был объявлен ниже (дубль) и нигде
-   не заполнялся → публикация в пустой топик. */
 char       s_events_topic[192];
-/* === END FIX MQTT-EVENTS === */
 
 TickType_t s_last_event_time = 0;
 int        s_publish_fail_count = 0;
@@ -74,10 +74,6 @@ static inline uint32_t mqtt_get_down_since(void)
     return v;
 }
 
-/* === FIX MQTT-EVENTS ===
-   Публикует событие аварии/восстановления в <base>/Events.
-   Формат: {"ts":"2026-11-10T12:34:56.789Z","type":"fault",
-            "detail":"short to GND (SR=1, V_IN=0, I=0)","role":"root"} */
 void wifi_mqtt_publish_event(const char *type, const char *detail,
                              const void *data, size_t data_len)
 {
@@ -120,7 +116,6 @@ void wifi_mqtt_publish_event(const char *type, const char *detail,
         ESP_LOGI(TAG, "EVENT → %s: %s", s_events_topic, buf);
     }
 }
-/* === END FIX MQTT-EVENTS === */
 
 #define NVS_NS_MQTT "mqtt_cfg"
 
@@ -128,8 +123,8 @@ void wifi_mqtt_load_config(void)
 {
     nvs_handle_t nvs;
     mqtt_config_t def = {
-        .broker_url = "mqtt://mqtt.xologie.ru",
-        .port       = 1883,
+        .broker_url = "mqtts://mqtt.xologie.ru",
+        .port       = 8883,
         .username   = "LS2024",
         .password   = "Zavulon56",
         .base_topic = "FSU_Trafic",
@@ -183,7 +178,7 @@ static void build_broker_uri(char *out, size_t out_len)
     uint16_t port = g_mqtt_config.port;
 
     if (!uri || !*uri) {
-        snprintf(out, out_len, "mqtt://127.0.0.1:%u", port);
+        snprintf(out, out_len, "mqtts://127.0.0.1:%u", port);
         return;
     }
 
@@ -227,26 +222,16 @@ static void build_topics(void)
     snprintf(s_layer_topic, sizeof(s_layer_topic), "%s/Layer",     s_topic);
     snprintf(s_kp_topic,    sizeof(s_kp_topic),    "%s/key_pressed", s_topic);
     snprintf(s_node_json_topic, sizeof(s_node_json_topic), "%s/Node", s_topic);
-    /* === FIX T_CHANNELS === */
     snprintf(s_node_channels_topic, sizeof(s_node_channels_topic),
              "%s/Node/Channels", s_topic);
-    /* === END FIX T_CHANNELS === */
-    /* === FIX MQTT-EVENTS ===
-       Инициализируем s_events_topic — раньше публикация шла в
-       пустой топик, и MQTT-клиент возвращал ошибку. */
     snprintf(s_events_topic, sizeof(s_events_topic), "%s/Events", s_topic);
-    /* === END FIX MQTT-EVENTS === */
 
     ESP_LOGI(TAG, "Topic:      %s", s_topic);
     ESP_LOGI(TAG, "Subscribe:  %s", s_sub_topic);
     ESP_LOGI(TAG, "JSON in:    %s", s_json_topic);
     ESP_LOGI(TAG, "Node JSON:  %s", s_node_json_topic);
-    /* === FIX T_CHANNELS === */
     ESP_LOGI(TAG, "NodeChannels: %s", s_node_channels_topic);
-    /* === END FIX T_CHANNELS === */
-    /* === FIX MQTT-EVENTS === */
     ESP_LOGI(TAG, "Events:     %s", s_events_topic);
-    /* === END FIX MQTT-EVENTS === */
 }
 
 int wifi_mqtt_fault_priority_ex(traffic_fault_t f) { return mqtt_fault_priority(f); }
@@ -271,11 +256,9 @@ void wifi_mqtt_set_phase_sync_enabled(bool en) {
 }
 const char *wifi_mqtt_last_node_fault(void) { return ""; }
 
-/* === FIX T_CHANNELS === */
 void wifi_mqtt_publish_node_channels(const char *json, size_t len) {
     mqtt_fault_publish_node_channels(json, len);
 }
-/* === END FIX T_CHANNELS === */
 
 uint32_t wifi_mqtt_get_down_ms(void)
 {
@@ -290,7 +273,6 @@ uint32_t wifi_mqtt_get_down_ms(void)
 void wifi_mqtt_force_restart_modem(void)
 {
     ESP_LOGE(TAG, "wifi_mqtt: force restart modem (PPP stop)");
-   // modem_ppp_stop();
 }
 
 static void mqtt_event_handler(void *args, esp_event_base_t base,
@@ -342,10 +324,25 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
                  event->data_len, event->total_data_len,
                  event->current_data_offset);
 
-        bool is_json_topic = (event->topic_len > 0 &&
-                              event->topic_len <= (int)strlen(s_json_topic) &&
+        /* === FIX MQTT-TOPIC-PREFIX-COLLISION ===
+           Раньше: is_json_topic = strncmp(topic, ".../SetJson", 13) == 0.
+           Для сообщения в ".../Set" (13 символов) это тоже true,
+           потому что "/Set" — префикс "/SetJson". Команда Set
+           уходила в mqtt_json_accum_feed, а не в mqtt_handle_command.
+
+           Теперь: topic_len должен СОВПАДАТЬ с strlen(full_topic).
+           Это единственный корректный способ отличить /Set от
+           /SetJson при одинаковом префиксе. */
+        bool is_json_topic = (event->topic_len == (int)strlen(s_json_topic) &&
                               strncmp(event->topic, s_json_topic,
                                       event->topic_len) == 0);
+        bool is_kp_topic   = (event->topic_len == (int)strlen(s_kp_topic) &&
+                              strncmp(event->topic, s_kp_topic,
+                                      event->topic_len) == 0);
+        bool is_sub_topic  = (event->topic_len == (int)strlen(s_sub_topic) &&
+                              strncmp(event->topic, s_sub_topic,
+                                      event->topic_len) == 0);
+        /* === END FIX MQTT-TOPIC-PREFIX-COLLISION === */
 
         if (is_json_topic) {
             int total = event->total_data_len > 0
@@ -359,21 +356,18 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
             break;
         }
 
-        if (event->topic_len > 0 &&
-            event->topic_len <= (int)strlen(s_kp_topic) &&
-            strncmp(event->topic, s_kp_topic, event->topic_len) == 0) {
+        if (is_kp_topic) {
             ESP_LOGW(TAG, "Keypressed via MQTT: %.*s",
                      event->data_len, event->data);
             break;
         }
 
-        if (event->topic_len > 0 &&
-            event->topic_len <= (int)strlen(s_sub_topic) &&
-            strncmp(event->topic, s_sub_topic, event->topic_len) == 0) {
+        if (is_sub_topic) {
             mqtt_handle_command(event->data, event->data_len);
         }
         break;
     }
+    
     default: break;
     }
 }
@@ -407,6 +401,17 @@ void wifi_mqtt_restart(void)
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri  = s_broker_uri,
+
+        /* === FIX MQTT-TLS-CA ===
+           Без этой строки esp-tls-mbedtls пишет
+             "No server verification option set in esp_tls_cfg_t"
+           и делает SSL_SETUP_FAILED до TCP-connect.
+           crt_bundle_attach = встроенный ~200 CA (Let's Encrypt,
+           DigiCert, GlobalSign, ISRG и т.д.). Этого достаточно
+           для mqtt.xologie.ru (сертификат публичного CA). */
+        .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
+        /* === END FIX MQTT-TLS-CA === */
+
         .credentials.username = g_mqtt_config.username,
         .credentials.authentication.password = g_mqtt_config.password,
         .session.last_will.topic = s_lwt_topic,

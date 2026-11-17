@@ -7,20 +7,32 @@
    end_utc_ms из sync:lock. ROOT сравнивает по той же UTC-шкале.
    ToA/RTT/обработка исключены из drift.
 
+   === FIX PONG-DRIFT-8000 ===
+   КЛЮЧЕВОЙ ФИКС.
+   Раньше ROOT, не имея UTC (SNTP не работает), формировал
+   end_utc = 0 + (dur - pm) = 7690 — это не UTC-метка, а просто
+   «dur − pm». NODE, у которого UTC есть (получил time:), видел
+   7690 как epoch 1970 → now(2026) >= end_utc → возвращал
+   pm = dur = 8000 в pong. ROOT получал drift=8000 → вечный
+   re-lock.
+
+   Теперь:
+     - ROOT формирует end_utc только если utc != 0, иначе 0;
+     - NODE, получив end_utc < EPOCH_2020_MS, трактует как 0
+       (старая прошивка ROOT) и использует локальный pm;
+     - ROOT-обработчик pong использует UTC-путь только если
+       my_pm_utc != 0 (раньше — || pm != 0, что маскировало
+       отсутствие своего UTC).
+
    === FIX FAULT-HAS-TOP-PRIORITY ===
    Если s_fault != NONE (YELLOW_BLINK или ALL_OFF), ритуал
    sync:probe/time/lock НЕ запускается: авария имеет наивысший
    приоритет. В ALIGNED-ветке traffic:start + start_with_red
-   пропускаются при активной аварии. По завершении таймаута
-   ALIGNED при аварии — только sync:done + IDLE, без снятия
-   fault и без старта.
+   пропускаются при активной аварии.
 
    === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
    Перед traffic:start в ветках ALIGNED-timeout и disp-synced
-   ROOT отправляет явный fault:none + пауза. NODE мог сам уйти
-   в ALL_OFF из-за потери ROOT (node_link_watchdog_task) и
-   блокирует traffic:start/c: через
-   traffic_light_fault_has_priority() без fault:none.
+   ROOT отправляет явный fault:none + пауза.
    ============================================================ */
 
 #include "sync_handshake.h"
@@ -45,17 +57,20 @@ static const char *TAG = "sync_hs";
 extern volatile bool     s_node_running;
 extern volatile uint32_t s_last_node_msg_ms;
 
-/* === FIX SYNC-PONG-UTC ===
-   Fallback-порог для локального pm (когда UTC недоступен).
-   Покрывает ToA (112 мс SF8/BW250 для 40 байт) + RTT + обработку. */
+/* Порог локального pm (когда UTC недоступен). Покрывает ToA
+   (112 мс SF8/BW250 для 40 байт) + RTT + обработку. */
 #define SYNC_ALIGN_DRIFT_LOCAL_MS    400
-/* === END FIX SYNC-PONG-UTC === */
 
-/* === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
-   Пауза между fault:none и traffic:start — чтобы LoRa успел
+/* Пауза между fault:none и traffic:start — чтобы LoRa успел
    доставить первый пакет (ToA 10 байт ≈ 40-50 мс SF8/BW250). */
 #define FAULT_NONE_TO_START_GAP_MS   80
-/* === END FIX ROOT-RETURN-SENDS-FAULT-NONE === */
+
+/* === FIX PONG-DRIFT-8000 ===
+   Sanity-порог epoch: любые end_utc_ms меньше 2020-01-01
+   трактуем как «не UTC» (0). Защищает от старых прошивок ROOT,
+   которые слали dur-pm вместо реальной UTC-метки. */
+#define EPOCH_2020_MS  1577836800000ULL
+/* === END FIX PONG-DRIFT-8000 === */
 
 /* ============================================================
    Общее: мигание ЖДИТЕ + выключение остальных
@@ -129,10 +144,13 @@ static inline void display_force_off(void)
     sr_output_off(ch);
 }
 
-/* === FIX SYNC-PONG-UTC: elapsed_ms по UTC === */
+/* === FIX PONG-DRIFT-8000 ===
+   elapsed_ms по UTC с защитой от мусорного end_utc.
+   Возвращает 0, если UTC нет или end_utc — не абсолютная метка. */
 static uint32_t utc_elapsed_ms(uint64_t end_utc_ms, uint32_t dur_ms)
 {
     if (end_utc_ms == 0 || dur_ms == 0) return 0;
+    if (end_utc_ms < EPOCH_2020_MS)     return 0;   /* не UTC-метка */
     uint64_t now_utc = time_sync_get_utc_ms();
     if (now_utc == 0) return 0;
     if (now_utc >= end_utc_ms) return dur_ms;
@@ -140,7 +158,7 @@ static uint32_t utc_elapsed_ms(uint64_t end_utc_ms, uint32_t dur_ms)
     if (remain > dur_ms) remain = dur_ms;
     return (uint32_t)(dur_ms - remain);
 }
-/* === END FIX SYNC-PONG-UTC === */
+/* === END FIX PONG-DRIFT-8000 === */
 
 /* ============================================================
    ROOT
@@ -162,11 +180,10 @@ static volatile uint8_t      s_root_node_phase = 0xFF;
 static volatile uint32_t     s_root_node_pm_ms = 0;
 static volatile bool         s_root_node_status_fresh = false;
 
-/* === FIX SYNC-PONG-UTC: параметры последнего lock === */
+/* Параметры последнего lock (для сверки pong по UTC) */
 static volatile uint64_t     s_root_lock_end_utc_ms = 0;
 static volatile uint32_t     s_root_lock_dur_ms     = 0;
 static volatile uint32_t     s_root_lock_phase      = 0;
-/* === END FIX SYNC-PONG-UTC === */
 
 static volatile uint8_t  s_root_node_disp       = 0xFF;
 static volatile uint32_t s_root_node_disp_ms    = 0;
@@ -196,18 +213,14 @@ static void root_set_state(sync_state_t st)
 
 void sync_handshake_root_start(void)
 {
-    /* === FIX FAULT-HAS-TOP-PRIORITY ===
-       При активной аварии ритуал sync:probe НЕ запускаем: каналы
-       принадлежат аварии. Как только авария снята (try_recovery
-       или ручной traffic:start), ритуал стартует. */
+    /* === FIX FAULT-HAS-TOP-PRIORITY === */
     if (traffic_light_fault_has_priority()) {
         ESP_LOGW(TAG, "ROOT sync: START ignored (fault active: %s)",
                  traffic_light_fault_str());
         return;
     }
-    /* === END FIX FAULT-HAS-TOP-PRIORITY === */
+    /* === END FIX === */
 
-    for (int i = 0; i < 16; i++) sr_output_off(i);   // все выключены
     if (g_config.role != DEVICE_ROLE_MASTER) return;
     if (s_root_state != SYNC_STATE_IDLE) return;
 
@@ -226,7 +239,12 @@ void sync_handshake_root_start(void)
     s_root_node_disp_ms = 0;
     s_root_disp_streak  = 0;
 
+    /* === FIX ROOT-START-ROLE-FIRST ===
+       sr_output_off теперь ВНУТРИ role-check (было до него —
+       если sync_handshake_root_start() случайно вызывался на
+       NODE, каналы выключались до проверки роли). */
     for (int i = 0; i < 16; i++) sr_output_off(i);
+    /* === END FIX === */
 
     s_display_cleared  = false;
     s_display_blink_on = false;
@@ -296,18 +314,28 @@ void sync_handshake_root_on_rx(const char *evt, size_t len)
                 bool utc_used = false;
                 int32_t drift = 0;
 
+                /* === FIX PONG-DRIFT-8000 ===
+                   Раньше: `if (my_pm_utc != 0 || pm != 0)` —
+                   маскировало отсутствие своего UTC и давало
+                   drift = pm - 0 = 8000. Теперь — только если
+                   my_pm_utc != 0 (у ROOT есть UTC и end_utc
+                   реальная метка). */
                 if (s_root_lock_end_utc_ms != 0 &&
                     s_root_lock_dur_ms != 0) {
                     uint32_t my_pm_utc = utc_elapsed_ms(
                         s_root_lock_end_utc_ms, s_root_lock_dur_ms);
-                    if (my_pm_utc != 0 || pm != 0) {
+                    if (my_pm_utc != 0) {
                         drift = (int32_t)pm - (int32_t)my_pm_utc;
                         utc_used = true;
-                        ESP_LOGD(TAG, "ROOT sync: pong pm_utc=%u my_pm_utc=%u "
-                                      "drift=%ld [utc]",
+                        ESP_LOGD(TAG, "ROOT sync: pong pm_utc=%u "
+                                      "my_pm_utc=%u drift=%ld [utc]",
                                  pm, my_pm_utc, (long)drift);
+                    } else {
+                        ESP_LOGW(TAG, "ROOT sync: pong UTC unavailable "
+                                      "(my_pm_utc=0), fallback to local");
                     }
                 }
+                /* === END FIX === */
 
                 if (!utc_used) {
                     uint32_t my_pm = traffic_light_get_phase_ms();
@@ -397,9 +425,7 @@ void sync_handshake_root_tick(uint32_t now_ms)
     if (g_config.role != DEVICE_ROLE_MASTER) return;
     if (s_root_state == SYNC_STATE_IDLE) return;
 
-    /* === FIX FAULT-HAS-TOP-PRIORITY ===
-       При активной аварии ритуал не трогает каналы: авария
-       управляет ими. Форсим IDLE без sync:done и без start. */
+    /* === FIX FAULT-HAS-TOP-PRIORITY === */
     if (traffic_light_fault_has_priority()) {
         if (s_root_state != SYNC_STATE_IDLE) {
             ESP_LOGW(TAG, "ROOT sync: fault active (%s) → force IDLE "
@@ -412,7 +438,7 @@ void sync_handshake_root_tick(uint32_t now_ms)
         }
         return;
     }
-    /* === END FIX FAULT-HAS-TOP-PRIORITY === */
+    /* === END FIX === */
 
     bool use_utc = (s_root_state >= SYNC_STATE_TIME);
     display_only_blink(now_ms, use_utc);
@@ -426,14 +452,9 @@ void sync_handshake_root_tick(uint32_t now_ms)
                      (unsigned)(now_ms - s_root_sync_started_ms));
             display_only_stop();
             display_force_off();
-            /* === FIX FAULT-HAS-TOP-PRIORITY ===
-               На случай, если fault поднялся ровно между проверкой
-               выше и этим блоком — не стартуем. */
             if (!traffic_light_fault_has_priority()) {
-                /* === FIX ROOT-RETURN-SENDS-FAULT-NONE === */
                 transport_send_cmd_noack("fault:none", strlen("fault:none"));
                 vTaskDelay(pdMS_TO_TICKS(FAULT_NONE_TO_START_GAP_MS));
-                /* === END FIX === */
 
                 s_fault_from_remote_ex = true;
                 traffic_light_set_fault(TRAFFIC_FAULT_NONE);
@@ -514,8 +535,17 @@ void sync_handshake_root_tick(uint32_t now_ms)
                 uint8_t  ph  = traffic_light_get_phase();
                 uint32_t pm  = traffic_light_get_phase_ms();
                 uint32_t dur = traffic_light_get_phase_duration_ms();
+
+                /* === FIX PONG-DRIFT-8000 ===
+                   КЛЮЧЕВОЕ. Раньше: end_utc = utc + (dur-pm),
+                   даже если utc==0 → мусорная метка 7690 (1970).
+                   Теперь: end_utc только если utc!=0, иначе 0. */
                 uint64_t utc = time_sync_get_utc_ms();
-                uint64_t end_utc = utc + (dur > pm ? dur - pm : dur);
+                uint64_t end_utc = 0;
+                if (utc != 0) {
+                    end_utc = utc + (dur > pm ? dur - pm : dur);
+                }
+                /* === END FIX === */
 
                 s_root_lock_end_utc_ms = end_utc;
                 s_root_lock_dur_ms     = dur;
@@ -527,7 +557,11 @@ void sync_handshake_root_tick(uint32_t now_ms)
                                   ph, (unsigned long)pm,
                                   (unsigned long)dur,
                                   (unsigned long long)end_utc);
-                if (ln > 0) transport_send_cmd_noack(lcmd, ln);
+                if (ln > 0) {
+                    transport_send_cmd_noack(lcmd, ln);
+                    ESP_LOGD(TAG, "ROOT sync: → '%s' (utc=%llu)", lcmd,
+                             (unsigned long long)utc);
+                }
 
                 s_root_lock_sent++;
                 if (s_root_lock_sent >= SYNC_LOCK_TRIES &&
@@ -554,16 +588,9 @@ void sync_handshake_root_tick(uint32_t now_ms)
 
             transport_send_cmd_noack("sync:done", 9);
 
-            /* === FIX FAULT-HAS-TOP-PRIORITY ===
-               traffic:start + start_with_red только если авария
-               не поднялась во время ALIGNED. */
             if (!traffic_light_fault_has_priority()) {
-                /* === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
-                   NODE мог сам уйти в ALL_OFF из-за потери ROOT.
-                   Шлём fault:none ПЕРЕД traffic:start, с паузой. */
                 transport_send_cmd_noack("fault:none", strlen("fault:none"));
                 vTaskDelay(pdMS_TO_TICKS(FAULT_NONE_TO_START_GAP_MS));
-                /* === END FIX === */
 
                 transport_send_cmd_noack("traffic:start",
                                          strlen("traffic:start"));
@@ -630,12 +657,9 @@ void sync_handshake_root_tick(uint32_t now_ms)
 
             transport_send_cmd_noack("sync:done", 9);
 
-            /* === FIX FAULT-HAS-TOP-PRIORITY === */
             if (!traffic_light_fault_has_priority()) {
-                /* === FIX ROOT-RETURN-SENDS-FAULT-NONE === */
                 transport_send_cmd_noack("fault:none", strlen("fault:none"));
                 vTaskDelay(pdMS_TO_TICKS(FAULT_NONE_TO_START_GAP_MS));
-                /* === END FIX === */
 
                 transport_send_cmd_noack("traffic:start",
                                          strlen("traffic:start"));
@@ -654,7 +678,6 @@ void sync_handshake_root_tick(uint32_t now_ms)
                               "(%s) — skip start",
                          traffic_light_fault_str());
             }
-            /* === END FIX === */
 
             display_only_stop();
             display_force_off();
@@ -715,14 +738,11 @@ static void node_set_state(sync_state_t st)
 
 void sync_handshake_node_start(void)
 {
-    /* === FIX FAULT-HAS-TOP-PRIORITY ===
-       При активной аварии ритуал sync:probe НЕ запускаем. */
     if (traffic_light_fault_has_priority()) {
         ESP_LOGW(TAG, "NODE sync: START ignored (fault active: %s)",
                  traffic_light_fault_str());
         return;
     }
-    /* === END FIX FAULT-HAS-TOP-PRIORITY === */
 
     if (g_config.role != DEVICE_ROLE_SLAVE) return;
     if (s_node_state != SYNC_STATE_IDLE) return;
@@ -791,17 +811,9 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
     }
 
     if (strncmp(buf, "sync:lock:", 10) == 0) {
-        /* === FIX FAULT-HAS-TOP-PRIORITY ===
-           Если NODE в аварии — не применяем sync:lock к каналам
-           (apply_mask и так заблокирован, но и состояние не
-           трогаем, чтобы не сбить s_phase_start_ms для recovery). */
         if (traffic_light_fault_has_priority()) {
             ESP_LOGW(TAG, "NODE sync: lock IGNORED (fault active: %s)",
                      traffic_light_fault_str());
-            /* Отвечаем pong, чтобы ROOT не висел в PHASE — но
-               без применения маски. pm_to_send — 0, ROOT получит
-               drift = 0 - my_pm ≠ 0 → re-lock, но если ROOT тоже
-               в аварии, он не будет спрашивать. */
             char pong[80];
             int pn = snprintf(pong, sizeof(pong),
                               "sync:pong:0:0:0:%u",
@@ -809,7 +821,6 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
             if (pn > 0) transport_send_evt_noack(pong, pn);
             return;
         }
-        /* === END FIX === */
 
         unsigned int ph = 0, pm = 0, dur = 0;
         unsigned long long end_utc = 0;
@@ -827,6 +838,19 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
             } else if (s_node_state == SYNC_STATE_ALIGNED) {
                 ESP_LOGD(TAG, "NODE sync: lock in ALIGNED → pong only");
             }
+
+            /* === FIX PONG-DRIFT-8000 ===
+               Старая прошивка ROOT (без UTC) шлёт end_utc как
+               «dur − pm» (число ~7690 — epoch 1970). Если видим
+               такое — трактуем как 0 (нет UTC), чтобы не отдавать
+               pm_utc = dur (8000) в pong. */
+            if (end_utc != 0 && end_utc < EPOCH_2020_MS) {
+                ESP_LOGW(TAG, "NODE sync: end_utc=%llu suspiciously small "
+                              "(< 2020) → treat as 0",
+                         end_utc);
+                end_utc = 0;
+            }
+            /* === END FIX === */
 
             s_node_lock_phase = (uint8_t)ph;
             s_node_lock_pm    = pm;
@@ -846,9 +870,10 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
             uint32_t pm_utc = utc_elapsed_ms((uint64_t)end_utc,
                                              (uint32_t)dur);
             uint32_t pm_to_send;
-            bool utc_ok = (pm_utc != 0 || end_utc == 0);
+            bool utc_ok = false;
             if (end_utc != 0 && pm_utc != 0) {
                 pm_to_send = pm_utc;
+                utc_ok = true;
             } else {
                 pm_to_send = traffic_light_get_phase_ms();
                 utc_ok = false;
@@ -878,11 +903,7 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
     }
 
     if (strncmp(buf, "sync:display:", 13) == 0) {
-        /* === FIX FAULT-HAS-TOP-PRIORITY ===
-           В аварии display-каналом управляет fault-мигание, а не
-           sync:display. */
         if (traffic_light_fault_has_priority()) return;
-        /* === END FIX === */
         unsigned int bit = 0;
         unsigned long long next_edge = 0;
         if (sscanf(buf + 13, "%u:%llu", &bit, &next_edge) == 2) {
@@ -924,10 +945,6 @@ void sync_handshake_node_on_rx(const char *cmd, size_t len)
             display_force_off();
             node_set_state(SYNC_STATE_IDLE);
         }
-        /* === FIX FAULT-HAS-TOP-PRIORITY ===
-           sync_handshake НЕ снимает fault и НЕ трогает каналы.
-           Снятие fault — только через fault:none от ROOT (см.
-           node_proto.c) или try_recovery. */
         return;
     }
 }
@@ -937,9 +954,6 @@ void sync_handshake_node_tick(uint32_t now_ms)
     if (g_config.role != DEVICE_ROLE_SLAVE) return;
     if (s_node_state == SYNC_STATE_IDLE) return;
 
-    /* === FIX FAULT-HAS-TOP-PRIORITY ===
-       При активной аварии ритуал не трогает каналы. Форсим IDLE
-       без display. */
     if (traffic_light_fault_has_priority()) {
         if (s_node_state != SYNC_STATE_IDLE) {
             ESP_LOGW(TAG, "NODE sync: fault active (%s) → force IDLE",
@@ -951,7 +965,6 @@ void sync_handshake_node_tick(uint32_t now_ms)
         }
         return;
     }
-    /* === END FIX FAULT-HAS-TOP-PRIORITY === */
 
     bool use_utc = (s_node_state >= SYNC_STATE_TIME);
     display_only_blink(now_ms, use_utc);
@@ -966,7 +979,6 @@ void sync_handshake_node_tick(uint32_t now_ms)
         return;
     }
 
-    /* Глобальный таймаут для PROBE/TIME/PHASE */
     if (s_node_sync_started_ms != 0 &&
         (now_ms - s_node_sync_started_ms) > SYNC_ALIGN_TIMEOUT_MS &&
         s_node_state != SYNC_STATE_ALIGNED) {
@@ -987,8 +999,7 @@ void sync_handshake_node_tick(uint32_t now_ms)
         break;
 
     case SYNC_STATE_ALIGNED:
-        /* resend pong раз в 3 с. НЕ обновляем s_node_state_ms — иначе
-           ALIGNED-TIMEOUT никогда не сработает. */
+        /* resend pong раз в 3 с. НЕ обновляем s_node_state_ms. */
         if ((now_ms - s_node_state_ms) >= 3000) {
             ESP_LOGW(TAG, "NODE sync: no done for 3s → resend pong");
 

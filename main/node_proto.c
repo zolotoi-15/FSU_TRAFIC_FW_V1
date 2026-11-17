@@ -144,15 +144,8 @@ volatile bool s_node_channels_valid = false;
 static uint32_t s_last_channels_ms = 0;
 /* === END FIX T_CHANNELS === */
 
-<<<<<<< HEAD
-<<<<<<< Updated upstream
-#define NODE_STATUS_PERIOD_MS      5000
-=======
-#define NODE_STATUS_PERIOD_MS      10000
->>>>>>> Stashed changes
-=======
+
 #define NODE_STATUS_PERIOD_MS      8000
->>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
 #define NODE_STATUS_FAULT_MS       1000
 #define NODE_STATUS_SYNC_MS        500
 #define STATUS_FORCE_MS            5000
@@ -162,9 +155,7 @@ static uint32_t s_last_channels_ms = 0;
 #define UTC_DELTA_MAX_MS_LOCAL     3000
 #define SYNC_MAX_DRIFT_MS_LOCAL    500
 
-<<<<<<< HEAD
-<<<<<<< Updated upstream
-=======
+
 /* === FIX STATUS-NO-CHANNELS ===
    Буфер STATUS: новый формат без ch00..ch15 ≈ 686 байт.
    1024 — с запасом (FAULT.reasons может быть длинным). */
@@ -181,15 +172,7 @@ static uint32_t s_last_channels_ms = 0;
 #define UTC_SKIP_PM_MAX_MS         3000
 /* === END FIX UTC-SKIP-PM-RESET === */
 
->>>>>>> Stashed changes
-=======
-/* === FIX STATUS-NO-CHANNELS ===
-   Буфер STATUS уменьшен: новый формат без ch00..ch15 ≈ 400 байт.
-   1024 — с запасом (FAULT.reasons может быть длинным при аварии). */
-#define NODE_STATUS_BUF_SIZE       1024
-/* === END FIX STATUS-NO-CHANNELS === */
 
->>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
 volatile bool s_fault_from_remote_ex = false;
 volatile bool s_node_running = false;
 
@@ -911,6 +894,17 @@ static void on_evt_from_node(const char *evt, size_t len)
     memcpy(buf, evt, n);
     buf[n] = '\0';
 
+    /* === FIX COMM-LOST-ON-ANY-RX ===
+       Любой EVT от NODE (pong, time, sync:ack, fault:recover_ok,
+       pedestrian:request) — доказательство, что NODE жив и LoRa
+       работает. Если мы в ALL_OFF из-за comm_lost и STATUS
+       потерялся (17 фрагментов без ACK → frag gap), comm_lost
+       никогда не очистится. Здесь — очищаем на любой RX от NODE. */
+    if (g_config.role == DEVICE_ROLE_MASTER) {
+        wifi_mqtt_set_root_comm_lost(false);
+    }
+    /* === END FIX === */
+
     /* === FIX SYNC-HANDSHAKE === */
     if (len >= 5 && strncmp(buf, "sync:", 5) == 0) {
         if (strncmp(buf, "sync:probe", 10) == 0) {
@@ -1079,27 +1073,14 @@ static void node_send_task(void *arg)
             esp_err_t err = transport_send_channels(json, off);
             ESP_LOGI(TAG, "T_CHANNELS -> ROOT: %s (%d bytes)",
                      err == ESP_OK ? "OK" : esp_err_to_name(err), off);
-<<<<<<< HEAD
-<<<<<<< Updated upstream
-=======
+
 
             /* === FIX T-CHANNELS-NOT-COMBINED ===
                После T_CHANNELS — пауза и continue: STATUS в этой
                итерации НЕ отправляем. */
             vTaskDelay(pdMS_TO_TICKS(3000));
             continue;
-            /* === END FIX T-CHANNELS-NOT-COMBINED === */
->>>>>>> Stashed changes
-=======
 
-            /* === FIX T-CHANNELS-NOT-COMBINED ===
-               После T_CHANNELS — пауза и continue: STATUS в этой
-               итерации НЕ отправляем. Иначе 30+10 фрагментов
-               подряд → коллизии с c: от ROOT. */
-            vTaskDelay(pdMS_TO_TICKS(3000));
-            continue;
-            /* === END FIX T-CHANNELS-NOT-COMBINED === */
->>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
         }
         /* === END FIX T_CHANNELS === */
 

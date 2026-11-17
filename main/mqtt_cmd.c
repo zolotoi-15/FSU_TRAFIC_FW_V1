@@ -71,9 +71,16 @@ void mqtt_json_accum_reset(void)
 
 /* ============================================================
    mqtt_json_accum_feed
-   === FIX ACCUM-DONE-HEURISTIC ===
-   === FIX ACCUM-OFFSET-SAFETY ===
-   === FIX ACCUM-BUFFER-SAFETY ===
+   === FIX ACCUM-CALLOC-SIZE ===
+   Раньше: calloc(MQTT_JSON_INPUT_SIZE+1 = 16385) даже для 13-байтной
+   команды, потому что при total == data_len (сообщение целиком)
+   условие `total > data_len` ложно → t = MQTT_JSON_INPUT_SIZE.
+   При 11 KB largest_heap это падает: "calloc(16385) failed",
+   входящие сообщения /Set и /SetJson теряются.
+
+   Теперь: t = total, если 0 < total <= MQTT_JSON_INPUT_SIZE.
+   Для multi-part то же самое (total = общий размер всех частей).
+   Fallback на data_len если total некорректен (0 или >16KB).
    ============================================================ */
 bool mqtt_json_accum_feed(const char *data, int data_len, int offset, int total)
 {
@@ -82,11 +89,20 @@ bool mqtt_json_accum_feed(const char *data, int data_len, int offset, int total)
     if (offset == 0) {
         mqtt_json_accum_reset();
 
-        int t = (total > data_len && total <= MQTT_JSON_INPUT_SIZE)
-                ? total : MQTT_JSON_INPUT_SIZE;
+        int t = (total > 0 && total <= MQTT_JSON_INPUT_SIZE)
+                ? total : data_len;
+        if (t <= 0 || t > MQTT_JSON_INPUT_SIZE) {
+            ESP_LOGE(TAG, "accum_feed: bad size (total=%d data_len=%d)",
+                     total, data_len);
+            return false;
+        }
+
         s_json_accum = calloc(1, t + 1);
         if (!s_json_accum) {
-            ESP_LOGE(TAG, "accum_feed: calloc(%d) failed", t + 1);
+            ESP_LOGE(TAG, "accum_feed: calloc(%d) failed (heap free=%u, largest=%u)",
+                     t + 1,
+                     (unsigned)esp_get_free_heap_size(),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
             return false;
         }
         s_json_accum_total  = t;
@@ -108,6 +124,7 @@ bool mqtt_json_accum_feed(const char *data, int data_len, int offset, int total)
         mqtt_json_accum_reset();
         return false;
     }
+
     memcpy(s_json_accum + offset, data, data_len);
     s_json_accum_len = offset + data_len;
 

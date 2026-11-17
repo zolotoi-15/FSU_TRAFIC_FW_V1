@@ -1,22 +1,5 @@
 /* ============================================================
    blink_example_main.c — PRODUCTION app_main().
-
-   === FIX LINK-LOSS-SMART ===
-       link_monitor_task: счётчик пропусков инкрементится ТОЛЬКО
-       если в окне LINK_*_EXPECT_MS реально не было пакета.
-
-   === FIX SYNC-DELAY-ZERO ===
-       blink_reset_rtt() вызывается при старте.
-
-   === FIX BLE-TRANSPORT ===
-       fsu_ble_init() после transport_init().
-
-   === FIX FAST-LINK-MONITOR + SYNC-HANDSHAKE ===
-       LINK_ROOT_EXPECT_MS 10000 → 3000 (NODE STATUS раз в 5 с).
-       LINK_NODE_EXPECT_MS 10000 → 2000 (ROOT ping раз в 2 с).
-       При 3 пропусках подряд → sync_handshake_root_start() /
-       sync_handshake_node_start(). Это ускоряет восстановление
-       связи с 50 с до 6-9 с + сам ритуал синхронизации.
    ============================================================ */
 
 #include <stdio.h>
@@ -57,33 +40,25 @@
 #include "fault_handler.h"
 #include "buttons.h"
 #include "root_wd.h"
-#include "sync_handshake.h"     /* === FIX SYNC-HANDSHAKE === */
+#include "sync_handshake.h"
 #include "app_shared.h"
 #include "ble_transport.h"
 #include "sync_config.h"
-#include "connectivity.h"
-#include "modem_ppp.h"          /* ← ДОБАВИТЬ: modem_ppp_get_netif() */
-#include "fault_handler.h"
+#include "modem_ppp.h"
 
 extern const uint8_t config_json_start[] asm("_binary_config_json_start");
 extern const uint8_t config_json_end[]   asm("_binary_config_json_end");
 
 static const char *TAG = "board";
+#define USE_BLE 0
 
 #define NVS_NS_PENDING   "pending_cfg"
 #define NVS_KEY_LEN      "len"
 #define NVS_KEY_CHUNK    "chunk_%d"
 #define PENDING_CHUNK_SZ 4096
 
-/* === FIX FAST-LINK-MONITOR ===
-   ROOT ждёт STATUS от NODE (NODE_STATUS_PERIOD_MS = 5000 мс),
-   NODE ждёт CMD/ping/sync от ROOT (HEARTBEAT_INTERVAL_MS = 2000 мс).
-
-   LINK_*_EXPECT_MS — окно опроса счётчиков. LINK_LOST_MISSED_PKTS=3.
-   Детект потери: ROOT 3×3=9 с, NODE 3×2=6 с. */
 #define LINK_ROOT_EXPECT_MS   3000
 #define LINK_NODE_EXPECT_MS   2000
-/* === END FIX FAST-LINK-MONITOR === */
 
 #define CFG_LOAD_TASK_STACK   24576
 
@@ -112,11 +87,11 @@ void blink_reset_rtt(void)
     s_rtt_delay_us = 0;
     s_rtt_samples = 0;
     s_last_pong_ms = 0;
-    traffic_light_set_sync_delay_us(0);   /* === FIX SYNC-DELAY-ZERO === */
+    traffic_light_set_sync_delay_us(0);
 }
 
 /* ============================================================
-   === LINK LOSS: helpers ===
+   LINK LOSS helpers
    ============================================================ */
 void link_monitor_note_status_rx(void) { s_root_missed_status = 0; }
 void link_monitor_note_ping_rx(void)   { s_node_missed_ping   = 0; }
@@ -124,14 +99,10 @@ void link_monitor_note_ping_rx(void)   { s_node_missed_ping   = 0; }
 bool link_monitor_root_lost(void) { return s_root_missed_status >= LINK_LOST_MISSED_PKTS; }
 bool link_monitor_node_lost(void) { return s_node_missed_ping   >= LINK_LOST_MISSED_PKTS; }
 
-/* ============================================================
-   link_monitor_task
-   === FIX LINK-LOSS-SMART + FAST-LINK-MONITOR + SYNC-HANDSHAKE ===
-   ============================================================ */
 static void link_monitor_task(void *arg)
 {
     ESP_LOGI(TAG, "link_monitor_task started (%u missed pkts = link lost, "
-                  "root_exp=%u ms, node_exp=%u ms, time-delta-log 30s)",
+                  "root_exp=%u ms, node_exp=%u ms)",
              LINK_LOST_MISSED_PKTS,
              (unsigned)LINK_ROOT_EXPECT_MS,
              (unsigned)LINK_NODE_EXPECT_MS);
@@ -164,11 +135,7 @@ static void link_monitor_task(void *arg)
                         ESP_LOGE(TAG, "ROOT: %u missed STATUS → link LOST "
                                       "→ sync_handshake",
                                  LINK_LOST_MISSED_PKTS);
-                        /* === FIX SYNC-HANDSHAKE ===
-                           Сразу запускаем ритуал восстановления —
-                           без ожидания watchdog-таски. */
                         sync_handshake_root_start();
-                        /* === END FIX SYNC-HANDSHAKE === */
                     }
                 } else {
                     s_root_missed_status = 0;
@@ -194,9 +161,7 @@ static void link_monitor_task(void *arg)
                         ESP_LOGE(TAG, "NODE: %u missed ping/CMD → link LOST "
                                       "→ sync_handshake",
                                  LINK_LOST_MISSED_PKTS);
-                        /* === FIX SYNC-HANDSHAKE === */
                         sync_handshake_node_start();
-                        /* === END FIX SYNC-HANDSHAKE === */
                     }
                 } else {
                     s_node_missed_ping = 0;
@@ -218,55 +183,46 @@ static void link_monitor_task(void *arg)
         }
     }
 }
-/* === END LINK LOSS === */
 
+/* ============================================================
+   on_got_ip — SNTP + MQTT стартуют при получении IP (PPP или STA)
+   ============================================================ */
 static void on_got_ip(void *arg, esp_event_base_t base,
                       int32_t id, void *data)
 {
     static bool sntp_started = false;
-    if (sntp_started) return;
     if (g_config.role != DEVICE_ROLE_MASTER) return;
 
-    ESP_LOGI(TAG, "GOT_IP → starting SNTP + MQTT");
-
-    /* === FIX DEFAULT-NETIF-BEFORE-SNTP ===
-       on_got_ip вызывается ИЗНУТРИ modem_ppp_start (IP_EVENT PPP).
-       esp_netif_set_default_netif в connectivity.c выполнится
-       ПОСЛЕ возврата modem_ppp_start, т.е. уже после
-       time_sync_start_sntp(). SNTP-сокет создастся на старом
-       default netif (ethernet/STA) → ответа от pool.ntp.org
-       не будет → time_sync не станет valid → root_wd вечно
-       висит в "time_sync not valid → wait".
-       Выставляем default netif ЗДЕСЬ, до SNTP. */
-    esp_netif_t *ppp_netif = modem_ppp_get_netif();
-    if (ppp_netif) {
-        esp_netif_set_default_netif(ppp_netif);
-        ESP_LOGI(TAG, "on_got_ip: default netif → PPPoS (before SNTP)");
-    } else {
-        ESP_LOGW(TAG, "on_got_ip: modem_ppp_get_netif() = NULL");
+    /* Обработчик modem_ppp тоже ловит это событие — он обновит
+       s_connected под mutex. Небольшая задержка гарантирует, что
+       modem_ppp_is_connected() уже вернёт true. */
+    if (!sntp_started) {
+        esp_netif_t *ppp_netif = modem_ppp_get_netif();
+        if (ppp_netif) {
+            esp_netif_set_default_netif(ppp_netif);
+        }
+        time_sync_start_sntp();
+        sntp_started = true;
     }
-    /* === END FIX === */
-
-    time_sync_start_sntp();
-    sntp_started = true;
 
     if (!wifi_mqtt_is_connected()) {
-        esp_err_t err = wifi_mqtt_init();
-        if (err == ESP_ERR_INVALID_STATE) {
-            ESP_LOGI(TAG, "wifi_mqtt_init: deferred (no IP yet)");
-        } else if (err != ESP_OK) {
-            ESP_LOGW(TAG, "wifi_mqtt_init: %s", esp_err_to_name(err));
+        for (int i = 0; i < 5; i++) {
+            esp_err_t err = wifi_mqtt_init();
+            if (err == ESP_OK) break;
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
 }
 
+/* ============================================================
+   Config load helpers (без изменений)
+   ============================================================ */
 static bool nvs_app_cfg_exists(void)
 {
     nvs_handle_t nvs;
     if (nvs_open("app_cfg", NVS_READONLY, &nvs) != ESP_OK) return false;
 
     static app_config_t tmp;
-
     size_t sz = sizeof(tmp);
     bool ok = false;
     if (nvs_get_blob(nvs, "cfg_blob", &tmp, &sz) == ESP_OK &&
@@ -293,21 +249,16 @@ static bool apply_pending_cfg_from_nvs(void)
                  (unsigned)len);
         nvs_close(nvs);
         if (nvs_open(NVS_NS_PENDING, NVS_READWRITE, &nvs) == ESP_OK) {
-            nvs_erase_all(nvs);
-            nvs_commit(nvs);
-            nvs_close(nvs);
+            nvs_erase_all(nvs); nvs_commit(nvs); nvs_close(nvs);
         }
         return false;
     }
-
     if (len < 1000) {
         ESP_LOGW(TAG, "pending_cfg: too short (%u bytes < 1000), erase",
                  (unsigned)len);
         nvs_close(nvs);
         if (nvs_open(NVS_NS_PENDING, NVS_READWRITE, &nvs) == ESP_OK) {
-            nvs_erase_all(nvs);
-            nvs_commit(nvs);
-            nvs_close(nvs);
+            nvs_erase_all(nvs); nvs_commit(nvs); nvs_close(nvs);
         }
         return false;
     }
@@ -321,7 +272,6 @@ static bool apply_pending_cfg_from_nvs(void)
     if (!buf) { nvs_close(nvs); return false; }
 
     char key[16];
-    size_t got = 0;
     for (int off = 0; off < (int)len; off += PENDING_CHUNK_SZ) {
         int chunk = (len - off > PENDING_CHUNK_SZ)
                     ? PENDING_CHUNK_SZ : (int)(len - off);
@@ -330,7 +280,6 @@ static bool apply_pending_cfg_from_nvs(void)
         if (nvs_get_blob(nvs, key, buf + off, &sz) != ESP_OK) {
             free(buf); nvs_close(nvs); return false;
         }
-        got += sz;
     }
     buf[len] = '\0';
     nvs_close(nvs);
@@ -340,9 +289,7 @@ static bool apply_pending_cfg_from_nvs(void)
 
     if (ok) {
         if (nvs_open(NVS_NS_PENDING, NVS_READWRITE, &nvs) == ESP_OK) {
-            nvs_erase_all(nvs);
-            nvs_commit(nvs);
-            nvs_close(nvs);
+            nvs_erase_all(nvs); nvs_commit(nvs); nvs_close(nvs);
         }
         ESP_LOGI(TAG, "pending_cfg: applied OK (version=%.2f, ped_mode=%u)",
                  g_config.version, g_config.traffic.pedestrian.request_mode);
@@ -359,7 +306,6 @@ static void load_embedded_config_if_needed(void)
         ESP_LOGE(TAG, "load_embedded_config: embedded config.json is EMPTY");
         return;
     }
-
     if (nvs_app_cfg_exists()) {
         ESP_LOGI(TAG, "NVS config found → use NVS (skip embedded config.json)");
         return;
@@ -480,20 +426,16 @@ static void ensure_valid_cfg(void)
                  g_config.traffic.pedestrian.request_mode);
         return;
     }
-
     size_t len = (size_t)(config_json_end - config_json_start);
     if (len == 0) {
-        ESP_LOGE(TAG, "ensure_valid_cfg: embedded config.json is EMPTY — "
-                      "cannot recover");
+        ESP_LOGE(TAG, "ensure_valid_cfg: embedded config.json is EMPTY");
         return;
     }
-
     ESP_LOGW(TAG, "ensure_valid_cfg: g_config has no sequence/stages → "
                   "force-load embedded config.json (%u bytes)", (unsigned)len);
     bool ok = config_load_json((const char *)config_json_start, len);
     if (!ok) {
-        ESP_LOGE(TAG, "ensure_valid_cfg: force-load FAILED — "
-                      "device will use defaults (CONFLICTING stages!)");
+        ESP_LOGE(TAG, "ensure_valid_cfg: force-load FAILED");
     } else {
         ESP_LOGI(TAG, "ensure_valid_cfg: force-load OK "
                       "(stages=%u seq=%u ped_mode=%u)",
@@ -503,11 +445,58 @@ static void ensure_valid_cfg(void)
     }
 }
 
+/* ============================================================
+   Хелпер: сгенерировать AP SSID (FSU_ROOT_XXXX / FSU_NODE_XXXX)
+   ============================================================ */
+static void build_ap_ssid(char *out, size_t out_len, bool is_root)
+{
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(out, out_len, "FSU_%s_%02X%02X",
+             is_root ? "ROOT" : "NODE", mac[4], mac[5]);
+}
+
+/* ============================================================
+   WiFi bringup: AP всегда; STA если есть creds (APSTA).
+   ============================================================ */
+static void wifi_bringup(bool is_root)
+{
+    char ap_ssid[33];
+    build_ap_ssid(ap_ssid, sizeof(ap_ssid), is_root);
+
+    bool has_wifi_creds = (strlen(g_config.wifi_ssid) > 0);
+
+    if (has_wifi_creds) {
+        ESP_LOGI(TAG, "WiFi bringup: APSTA (STA='%s' + AP='%s')",
+                 g_config.wifi_ssid, ap_ssid);
+        esp_err_t err = wifi_start();
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "wifi_start failed (%s) → fallback to AP-only",
+                     esp_err_to_name(err));
+            esp_err_t ap_err = wifi_ap_start_only(ap_ssid, "fsu12345678");
+            if (ap_err != ESP_OK) {
+                ESP_LOGE(TAG, "wifi_ap_start_only: %s",
+                         esp_err_to_name(ap_err));
+            }
+        }
+    } else {
+        ESP_LOGI(TAG, "WiFi bringup: AP-only ('%s') — no STA creds",
+                 ap_ssid);
+        esp_err_t ap_err = wifi_ap_start_only(ap_ssid, "fsu12345678");
+        if (ap_err != ESP_OK) {
+            ESP_LOGE(TAG, "wifi_ap_start_only: %s", esp_err_to_name(ap_err));
+        }
+    }
+}
+
+/* ============================================================
+   app_main
+   ============================================================ */
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Board bring-up (ROOT/NODE) — NO WIFI, LoRa only, "
-                  "FAST-LINK-MONITOR + SYNC-HANDSHAKE");
+    ESP_LOGI(TAG, "Board bring-up (ROOT/NODE) — LoRa + AP config + STA/PPP");
 
+    /* --- NVS --- */
     esp_err_t nvs_ret = nvs_flash_init();
     if (nvs_ret == ESP_ERR_NVS_NO_FREE_PAGES ||
         nvs_ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -516,27 +505,34 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(nvs_ret);
 
-/* === FIX LEAD-MS-NVS ===
-       Загружаем lead_ms из NVS до traffic_light_init(). Если
-       в NVS пусто — sync_config_init() оставит SYNC_LEAD_MS_DEFAULT
-       (150 мс). */
+    /* --- Event loop + netif СРАЗУ (нужны wifi_init/ppp/wifi_mqtt) --- */
+    esp_err_t e = esp_netif_init();
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+        ESP_LOGE(TAG, "esp_netif_init: %s", esp_err_to_name(e));
+    }
+    e = esp_event_loop_create_default();
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "esp_event_loop_create_default: %s", esp_err_to_name(e));
+    }
+
+    /* --- sync_config (lead_ms) ДО traffic_light_init --- */
     sync_config_init();
-    /* === END FIX LEAD-MS-NVS === */
-    
+
     log_heap("app_main start");
 
+    /* --- config: pending → NVS → embedded --- */
     bool pending_applied = run_cfg_load();
     if (pending_applied) {
         log_heap("after pending_cfg applied");
     }
-
     config_init();
-
     ensure_valid_cfg();
 
     bool is_root = (g_config.role == DEVICE_ROLE_MASTER);
-    ESP_LOGI(TAG, "role = %s", is_root ? "ROOT" : "NODE");
+    ESP_LOGI(TAG, "role = %s, wifi_ssid='%s'",
+             is_root ? "ROOT" : "NODE", g_config.wifi_ssid);
 
+    /* --- Peripherals --- */
     board_hw_init();
     sr_init();
     sr_all_off();
@@ -549,46 +545,51 @@ void app_main(void)
     traffic_light_init();
     fault_handler_register();
     wifi_mqtt_apply_config_runtime();
-
     buttons_start_tasks();
 
-/* === FIX BLE-TRANSPORT === */
+    /* --- WiFi: AP всегда + STA (если creds) --- */
+    wifi_init();
+    wifi_bringup(is_root);
+
+    /* --- BLE (для настройки через телефон) --- */
+    /* BLE disabled — config via WiFi AP */
+//#if USE_BLE
     esp_err_t ble_err = fsu_ble_init();
-    if (ble_err != ESP_OK) {
-        ESP_LOGW(TAG, "fsu_ble_init: %s", esp_err_to_name(ble_err));
-    } else {
-        ESP_LOGI(TAG, "BLE transport initialized");
-    }
-    /* === END FIX BLE-TRANSPORT === */
+    if (ble_err == ESP_ERR_NOT_SUPPORTED) {
+    ESP_LOGW(TAG, "BLE disabled (CONFIG_BT_ENABLED=n) — config via WiFi AP 192.168.4.1");
+} else if (ble_err != ESP_OK) {
+    ESP_LOGW(TAG, "fsu_ble_init: %s", esp_err_to_name(ble_err));
+} else {
+    ESP_LOGI(TAG, "BLE transport initialized");
+}
+/*#else
+    ESP_LOGW(TAG, "BLE disabled (CONFIG_BT_ENABLED=n) — config via WiFi AP 192.168.4.1");
+#endif*/
 
+    /* --- RS485/CAN transport + протокол --- */
     connectivity_register_rs485_can();
-
     transport_init();
     node_proto_register_callbacks();
 
-    
-
-    /* === FIX SYNC-DELAY-ZERO === */
     blink_reset_rtt();
-    /* === END FIX SYNC-DELAY-ZERO === */
 
     xTaskCreate(link_monitor_task, "link_mon", 3072, NULL, 3, NULL);
 
-    esp_netif_init();
-    esp_event_loop_create_default();
     esp_event_handler_register(IP_EVENT, IP_EVENT_PPP_GOT_IP, on_got_ip, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, on_got_ip, NULL);
 
+    /* --- ROOT/NODE специфичные задачи (ОДИН раз) --- */
     if (is_root) {
-        ESP_LOGI(TAG, "=== ROOT init (no Wi-Fi AP) ===");
+        ESP_LOGI(TAG, "=== ROOT init: root_wd + connectivity + mux + node_proto ===");
         root_wd_start_tasks();
         connectivity_start_tasks();
         mux_app_task_start();
         node_proto_start_root_tasks();
-        ESP_LOGI(TAG, "ROOT ready: LoRa CFG → traffic → PPP → MQTT + BLE");
+        ESP_LOGI(TAG, "ROOT ready: LoRa CFG → traffic → PPP/MQTT + WiFi/BLE");
     } else {
-        ESP_LOGI(TAG, "=== NODE init (no Wi-Fi STA) ===");
+        ESP_LOGI(TAG, "=== NODE init: node_proto + mux ===");
         node_proto_start_tasks();
         mux_app_task_start();
-        ESP_LOGI(TAG, "NODE ready: LoRa only, waiting for CFG + BLE config");
+        ESP_LOGI(TAG, "NODE ready: LoRa only, waiting CFG via BLE/WiFi/MQTT");
     }
 }
