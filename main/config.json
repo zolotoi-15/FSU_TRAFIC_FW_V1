@@ -80,6 +80,7 @@
       "insert_sequence": [5, 1, 6, 7, 1, 2],
       "insert_lead_ms": 10000,
       "insert_red_ms": 5000,
+
       "return_to_hold": true,
       "safe_exit_sequence": []
     },
@@ -143,7 +144,7 @@
       }
     ],
 
-    "sequence": [1, 2, 3,4,5,6,7],
+    "sequence": [1, 2, 3],
 
     "conflicting_channels": [
       [2, 10],
