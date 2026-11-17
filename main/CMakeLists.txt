@@ -1,7 +1,11 @@
 idf_component_register(
     SRCS
-        "mqtt_cmd.c" "mqtt_apply.c" "mqtt_fault.c" "mqtt_json.c"
-        "traffic_fault.c" "traffic_config.c" "blink_example_main.c"
+        "mqtt_cmd.c"
+        "mqtt_apply.c"
+        "mqtt_fault.c"
+        "mqtt_json.c"
+        "traffic_fault.c"
+        "blink_example_main.c"
         "board_hw.c"
         "mux_task.c"
         "fault_handler.c"
@@ -28,8 +32,7 @@ idf_component_register(
         "lora_nvs.c"
         "sync_handshake.c"
         "sync_config.c"
-        # "eth_w5500.c" — если используете W5500
-
+        # "eth_w5500.c"
     INCLUDE_DIRS "." "include"
     REQUIRES
         driver esp_driver_gpio esp_driver_uart esp_driver_spi freertos
@@ -40,7 +43,6 @@ idf_component_register(
         cjson
 )
 
-# === BLE: собираем только если BT включён в sdkconfig ===
 if(CONFIG_BT_ENABLED)
     target_sources(${COMPONENT_LIB} PRIVATE
         "ble_transport.c"
@@ -51,6 +53,5 @@ if(CONFIG_BT_ENABLED)
 else()
     message(WARNING "BLE disabled (CONFIG_BT_ENABLED=n): ble_transport.c/ble_config.c НЕ собираются")
 endif()
-# === END ===
 
 target_add_binary_data(${COMPONENT_LIB} "config.json" TEXT)
