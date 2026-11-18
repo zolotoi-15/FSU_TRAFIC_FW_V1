@@ -77,11 +77,13 @@
       "request_mode": "insert",
       "insert_timeout_ms": 30000,
       "min_recall_s": 15,
-      "insert_sequence": [4, 5, 1, 6, 7],
+      
+      "insert_sequence": [4, 5, 1, 6, 7, 1, 2],
+      
       "insert_lead_ms": 10000,
       "insert_red_ms": 5000,
       "return_to_hold": true,
-      "safe_exit_sequence": []
+      "safe_exit_sequence": [1, 2]
     },
 
     "stages_dd": [
@@ -98,7 +100,7 @@
         "name": "Фаза.2 (красный+жёлтый)",
         "groups": [2],
         "duration_kind": "red_yellow",
-        "outputs_on": [0, 1, 3, 4, 6, 7, 9],
+        "outputs_on": [0, 1, 3, 4, 6, 7, 9, 10],
         "outputs_blink": []
       },
       {
@@ -106,7 +108,7 @@
         "name": "Фаза.3 (зелёные — hold)",
         "groups": [3],
         "duration_kind": "green",
-        "outputs_on": [2, 5, 8, 9],
+        "outputs_on": [2, 5, 8, 11],
         "outputs_blink": []
       },
       {
@@ -114,15 +116,15 @@
         "name": "Фаза.4 (зелёные мигающие)",
         "groups": [4],
         "duration_kind": "green_blink",
-        "outputs_on": [9],
-        "outputs_blink": [2, 5, 8]
+        "outputs_on": [],
+        "outputs_blink": [2, 5, 8, 11]
       },
       {
         "id": 5,
         "name": "Фаза.5 (все жёлтые)",
         "groups": [5],
         "duration_kind": "yellow",
-        "outputs_on": [1, 4, 7, 9],
+        "outputs_on": [1, 4, 7, 10],
         "outputs_blink": []
       },
       {
@@ -130,7 +132,7 @@
         "name": "Фаза.6 (пешеходный зелёный)",
         "groups": [6],
         "duration_kind": "ped_green",
-        "outputs_on": [0, 3, 6, 10],
+        "outputs_on": [0, 3, 6, 9, 10],
         "outputs_blink": []
       },
       {
@@ -138,17 +140,18 @@
         "name": "Фаза.7 (пешеходный мигающий)",
         "groups": [7],
         "duration_kind": "ped_blink",
-        "outputs_on": [0, 3, 6],
+        "outputs_on": [0, 3, 6, 9],
         "outputs_blink": [10]
       }
     ],
 
-    "sequence": [1, 2, 3,4,5,6,7],
+    "sequence": [1, 2, 3, 4, 5, 6, 7],
 
     "conflicting_channels": [
       [2, 10],
       [5, 10],
-      [8, 10]
+      [8, 10],
+      [11, 10]
     ],
 
     "transitions": [
@@ -169,22 +172,22 @@
 
   "shift_register": {
     "outputs": [
-      { "ch": 0,  "name": "1-1",   "active": true },
-      { "ch": 1,  "name": "1-2",   "active": true },
-      { "ch": 2,  "name": "1-3",   "active": true },
-      { "ch": 3,  "name": "1-4",   "active": true },
-      { "ch": 4,  "name": "1-5",   "active": true },
-      { "ch": 5,  "name": "1-6",   "active": true },
-      { "ch": 6,  "name": "1-7",   "active": true },
-      { "ch": 7,  "name": "1-8",   "active": true },
-      { "ch": 8,  "name": "1-9",   "active": true },
-      { "ch": 9,  "name": "1-10",  "active": true },
-      { "ch": 10, "name": "1-11",  "active": true },
-      { "ch": 11, "name": "1-12",  "active": true },
-      { "ch": 12, "name": "spare", "active": false },
-      { "ch": 13, "name": "spare", "active": false },
-      { "ch": 14, "name": "spare", "active": false },
-      { "ch": 15, "name": "spare", "active": false }
+      { "ch": 0,  "name": "A-North Red",    "active": true },
+      { "ch": 1,  "name": "A-North Yellow", "active": true },
+      { "ch": 2,  "name": "A-North Green",  "active": true },
+      { "ch": 3,  "name": "A-South Red",    "active": true },
+      { "ch": 4,  "name": "A-South Yellow", "active": true },
+      { "ch": 5,  "name": "A-South Green",  "active": true },
+      { "ch": 6,  "name": "B-West Red",     "active": true },
+      { "ch": 7,  "name": "B-West Yellow",  "active": true },
+      { "ch": 8,  "name": "B-West Green",   "active": true },
+      { "ch": 9,  "name": "B-East Red",     "active": true },
+      { "ch": 10, "name": "Ped Green",      "active": true },
+      { "ch": 11, "name": "B-East Green",   "active": true },
+      { "ch": 12, "name": "spare",          "active": false },
+      { "ch": 13, "name": "spare",          "active": false },
+      { "ch": 14, "name": "spare",          "active": false },
+      { "ch": 15, "name": "spare",          "active": false }
     ]
   }
 }
