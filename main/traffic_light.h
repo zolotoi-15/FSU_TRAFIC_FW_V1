@@ -203,6 +203,7 @@ bool traffic_light_fault_has_priority(void);
    Т.е. это «нормальный простой», а не «аварийный простой». */
 bool traffic_light_in_standby(void);
 /* === END FIX ALL-OFF-STANDBY-NOT-FAULT === */
+bool stage_is_hold(uint8_t seq_idx);
 
 #ifdef __cplusplus
 }

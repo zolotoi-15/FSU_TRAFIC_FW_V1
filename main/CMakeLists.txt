@@ -23,6 +23,7 @@ idf_component_register(
         "wifi_ap.c"
         "wifi_mqtt.c"
         "mux_data.c"
+        "traffic_config.c"
         "traffic_light.c"
         "traffic_nvs.c"
         "modem_ppp.c"

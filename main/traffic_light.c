@@ -1941,3 +1941,16 @@ esp_err_t traffic_light_priority_shorten(uint32_t ms)
              (unsigned long)ms);
     return ESP_OK;
 }
+
+bool stage_is_hold(uint8_t seq_idx)
+{
+    if (!g_config.traffic.hold.enabled) return false;
+    if (g_config.traffic.hold.stage_count == 0) return false;
+    if (seq_idx >= g_config.traffic.sequence_count) return false;
+
+    uint8_t id = g_config.traffic.sequence[seq_idx];
+    for (int i = 0; i < g_config.traffic.hold.stage_count; i++) {
+        if (g_config.traffic.hold.stage_ids[i] == id) return true;
+    }
+    return false;
+}
