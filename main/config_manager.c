@@ -85,11 +85,12 @@ static void set_defaults_to(app_config_t *cfg)
     strcpy(cfg->timezone, "MSK-3");
 
     cfg->mqtt_enabled = true;
-    strcpy(cfg->mqtt_uri, "mqtt://m2.wqtt.ru");
-    cfg->mqtt_port = 13257;
-    strcpy(cfg->mqtt_user, "u_GGENLB");
-    strcpy(cfg->mqtt_password, "LTHNW22D");
+    strcpy(cfg->mqtt_uri, "mqtts://mqtt.xologie.ru");
+    cfg->mqtt_port = 8883;
+    strcpy(cfg->mqtt_user, "LS2024");
+    strcpy(cfg->mqtt_password, "Zavulon56");
     cfg->mqtt_timepause_min = 5;
+    cfg->root_start_delay_ms = 265;
 
     const char *names[] = { "solar", "bat", "load" };
     const int   pins[]  = { 18, 19, 20 };
@@ -204,16 +205,27 @@ void config_load(void)
         config_save();
         return;
     }
+
+    memset(&g_config, 0, sizeof(g_config));
     size_t sz = sizeof(g_config);
     err = nvs_get_blob(nvs, NVS_KEY, &g_config, &sz);
     nvs_close(nvs);
 
-    if (err != ESP_OK || sz != sizeof(g_config)) {
+    if (err != ESP_OK || sz == 0 || sz > sizeof(g_config)) {
         ESP_LOGW(TAG, "NVS blob missing/bad size (got %u, want %u), defaults",
                  (unsigned)sz, (unsigned)sizeof(g_config));
         set_defaults();
         config_save();
     } else {
+        if (sz < sizeof(g_config)) {
+            memset((char *)&g_config + sz, 0, sizeof(g_config) - sz);
+            g_config.root_start_delay_ms = 2000;
+            ESP_LOGI(TAG, "NVS blob migrated: %u → %u bytes "
+                          "(root_start_delay_ms=2000)",
+                     (unsigned)sz, (unsigned)sizeof(g_config));
+            config_save();   /* перезапишем blob уже новой длины */
+        }
+
         bool timings_changed = !validate_phase_timings(&g_config.traffic);
         uint8_t ins_before = g_config.traffic.pedestrian.insert_count;
         uint8_t sex_before = g_config.traffic.pedestrian.safe_exit_count;
@@ -959,6 +971,9 @@ bool config_load_json(const char *json, size_t len)
     }
     json_get_str(root, "timezone", tmp->timezone, sizeof(tmp->timezone));
 
+tmp->root_start_delay_ms = (uint32_t)json_get_int(
+        root, "root_start_delay_ms", (int)tmp->root_start_delay_ms);
+
     const cJSON *mqtt = cJSON_GetObjectItemCaseSensitive(root, "mqtt");
     if (cJSON_IsObject(mqtt)) {
         tmp->mqtt_enabled = json_get_bool(mqtt, "enabled", true);
@@ -1122,6 +1137,9 @@ bool config_export_json(char *buf, size_t *len)
         cJSON_AddStringToObject(mqtt, "password", g_config.mqtt_password);
         cJSON_AddNumberToObject(mqtt, "timepause_min", g_config.mqtt_timepause_min);
     }
+
+     cJSON_AddNumberToObject(root, "root_start_delay_ms",
+                            g_config.root_start_delay_ms);
 
     cJSON *t = cJSON_AddObjectToObject(root, "traffic");
     if (t) {

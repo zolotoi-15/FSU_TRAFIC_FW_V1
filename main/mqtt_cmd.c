@@ -322,6 +322,16 @@ static bool parse_hex(const char *p, uint8_t *buf, size_t max, size_t *out_n)
    ============================================================ */
 void mqtt_handle_command(const char *data, int data_len)
 {
+
+    /* === FIX ROOT-START-DELAY ===
+       Отдельный параметр верхнего уровня JSON.
+       Проверяем до основного парсера — он может игнорировать
+       неизвестные ключи молча. */
+    if (data && data_len > 0 && strstr(data, "\"root_start_delay_ms\"")) {
+        mqtt_cmd_root_start_delay(data, data_len);
+        return;
+    }
+
     char cmd[256];
     int len = data_len < (int)sizeof(cmd) - 1 ? data_len : (int)sizeof(cmd) - 1;
     memcpy(cmd, data, len);

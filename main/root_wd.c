@@ -76,13 +76,13 @@
 
 static const char *TAG = "root_wd";
 
-#define ROOT_NODE_CHECK_MS          200
+#define ROOT_NODE_CHECK_MS          50
 #define NODE_COMM_LOST_MS           4000
 #define HEARTBEAT_INTERVAL_MS       2000
 #define SYNC_AFTER_START_DELAY_MS   2000
 
 /* === FIX ROOT-WAIT-NODE-ACK === */
-#define WAIT_NODE_ACK_TIMEOUT_MS   3000
+#define WAIT_NODE_ACK_TIMEOUT_MS   300
 /* === END FIX ROOT-WAIT-NODE-ACK === */
 
 /* === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
@@ -117,6 +117,9 @@ extern uint32_t blink_get_rtt_us(void);
 
 extern volatile bool s_hold_active;
 extern volatile bool s_insert_pending;
+
+static esp_timer_handle_t s_root_delay_timer = NULL;
+static traffic_fault_t    s_root_delay_fault = TRAFFIC_FAULT_NONE;
 
 /* ============================================================
    SET_REMOTE_FLAG
@@ -397,30 +400,19 @@ void root_apply_new_config_from_mqtt(const char *json, int len)
     }
     traffic_light_reset();
 
-    if (g_config.traffic.enabled && g_config.traffic.auto_start) {
-        ESP_LOGW(TAG, "ROOT: auto-start after config update (c: via phase_sync)");
-
-        uint32_t utc_sec; uint16_t utc_ms;
-        if (time_sync_get(&utc_sec, &utc_ms)) {
-            time_sync_root_push_force(blink_get_rtt_us());
-        }
-
-        SET_REMOTE_FLAG(true);
-        traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-        SET_REMOTE_FLAG(false);
-        traffic_light_set_follow_root(false);
-        traffic_light_start_with_red();
+     if (g_config.traffic.auto_start) {
+        /* === FIX ROOT-START-DELAY ===
+           Вместо немедленного fault:none + start_with_red —
+           отложенный запуск через g_config.root_start_delay_ms. */
+        root_start_delay_schedule();
     } else {
         ESP_LOGW(TAG, "ROOT: auto_start disabled - stay in YELLOW_BLINK");
-        /* === FIX FAULT-MASK-ON-CONFIG-LOAD ===
-           Явно применяем YELLOW_BLINK, чтобы apply_fault_mode
-           построил маску по уже применённому g_config.pins. */
         SET_REMOTE_FLAG(true);
         traffic_light_set_fault(TRAFFIC_FAULT_YELLOW_BLINK);
         SET_REMOTE_FLAG(false);
-        /* === END FIX === */
     }
 }
+
 
 /* ============================================================
    root_node_watchdog_task
@@ -481,22 +473,22 @@ static void root_node_watchdog_task(void *arg)
             if (node_confirmed || timeout) {
                 if (timeout && !node_confirmed) {
                     ESP_LOGW(TAG, "ROOT: wait NODE ack timeout (%u ms) — "
-                                  "force local start_with_red",
+                                  "force local start_with_red (delayed)",
                              WAIT_NODE_ACK_TIMEOUT_MS);
                 } else {
                     ESP_LOGI(TAG, "ROOT: NODE ack RUNNING → local "
-                                  "start_with_red (channels ON)");
+                                  "start_with_red (delayed)");
                 }
 
                 uint32_t utc_sec; uint16_t utc_ms;
                 if (time_sync_get(&utc_sec, &utc_ms)) {
                     time_sync_root_push_force(blink_get_rtt_us());
                 }
-                SET_REMOTE_FLAG(true);
-                traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-                SET_REMOTE_FLAG(false);
-                traffic_light_set_follow_root(false);
-                traffic_light_start_with_red();
+
+                /* === FIX ROOT-START-DELAY ===
+                   fault:none + start_with_red переехали в таймер.
+                   ROOT остаётся в ALL_OFF до срабатывания задержки. */
+                root_start_delay_schedule();
 
                 wait_node_ack = false;
                 was_connected = true;
@@ -601,18 +593,15 @@ static void root_node_watchdog_task(void *arg)
             traffic_light_get_fault() != TRAFFIC_FAULT_ALL_OFF) {
 
             ESP_LOGW(TAG, "ROOT: NODE RUNNING but ROOT STOPPED → "
-                          "START ROOT + force c:");
+                          "START ROOT (delayed) + force c:");
 
             uint32_t utc_sec; uint16_t utc_ms;
             if (time_sync_get(&utc_sec, &utc_ms)) {
                 time_sync_root_push_force(blink_get_rtt_us());
             }
 
-            SET_REMOTE_FLAG(true);
-            traffic_light_set_fault(TRAFFIC_FAULT_NONE);
-            SET_REMOTE_FLAG(false);
-            traffic_light_set_follow_root(false);
-            traffic_light_start_with_red();
+            /* === FIX ROOT-START-DELAY === */
+            root_start_delay_schedule();
 
             was_connected = true;
             lost_since_ms = 0;
@@ -677,8 +666,10 @@ static void root_node_watchdog_task(void *arg)
         }
         /* === END FIX NO-FAULT-NONE-ON-RESEND === */
 
-        if (!has_node && was_connected) {
+         if (!has_node && was_connected) {
             ESP_LOGW(TAG, "ROOT: NODE lost -> sync_handshake");
+            /* === FIX ROOT-START-DELAY: гасим отложенный старт === */
+            root_start_delay_cancel();
             traffic_light_stop();
             SET_REMOTE_FLAG(true);
             traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
@@ -699,6 +690,8 @@ static void root_node_watchdog_task(void *arg)
                 if (traffic_light_get_fault() != TRAFFIC_FAULT_ALL_OFF) {
                     ESP_LOGE(TAG, "ROOT: NODE absent > %d ms -> ALL_OFF",
                              NODE_COMM_LOST_MS);
+                    /* === FIX ROOT-START-DELAY: гасим отложенный старт === */
+                    root_start_delay_cancel();
                     SET_REMOTE_FLAG(true);
                     traffic_light_set_fault(TRAFFIC_FAULT_ALL_OFF);
                     SET_REMOTE_FLAG(false);
@@ -832,3 +825,58 @@ void root_wd_start_tasks(void)
     xTaskCreate(root_node_watchdog_task,  "root_node_wd",  8192, NULL, 3, NULL);
     xTaskCreate(root_heartbeat_task,      "root_hb",       3072, NULL, 3, NULL);
 }
+
+static void root_start_delay_fire(void)
+{
+    if (traffic_light_get_fault() != s_root_delay_fault) {
+        ESP_LOGW(TAG, "ROOT start delay: fault changed during delay "
+                      "(sched=%d now=%d) → skip local start",
+                 (int)s_root_delay_fault,
+                 (int)traffic_light_get_fault());
+        return;
+    }
+    ESP_LOGI(TAG, "ROOT start delay expired (%lu ms) → local start_with_red",
+             (unsigned long)g_config.root_start_delay_ms);
+    SET_REMOTE_FLAG(true);
+    traffic_light_set_fault(TRAFFIC_FAULT_NONE);
+    SET_REMOTE_FLAG(false);
+    traffic_light_set_follow_root(false);
+    traffic_light_start_with_red();
+}
+
+static void root_delay_timer_cb(void *arg)
+{
+    (void)arg;
+    root_start_delay_fire();
+}
+
+uint32_t root_start_delay_get(void) { return g_config.root_start_delay_ms; }
+
+void root_start_delay_schedule(void)
+{
+    uint32_t dly = g_config.root_start_delay_ms;
+    if (dly == 0) { root_start_delay_fire(); return; }
+
+    if (!s_root_delay_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = root_delay_timer_cb,
+            .arg = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "root_dly"
+        };
+        if (esp_timer_create(&args, &s_root_delay_timer) != ESP_OK) {
+            root_start_delay_fire();   /* таймер не создался — не блокируем старт */
+            return;
+        }
+    }
+    esp_timer_stop(s_root_delay_timer);
+    s_root_delay_fault = traffic_light_get_fault();
+    esp_timer_start_once(s_root_delay_timer, (uint64_t)dly * 1000ULL);
+    ESP_LOGW(TAG, "ROOT: local start_with_red in %lu ms", (unsigned long)dly);
+}
+
+void root_start_delay_cancel(void)
+{
+    if (s_root_delay_timer) esp_timer_stop(s_root_delay_timer);
+}
+/* === END FIX ROOT-START-DELAY === */

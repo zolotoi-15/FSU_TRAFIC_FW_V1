@@ -63,6 +63,7 @@ void mqtt_fault_publish_node_channels(const char *json, size_t len);
 /* mqtt_apply.c */
 void mqtt_apply_config_runtime(void);
 void mqtt_notify_phase(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms);
+void mqtt_cmd_root_start_delay(const char *payload, int len);
 
 #ifdef __cplusplus
 }

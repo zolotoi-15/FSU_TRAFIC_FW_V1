@@ -110,6 +110,9 @@ static esp_err_t wifi_connect_start(void)
 }
 
 static void reconnect_timer_cb(void *arg) {
+    /* === FIX STA-QUIET-WHEN-PPP === */
+    if (modem_ppp_is_connected()) return;   /* PPP жив — STA не нужна */
+    /* === END FIX STA-QUIET-WHEN-PPP === */
     if (!s_sta_connected && !s_sta_connecting && s_has_saved_ssid) {
         ESP_LOGI(TAG, "Attempting STA reconnect...");
         wifi_connect_start();
@@ -150,6 +153,16 @@ static void evt_handler(void *arg, esp_event_base_t base, int32_t id, void *data
         s_sta_connecting = false;
         wifi_inc_disconnect();
         strcpy(s_ip, "0.0.0.0");
+
+        if (s_has_saved_ssid && !modem_ppp_is_connected()) {
+            ensure_reconnect_timer();
+            esp_timer_stop(s_reconnect_timer);
+            esp_timer_start_once(s_reconnect_timer,
+                                 (uint64_t)s_retry_delay_sec * 1000000ULL);
+            if (s_retry_delay_sec < 60) s_retry_delay_sec *= 2;
+            if (s_retry_delay_sec > 60) s_retry_delay_sec = 60;
+        }
+        
         if (wifi_get_down_since() == 0) wifi_set_down_since(esp_timer_get_time());
         ESP_LOGW(TAG, "STA disconnected (reason=%u %s, rssi=%d)",
                  evt->reason, reason_str(evt->reason), evt->rssi);
@@ -212,6 +225,20 @@ static void wifi_monitor_task(void *arg)
     ESP_LOGI(TAG, "WiFi monitor task started");
     while (1) {
         vTaskDelayUntil(&last, pdMS_TO_TICKS(WIFI_MONITOR_PERIOD_MS));
+
+        /* === FIX STA-QUIET-WHEN-PPP ===
+           PPP жив — STA не дёргаем: ни forcing connect, ни hard
+           reconnect, ни esp_restart(). Каждый цикл auth->init
+           трясёт lwIP и обрывает TCP-соединения MQTT
+           ('Software caused connection abort' в логе совпадал с
+           AUTH_EXPIRE). А esp_restart() по 'STA down 15 min'
+           перезагружал рабочий светофор при живом PPP —
+           STA тут резерв, а не условие жизни. */
+        if (modem_ppp_is_connected()) {
+            wifi_set_down_since(0);   /* STA-даунтайм не копим */
+            continue;
+        }
+        /* === END FIX STA-QUIET-WHEN-PPP === */
 
         int64_t now = esp_timer_get_time();
 

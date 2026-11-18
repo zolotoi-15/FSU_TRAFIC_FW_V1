@@ -59,7 +59,7 @@ static const char *TAG = "transport";
 #define FRAG_GAP_MS       200
 #define FRAG_GAP_STATUS_EXTRA_MS  150
 
-#define TX_IDLE_GUARD_MS  50
+#define TX_IDLE_GUARD_MS  400
 
 #define ACK_TIMEOUT       800
 #define ACK_TIMEOUT_CMD   2000

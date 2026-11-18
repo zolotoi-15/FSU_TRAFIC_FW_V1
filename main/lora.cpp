@@ -37,7 +37,7 @@ static volatile bool     s_have_rx_stats = false;
    Параметры модуляции (fallback, если NVS пуст).
    SF9 / BW250 / CR4/5 / 869.85 МГц / 13 dBm.
    ============================================================ */
-#define LORA_FREQ_HZ        869850000   /* 869.85 МГц — g4, 100% скважности, 25 мВт */
+#define LORA_FREQ_HZ        869850675   /* 869.85 МГц — g4, 100% скважности, 25 мВт */
 #define LORA_TX_POWER_DBM   13          /* 13 dBm = 20 мВт (в пределах 25 мВт g4) */
 #define LORA_SF             8           /* SF7..SF12 */
 #define LORA_BW_KHZ         250         /* 125/250/500 */

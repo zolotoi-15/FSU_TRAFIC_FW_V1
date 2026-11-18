@@ -392,6 +392,7 @@ typedef struct {
     control_source_t control_sources[MAX_CONTROL_SOURCES];
     uint8_t          control_source_count;
     modules_config_t modules;
+    uint32_t root_start_delay_ms;
 } app_config_t;
 
 extern app_config_t g_config;

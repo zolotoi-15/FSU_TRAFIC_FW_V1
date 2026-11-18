@@ -41,7 +41,7 @@ idf_component_register(
         esp_adc esp_wifi esp_event esp_http_server lwip nvs_flash
         espressif__esp_modem
         espp__sx126x
-        cjson
+        cjson esp-tls
 )
 
 if(CONFIG_BT_ENABLED)

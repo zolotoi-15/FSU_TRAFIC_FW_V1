@@ -45,7 +45,7 @@ static const char *TAG = "connectivity";
 
 #define MODEM_APN             "internet"
 #define MODEM_PPP_TIMEOUT_MS  30000
-#define MODEM_RETRY_PERIOD_MS 5000
+#define MODEM_RETRY_PERIOD_MS 30000
 #define PPP_RETRY_MAX_DOWN_MS (5 * 60 * 1000)
 #define CFG_WAIT_MAX_MS       (120 * 1000)
 
@@ -87,6 +87,20 @@ static void modem_retry_task(void *arg) {
             /* === END FIX === */
 
             if (g_config.role == DEVICE_ROLE_MASTER) {
+                 /* === FIX MQTT-INIT-ONCE-UP ===
+                   init нужен только когда клиента нет вовсе.
+                   При живом клиенте реконнект делает сам esp-mqtt;
+                   повторный restart каждые 5 с обрывает идущую
+                   попытку connect. */
+                extern esp_mqtt_client_handle_t g_mqtt_client;
+                if (g_mqtt_client == NULL) {
+                    esp_err_t merr = wifi_mqtt_init();
+                    if (merr != ESP_OK && merr != ESP_ERR_INVALID_STATE) {
+                        ESP_LOGW(TAG, "wifi_mqtt_init retry: %s",
+                                 esp_err_to_name(merr));
+                    }
+                }
+                
                 /* MQTT может не встать сразу после PPP up — пробуем
                    wifi_mqtt_init каждый цикл, если ещё не подключён. */
                 if (!wifi_mqtt_is_connected()) {
@@ -105,7 +119,7 @@ static void modem_retry_task(void *arg) {
                        ветке — значит да). */
                     ESP_LOGE(TAG, "PPP up but MQTT down %lu ms → force restart",
                              (unsigned long)mqtt_down);
-                    wifi_mqtt_force_restart_modem();
+                   // wifi_mqtt_force_restart_modem();
                     vTaskDelay(pdMS_TO_TICKS(3000));
                     ppp_down_since_ms = now;
                 }
@@ -135,6 +149,14 @@ static void modem_retry_task(void *arg) {
 
         ESP_LOGW(TAG, "no IP → try PPPoS (attempt %d)", s_ppp_fail_count + 1);
         esp_err_t mret = modem_ppp_start(MODEM_APN, MODEM_PPP_TIMEOUT_MS);
+        /* === FIX PPP-SINGLE-FLIGHT ===
+           «Busy» — не провал: попытка ещё идёт (attach, dial).
+           fail_count не трогаем, иначе 'SIM not ready, skip PPP'
+           снова сработает на живой модем. */
+        if (mret == ESP_ERR_INVALID_STATE) {
+            continue;
+        }
+bool got_ip = (mret == ESP_OK && modem_ppp_is_connected());
         if (mret == ESP_OK) {
             s_ppp_fail_count = 0;
             ppp_down_since_ms = 0;

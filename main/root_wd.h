@@ -50,6 +50,11 @@ extern volatile bool     s_cfg_req_pending;
 extern volatile bool     s_force_resync_pending;
 extern volatile uint32_t s_cfg_last_ok_ms;
 
+
+void     root_start_delay_schedule(void);
+void     root_start_delay_cancel(void);
+uint32_t root_start_delay_get(void);
+
 #ifdef __cplusplus
 }
 #endif

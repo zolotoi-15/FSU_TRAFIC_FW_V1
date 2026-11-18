@@ -548,8 +548,8 @@ void app_main(void)
     buttons_start_tasks();
 
     /* --- WiFi: AP всегда + STA (если creds) --- */
-    wifi_init();
-    wifi_bringup(is_root);
+   // wifi_init();
+  //  wifi_bringup(is_root);
 
     /* --- BLE (для настройки через телефон) --- */
     /* BLE disabled — config via WiFi AP */
