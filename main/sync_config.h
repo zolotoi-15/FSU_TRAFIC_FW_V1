@@ -13,7 +13,7 @@ extern "C" {
 #define TIME_PUSH_PERIOD_MS       10000
 #define HOLD_RESYNC_INTERVAL_MS   500
 
-#define LORA_SYNC_INTERVAL_MS     300
+#define LORA_SYNC_INTERVAL_MS     250//300
 
 #define SYNC_MAX_DRIFT_MS         250
 #define UTC_DELTA_MAX_MS          5000

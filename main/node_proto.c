@@ -140,17 +140,17 @@ volatile bool     s_node_link_valid    = false;
 /* === FIX T_CHANNELS === */
 char s_node_channels_json[2048] = {0};
 volatile bool s_node_channels_valid = false;
-#define NODE_CHANNELS_PERIOD_MS  60000
+#define NODE_CHANNELS_PERIOD_MS  10000//60000
 static uint32_t s_last_channels_ms = 0;
 /* === END FIX T_CHANNELS === */
 
 
-#define NODE_STATUS_PERIOD_MS      8000
-#define NODE_STATUS_FAULT_MS       1000
-#define NODE_STATUS_SYNC_MS        500
-#define STATUS_FORCE_MS            5000
+#define NODE_STATUS_PERIOD_MS      2000//8000
+#define NODE_STATUS_FAULT_MS       500//1000
+#define NODE_STATUS_SYNC_MS        200//500
+#define STATUS_FORCE_MS            2000//5000
 
-#define NODE_ROOT_LOST_MS          6000
+#define NODE_ROOT_LOST_MS          4000//6000
 
 #define UTC_DELTA_MAX_MS_LOCAL     3000
 #define SYNC_MAX_DRIFT_MS_LOCAL    500

@@ -76,13 +76,13 @@
 
 static const char *TAG = "root_wd";
 
-#define ROOT_NODE_CHECK_MS          50
-#define NODE_COMM_LOST_MS           4000
-#define HEARTBEAT_INTERVAL_MS       2000
-#define SYNC_AFTER_START_DELAY_MS   2000
+#define ROOT_NODE_CHECK_MS          200//50
+#define NODE_COMM_LOST_MS           3000//4000
+#define HEARTBEAT_INTERVAL_MS       1000//2000
+#define SYNC_AFTER_START_DELAY_MS   1000//2000
 
 /* === FIX ROOT-WAIT-NODE-ACK === */
-#define WAIT_NODE_ACK_TIMEOUT_MS   300
+#define WAIT_NODE_ACK_TIMEOUT_MS   200//300
 /* === END FIX ROOT-WAIT-NODE-ACK === */
 
 /* === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
@@ -91,7 +91,7 @@ static const char *TAG = "root_wd";
    transport_send_cmd_noack блокирующий (возвращается после
    физической передачи), так что 80 мс — это запас поверх
    уже доставленного пакета. */
-#define FAULT_NONE_TO_START_GAP_MS  80
+#define FAULT_NONE_TO_START_GAP_MS  100//150
 /* === END FIX ROOT-RETURN-SENDS-FAULT-NONE === */
 
 /* === FIX WAIT-TIME-SYNC-TIMEOUT ===

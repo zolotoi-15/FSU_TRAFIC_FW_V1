@@ -345,10 +345,25 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
                  event->data_len, event->total_data_len,
                  event->current_data_offset);
 
-        bool is_json_topic = (event->topic_len > 0 &&
-                              event->topic_len <= (int)strlen(s_json_topic) &&
+        /* === FIX MQTT-TOPIC-PREFIX-COLLISION ===
+           Раньше: is_json_topic = strncmp(topic, ".../SetJson", 13) == 0.
+           Для сообщения в ".../Set" (13 символов) это тоже true,
+           потому что "/Set" — префикс "/SetJson". Команда Set
+           уходила в mqtt_json_accum_feed, а не в mqtt_handle_command.
+
+           Теперь: topic_len должен СОВПАДАТЬ с strlen(full_topic).
+           Это единственный корректный способ отличить /Set от
+           /SetJson при одинаковом префиксе. */
+        bool is_json_topic = (event->topic_len == (int)strlen(s_json_topic) &&
                               strncmp(event->topic, s_json_topic,
                                       event->topic_len) == 0);
+        bool is_kp_topic   = (event->topic_len == (int)strlen(s_kp_topic) &&
+                              strncmp(event->topic, s_kp_topic,
+                                      event->topic_len) == 0);
+        bool is_sub_topic  = (event->topic_len == (int)strlen(s_sub_topic) &&
+                              strncmp(event->topic, s_sub_topic,
+                                      event->topic_len) == 0);
+        /* === END FIX MQTT-TOPIC-PREFIX-COLLISION === */
 
         if (is_json_topic) {
             int total = event->total_data_len > 0
@@ -362,21 +377,18 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
             break;
         }
 
-        if (event->topic_len > 0 &&
-            event->topic_len <= (int)strlen(s_kp_topic) &&
-            strncmp(event->topic, s_kp_topic, event->topic_len) == 0) {
+        if (is_kp_topic) {
             ESP_LOGW(TAG, "Keypressed via MQTT: %.*s",
                      event->data_len, event->data);
             break;
         }
 
-        if (event->topic_len > 0 &&
-            event->topic_len <= (int)strlen(s_sub_topic) &&
-            strncmp(event->topic, s_sub_topic, event->topic_len) == 0) {
+        if (is_sub_topic) {
             mqtt_handle_command(event->data, event->data_len);
         }
         break;
     }
+    
     default: break;
     }
 }
