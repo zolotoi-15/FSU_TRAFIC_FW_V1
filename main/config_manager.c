@@ -248,8 +248,10 @@ void config_load(void)
                       "insert_red_ms=%lu, insert_seq=%u, safe_exit=%u, "
                       "conflicts=%u, ped_display=%u)",
                  g_config.version,
-                 g_config.wifi_ssid, g_config.traffic.mode,
-                 g_config.traffic.stage_count, g_config.traffic.sequence_count,
+                 g_config.wifi_ssid,
+                 g_config.traffic.mode,
+                 g_config.traffic.stage_count,
+                 g_config.traffic.sequence_count,
                  g_config.traffic.pedestrian.request_mode,
                  g_config.traffic.hold.enabled,
                  g_config.traffic.hold.stage_count,

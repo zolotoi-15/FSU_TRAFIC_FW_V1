@@ -102,7 +102,7 @@ static volatile bool     s_node_has_fault           = false;
 #define SYNC_AFTER_START_DELAY_MS   1000//2000
 
 /* === FIX ROOT-WAIT-NODE-ACK === */
-#define WAIT_NODE_ACK_TIMEOUT_MS   200//300
+#define WAIT_NODE_ACK_TIMEOUT_MS   300//300
 /* === END FIX ROOT-WAIT-NODE-ACK === */
 
 /* === FIX ROOT-RETURN-SENDS-FAULT-NONE ===
@@ -111,7 +111,7 @@ static volatile bool     s_node_has_fault           = false;
    transport_send_cmd_noack блокирующий (возвращается после
    физической передачи), так что 80 мс — это запас поверх
    уже доставленного пакета. */
-#define FAULT_NONE_TO_START_GAP_MS  100//150
+#define FAULT_NONE_TO_START_GAP_MS  150//150
 /* === END FIX ROOT-RETURN-SENDS-FAULT-NONE === */
 
 /* === FIX WAIT-TIME-SYNC-TIMEOUT ===
@@ -559,7 +559,7 @@ static void root_node_watchdog_task(void *arg)
                 last_start_ms = 0;
                 wait_time_sync_since = 0;
                 wifi_mqtt_set_root_comm_lost(false);
-                wifi_mqtt_publish_comm_restored();
+               // wifi_mqtt_publish_comm_restored();
             }
             vTaskDelay(pdMS_TO_TICKS(ROOT_NODE_CHECK_MS));
             continue;
@@ -644,7 +644,7 @@ static void root_node_watchdog_task(void *arg)
                 last_start_ms = 0;
                 wait_time_sync_since = 0;
                 wifi_mqtt_set_root_comm_lost(false);
-                wifi_mqtt_publish_comm_restored();
+                //wifi_mqtt_publish_comm_restored();
             }
             vTaskDelay(pdMS_TO_TICKS(ROOT_NODE_CHECK_MS));
             continue;
@@ -798,7 +798,7 @@ static void root_node_watchdog_task(void *arg)
                     wifi_mqtt_set_root_comm_lost(true);
                     in_comm_lost_all_off = true;
 
-                    wifi_mqtt_publish_comm_lost(NODE_COMM_LOST_MS);
+                    //wifi_mqtt_publish_comm_lost(NODE_COMM_LOST_MS);
 
                     sync_handshake_root_start();
                 }

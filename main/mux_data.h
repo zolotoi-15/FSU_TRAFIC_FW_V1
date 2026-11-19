@@ -33,7 +33,7 @@ const char *imon_state_str(imon_state_t s);
    порог 4300 — на грани, fault можно не поймать. Снижено до 4200
    с запасом. Не ниже 4000 — иначе V_IMON(lin) max 4 В начнёт
    ложно срабатывать. */
-#define IMON_TH_FAULT_MV         4200
+#define IMON_TH_FAULT_MV         3150//4200
 /* === END FIX TPS27S100B-VIN-FIRST === */
 
 /* === FIX TPS27S100B-VIN-FIRST ===

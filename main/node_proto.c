@@ -1,4 +1,4 @@
-/* ============================================================
+/*         ====
    node_proto.c — NODE/ROOT протокол.
 
    === FIX C-BUFFER-BEFORE-START ===
@@ -37,11 +37,11 @@
 
    === FIX TIME-APPLY-IN-ALIGNED ===
    time: применяется на NODE всегда.
-<<<<<<< HEAD
-<<<<<<< Updated upstream
-=======
-=======
->>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
+  HEAD
+  Updated upstream
+ 
+ 
+  68ea8f38277221d1f4cb2c1a936d18ea0698235d
 
    === FIX NODE-STATUS-ROOT-FORMAT ===
    STATUS от NODE в формате ROOT (SR/NET/TRAFFIC/FAULT/LINK/
@@ -53,13 +53,13 @@
    LINK.rssi), т.к. LINK теперь — объект с root/node.
 
    === FIX STATUS-NO-CHANNELS ===
-<<<<<<< HEAD
+  HEAD
    STATUS без ch00..ch15 → ~686 байт = 17 фрагментов по LoRa.
    Без ACK на каждом фрагменте (T_STATUS = noack) потеря
    любого фрагмента → frag gap → отбрасывание всего пакета.
    Каналы NODE остаются в T_CHANNELS (раз в 60 с, публикуется
    в <base>/Node/Channels).
-=======
+ 
    КЛЮЧЕВАЯ ПРАВКА.
    Раньше STATUS включал ch00..ch15 → ~1500 байт = 46 фрагментов
    по LoRa. Без ACK на каждом фрагменте (T_STATUS = noack) потеря
@@ -71,12 +71,12 @@
    Каналы NODE остаются в T_CHANNELS (раз в 60 с, публикуется
    в <base>/Node/Channels). Вероятность потери 1 из 10 гораздо
    ниже, чем 1 из 46.
->>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
+  68ea8f38277221d1f4cb2c1a936d18ea0698235d
 
    === FIX T-CHANNELS-NOT-COMBINED ===
    T_CHANNELS и STATUS больше НЕ шлются в одной итерации
    node_send_task. После T_CHANNELS — пауза 3000 мс + continue.
-<<<<<<< HEAD
+  HEAD
 
    === FIX UTC-SKIP-PM-RESET ===
    КЛЮЧЕВАЯ ПРАВКА.
@@ -91,12 +91,12 @@
    (фаза начнётся с начала, доиграет свой dur). Исключение:
    ph=0 (ALL_OFF) и insert-фазы — для них pm применяется
    как есть (это управляющие команды, не нормальная фаза).
->>>>>>> Stashed changes
-=======
+  Stashed changes
+ 
    Иначе 30+10=40 фрагментов подряд → ROOT шлёт c: каждые
    LORA_SYNC_INTERVAL_MS → гарантированные коллизии.
->>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
-   ============================================================ */
+  68ea8f38277221d1f4cb2c1a936d18ea0698235d
+           ==== */
 
 #include "node_proto.h"
 #include "app_shared.h"
@@ -159,7 +159,7 @@ static uint32_t s_last_channels_ms = 0;
 /* === FIX STATUS-NO-CHANNELS ===
    Буфер STATUS: новый формат без ch00..ch15 ≈ 686 байт.
    1024 — с запасом (FAULT.reasons может быть длинным). */
-#define NODE_STATUS_BUF_SIZE       1024
+#define NODE_STATUS_BUF_SIZE       2048
 /* === END FIX STATUS-NO-CHANNELS === */
 
 /* === FIX UTC-SKIP-PM-RESET ===
@@ -213,11 +213,11 @@ static inline void node_note_root_data(void)
     s_last_root_data_ms = (uint32_t)(esp_timer_get_time() / 1000);
 }
 
-/* ============================================================
+/*         ====
    node_apply_c_mask
    === FIX FAULT-HAS-TOP-PRIORITY ===
    === FIX UTC-SKIP-PM-RESET ===
-   ============================================================ */
+           ==== */
 static void node_apply_c_mask(uint8_t ph,
                               uint32_t pm,
                               uint16_t on16,
@@ -301,11 +301,11 @@ static void node_apply_c_mask(uint8_t ph,
     traffic_light_apply_mask(on16, blink16, ph, apply_pm, dur);
 }
 
-/* ============================================================
+/*         ====
    on_cmd_from_root
    === FIX ROOT-RETURN-CLEARS-LOCAL-ALL-OFF ===
    === FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE ===
-   ============================================================ */
+           ==== */
 static void on_cmd_from_root(const char *cmd, size_t len)
 {
     link_monitor_note_ping_rx();
@@ -415,6 +415,13 @@ static void on_cmd_from_root(const char *cmd, size_t len)
             ESP_LOGW(TAG, "fault:none from ROOT IGNORED: NODE has %u "
                           "active local fault(s), wait try_recovery",
                      local_cnt);
+                     ESP_LOGW(TAG, "fault:none from ROOT → clearing NODE fault latch");
+        if (traffic_light_fault_has_priority()) {
+        ESP_LOGW(TAG, "fault:none from ROOT → clearing NODE fault latch");
+        
+    }
+        traffic_light_set_fault(TRAFFIC_FAULT_NONE);
+
             return;
         }
         /* === END FIX FAULT-NONE-DONT-CLEAR-LOCAL-ACTIVE === */
@@ -666,9 +673,9 @@ static void on_cmd_from_root(const char *cmd, size_t len)
     }
 }
 
-/* ============================================================
+/*         ====
    node_handle_local_cmd
-   ============================================================ */
+           ==== */
 void node_handle_local_cmd(const char *cmd)
 {
     int baud = 0;
@@ -731,13 +738,13 @@ void node_handle_local_cmd(const char *cmd)
     if (strcmp(cmd, "can:normal")  == 0) { can_bus_set_standby(false); return; }
 }
 
-/* ============================================================
+/*         ====
    on_node_status_from_transport (ROOT)
    === FIX NODE-STATUS-ROOT-FORMAT ===
    LINK теперь в формате ROOT: {"root":{"rssi":...,...},"node":{...}}.
    Из NODE приходит LINK.root (его RX-метрики) + LINK.node=null.
    ROOT берёт LINK.root как «качество последнего RX от NODE».
-   ============================================================ */
+           ==== */
 static void on_node_status_from_transport(const char *json, size_t len)
 {
     link_monitor_note_status_rx();
@@ -890,10 +897,10 @@ static void on_node_channels_from_transport(const char *json, size_t len)
 }
 /* === END FIX T_CHANNELS === */
 
-/* ============================================================
+/*         ====
    on_evt_from_node (ROOT)
    === FIX ROOT-MIRROR-NODE-FAULT ===
-   ============================================================ */
+           ==== */
 static void on_evt_from_node(const char *evt, size_t len)
 {
     char buf[128];
@@ -1004,13 +1011,13 @@ static void on_evt_from_node(const char *evt, size_t len)
     if (strncmp(buf, "status:autonomous", 17) == 0) return;
 }
 
-/* ============================================================
+/*         ====
    node_send_task
-<<<<<<< HEAD
-<<<<<<< Updated upstream
-=======
-=======
->>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
+  HEAD
+  Updated upstream
+ 
+ 
+  68ea8f38277221d1f4cb2c1a936d18ea0698235d
    === FIX STATUS-NO-CHANNELS ===
    STATUS от NODE (формат ROOT, БЕЗ ch00..ch15):
      {"SR":{state+hex+outputs},"NET":{role=node,ppp,ip},
@@ -1021,15 +1028,15 @@ static void on_evt_from_node(const char *evt, size_t len)
       "NODE":null,"NODE_FAULT":null,
       "RS485":{...},"CAN":{...},"RTT":{...},
       "role":"node"}
-<<<<<<< HEAD
+  HEAD
    ≈ 686 байт = 17 фрагментов по LoRa.
 
    === FIX T-CHANNELS-NOT-COMBINED ===
    После T_CHANNELS — пауза + continue. STATUS в этой итерации
    НЕ шлётся. Иначе 27+17 фрагментов подряд → коллизии с c:
    от ROOT → потеря фрагментов → ROOT не собирает пакет.
->>>>>>> Stashed changes
-=======
+  Stashed changes
+ 
    ≈ 400 байт = 10 фрагментов по LoRa.
 
    Каналы NODE (ch00..ch15) идут отдельным T_CHANNELS раз в 60 с.
@@ -1038,8 +1045,8 @@ static void on_evt_from_node(const char *evt, size_t len)
    После T_CHANNELS — пауза + continue. STATUS в этой итерации
    НЕ шлётся. Иначе 30+10 фрагментов подряд → коллизии с c:
    от ROOT → потеря фрагментов → ROOT не собирает пакет.
->>>>>>> 68ea8f38277221d1f4cb2c1a936d18ea0698235d
-   ============================================================ */
+  68ea8f38277221d1f4cb2c1a936d18ea0698235d
+           ==== */
 static void node_send_task(void *arg)
 {
     char *json = malloc(NODE_STATUS_BUF_SIZE);
@@ -1084,9 +1091,19 @@ static void node_send_task(void *arg)
             }
             off += snprintf(json + off, NODE_STATUS_BUF_SIZE - off, "]}");
 
-            esp_err_t err = transport_send_channels(json, off);
+
+if (off >= NODE_STATUS_BUF_SIZE) {
+        off = NODE_STATUS_BUF_SIZE - 1;
+        json[off] = '\0';
+    }
+    if (off > 0 && (size_t)off < NODE_STATUS_BUF_SIZE) {
+       // transport_send_channels(json, (size_t)off);
+        esp_err_t err = transport_send_channels(json, (size_t)off);
             ESP_LOGI(TAG, "T_CHANNELS -> ROOT: %s (%d bytes)",
                      err == ESP_OK ? "OK" : esp_err_to_name(err), off);
+    }
+
+            
 
 
             /* === FIX T-CHANNELS-NOT-COMBINED ===
@@ -1252,9 +1269,9 @@ static void node_send_task(void *arg)
     }
 }
 
-/* ============================================================
+/*         ====
    node_link_watchdog_task
-   ============================================================ */
+           ==== */
 static void node_link_watchdog_task(void *arg)
 {
     ESP_LOGI(TAG, "node_link_watchdog_task started (timeout=%d ms)",
@@ -1311,9 +1328,9 @@ static void node_link_watchdog_task(void *arg)
     }
 }
 
-/* ============================================================
+/*         ====
    Register callbacks / start tasks
-   ============================================================ */
+           ==== */
 void node_proto_register_callbacks(void)
 {
     if (g_config.role == DEVICE_ROLE_SLAVE) {

@@ -63,7 +63,7 @@ extern volatile uint32_t s_last_node_msg_ms;
 
 /* Пауза между fault:none и traffic:start — чтобы LoRa успел
    доставить первый пакет (ToA 10 байт ≈ 40-50 мс SF8/BW250). */
-#define FAULT_NONE_TO_START_GAP_MS   80
+#define FAULT_NONE_TO_START_GAP_MS   160
 
 /* === FIX PONG-DRIFT-8000 ===
    Sanity-порог epoch: любые end_utc_ms меньше 2020-01-01
