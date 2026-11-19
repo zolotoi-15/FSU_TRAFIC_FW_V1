@@ -420,11 +420,10 @@ void wifi_mqtt_restart(void)
     ESP_LOGI(TAG, "MQTT connect → %s", s_broker_uri);
 
     esp_mqtt_client_config_t cfg = {
-        .broker.address.uri  = s_broker_uri,
+        .broker.address.uri  = "mqtts://mqtt.xologie.ru:8883",//g_mqtt_config.broker_url,
         .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
         .credentials.username = g_mqtt_config.username,
         .credentials.authentication.password = g_mqtt_config.password,
-
         .session.last_will.topic = s_lwt_topic,
         .session.last_will.msg = g_mqtt_config.lwt_msg,
         .session.last_will.msg_len = strlen(g_mqtt_config.lwt_msg),
