@@ -309,7 +309,7 @@ void traffic_light_request_pedestrian_ex(bool from_remote)
         ESP_LOGW(TAG, "pedestrian request: MIN_RECALL (next cycle min %lu s)",
                  (unsigned long)g_config.traffic.pedestrian.min_recall_s);
         if (g_config.role == DEVICE_ROLE_MASTER && !from_remote) {
-            transport_send_cmd("pedestrian:request", strlen("pedestrian:request"));
+           // transport_send_cmd("pedestrian:request", strlen("pedestrian:request"));
             send_channels_to_node(s_phase,
                                   traffic_light_get_phase_ms(),
                                   traffic_light_get_phase_duration_ms(),
@@ -367,12 +367,25 @@ void traffic_light_request_pedestrian_ex(bool from_remote)
     if (g_config.role == DEVICE_ROLE_MASTER && !from_remote) {
         uint8_t disp_ch = g_config.traffic.pins.cross_ped.ped_display;
         if (disp_ch < 16) sr_output_on(disp_ch);
-        transport_send_cmd("pedestrian:request", strlen("pedestrian:request"));
+        //transport_send_cmd("pedestrian:request", strlen("pedestrian:request"));
         send_channels_to_node(s_phase,
                               traffic_light_get_phase_ms(),
                               traffic_light_get_phase_duration_ms(),
                               true);
     }
+
+    if (s_follow_root) {
+    ESP_LOGI(TAG, "pedestrian request: follow_root → delegate to ROOT");
+    // НОВОЕ: включить дисплей "ЖДИТЕ" сразу на NODE
+    uint8_t disp_ch = g_config.traffic.pins.cross_ped.ped_display;
+    if (disp_ch < 16) sr_output_on(disp_ch);
+    // Отправить запрос на ROOT
+    if (g_config.role == DEVICE_ROLE_SLAVE) {
+        transport_send_evt_noack("pedestrian:request", strlen("pedestrian:request"));
+    }
+    return;
+}
+
 }
 
 void traffic_light_request_pedestrian(void)

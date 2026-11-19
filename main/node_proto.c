@@ -857,6 +857,13 @@ static void on_node_status_from_transport(const char *json, size_t len)
             }
             mode[k] = '\0';
 
+             /* === FIX NODE-FAULT-UNBLOCK ===
+                Обновляем состояние аварии NODE для механизма
+                принудительного снятия. */
+             bool node_has_fault = (strcmp(mode, "NONE") != 0);
+             root_wd_update_node_fault_state(node_has_fault);
+             /* === END FIX NODE-FAULT-UNBLOCK === */
+
             if (strcmp(mode, "YELLOW_BLINK") == 0) {
                 wifi_mqtt_apply_remote_fault("fault:yellow_blink:node", 24);
             } else if (strcmp(mode, "ALL_OFF") == 0) {
@@ -939,6 +946,9 @@ static void on_evt_from_node(const char *evt, size_t len)
                 return;
             }
             ESP_LOGW(TAG, "NODE recover_ok, ROOT ok -> send fault:none");
+             /* === FIX NODE-FAULT-UNBLOCK === */
+         root_wd_update_node_fault_state(false);
+         /* === END FIX NODE-FAULT-UNBLOCK === */
             transport_send_cmd_noack("fault:none", 10);
             return;
         }
@@ -961,6 +971,10 @@ static void on_evt_from_node(const char *evt, size_t len)
                          mode,
                          nf == TRAFFIC_FAULT_ALL_OFF
                              ? "ALL_OFF" : "YELLOW_BLINK");
+
+                             /* === FIX NODE-FAULT-UNBLOCK === */
+             root_wd_update_node_fault_state(true);
+             /* === END FIX NODE-FAULT-UNBLOCK === */
                 SET_REMOTE_FLAG(true);
                 traffic_light_set_fault(nf);
                 SET_REMOTE_FLAG(false);

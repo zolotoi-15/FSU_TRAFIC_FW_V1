@@ -43,6 +43,12 @@ uint32_t send_channels_to_node_no_display(uint8_t phase, uint32_t phase_ms,
                                           uint32_t duration_ms, bool force);
 /* === END FIX PED-DISPLAY-CLEAR-BEFORE-RETURN-HOLD === */
 
+/* === FIX NODE-FAULT-UNBLOCK ===
+   Обновление состояния аварии NODE (вызывается из node_proto.c
+   при получении STATUS или fault:* от NODE). */
+void root_wd_update_node_fault_state(bool has_fault);
+/* === END FIX NODE-FAULT-UNBLOCK === */
+
 extern volatile bool     s_cfg_ack;
 extern volatile bool     s_cfg_pushing;
 extern volatile bool     s_cfg_applied_and_started;

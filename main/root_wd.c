@@ -76,6 +76,26 @@
 
 static const char *TAG = "root_wd";
 
+/* === FIX NODE-FAULT-UNBLOCK ===
+   Принудительное снятие аварии с NODE.
+   
+   Проблема: если NODE ушёл в аварию (YELLOW_BLINK/ALL_OFF) из-за
+   временного сбоя или ложного срабатывания, а ROOT уже восстановился,
+   NODE остаётся заблокированным и игнорирует все команды c: и
+   traffic:start, ожидая явного fault:none.
+   
+   Решение: если ROOT в норме (fault == NONE), а NODE сообщает об
+   аварии дольше NODE_FAULT_UNBLOCK_MS, ROOT принудительно отправляет
+   fault:none с периодом NODE_FAULT_NONE_PERIOD_MS для гарантии
+   доставки по LoRa. */
+#define NODE_FAULT_UNBLOCK_MS       15000  /* 15 секунд в аварии → разблокировать */
+#define NODE_FAULT_NONE_PERIOD_MS   5000   /* Повторная отправка каждые 5 секунд */
+
+static volatile uint32_t s_node_fault_first_seen_ms = 0;
+static volatile uint32_t s_node_fault_last_none_ms  = 0;
+static volatile bool     s_node_has_fault           = false;
+/* === END FIX NODE-FAULT-UNBLOCK === */
+
 #define ROOT_NODE_CHECK_MS          200//50
 #define NODE_COMM_LOST_MS           3000//4000
 #define HEARTBEAT_INTERVAL_MS       1000//2000
@@ -121,11 +141,38 @@ extern volatile bool s_insert_pending;
 static esp_timer_handle_t s_root_delay_timer = NULL;
 static traffic_fault_t    s_root_delay_fault = TRAFFIC_FAULT_NONE;
 
+static volatile bool s_start_push_pending = false;
 /* ============================================================
    SET_REMOTE_FLAG
    ============================================================ */
 #define SET_REMOTE_FLAG(v) do { s_fault_from_remote_ex = (v); } while (0)
 
+
+static void root_push_start_to_node_now(void)
+{
+    if (g_config.role != DEVICE_ROLE_MASTER) return;
+    if (!transport_is_lora()) return;
+
+    if (traffic_light_fault_has_priority()) {
+        ESP_LOGW(TAG, "push_start: fault active (%s) → skip",
+                 traffic_light_fault_str());
+        return;
+    }
+
+    ESP_LOGW(TAG, "config applied → NODE: fault:none + traffic:start + c:0:red");
+
+    /* 1) снимаем YELLOW_BLINK, который сами же послали при загрузке конфига */
+    transport_send_cmd_noack("fault:none", strlen("fault:none"));
+    vTaskDelay(pdMS_TO_TICKS(FAULT_NONE_TO_START_GAP_MS));
+
+    /* 2) NODE: follow_root=true + start_with_red (STANDBY, ждёт c:0:red) */
+    transport_send_cmd_noack("traffic:start", strlen("traffic:start"));
+    vTaskDelay(pdMS_TO_TICKS(FAULT_NONE_TO_START_GAP_MS));
+
+    /* 3) первичная маска красного — force, чтобы обойти дедупликацию */
+    send_channels_to_node(0, UINT32_MAX,
+                          traffic_light_stage_duration_ms(0), true);
+}
 /* ============================================================
    send_channels_to_node_impl
    === FIX PM-AT-SEND ===
@@ -463,6 +510,21 @@ static void root_node_watchdog_task(void *arg)
                          s_last_node_msg_ms != 0 &&
                          !link_monitor_root_lost());
 
+/* === FIX CONFIG-APPLIED-PUSH-START === */
+        if (s_start_push_pending) {
+            s_start_push_pending = false;
+            root_push_start_to_node_now();
+            was_connected  = true;   /* не заходить в ветку !was_connected */
+            wait_node_ack  = false;
+            lost_since_ms  = 0;
+            last_start_ms  = now;    /* не спамить повторным traffic:start 5 с */
+            in_comm_lost_all_off = false;
+            wifi_mqtt_set_root_comm_lost(false);
+            vTaskDelay(pdMS_TO_TICKS(ROOT_NODE_CHECK_MS));
+            continue;
+        }
+        /* === END FIX === */
+
         /* === FIX ROOT-WAIT-NODE-ACK ===
            Ожидание подтверждения от NODE. ROOT в ALL_OFF,
            каналы выключены. */
@@ -666,6 +728,43 @@ static void root_node_watchdog_task(void *arg)
         }
         /* === END FIX NO-FAULT-NONE-ON-RESEND === */
 
+        /* === FIX NODE-FAULT-UNBLOCK ===
+        Принудительное снятие аварии с NODE.
+        
+        Условия:
+        - Связь с NODE есть (has_node && was_connected)
+        - ROOT в норме (нет активной аварии)
+        - NODE сообщает об аварии (s_node_has_fault == true)
+        - Авария длится дольше NODE_FAULT_UNBLOCK_MS
+        
+        Отправка происходит периодически (раз в NODE_FAULT_NONE_PERIOD_MS),
+        чтобы гарантировать доставку по LoRa (пакеты могут теряться).
+        
+        Это решает проблему "застревания" NODE в аварии после:
+        - Временных сбоев диагностики каналов
+        - Загрузки конфигурации на ROOT (которая ставит YELLOW_BLINK)
+        - Потери и восстановления связи */
+     if (!wait_node_ack && has_node && was_connected &&
+         traffic_light_get_fault() == TRAFFIC_FAULT_NONE &&
+         s_node_has_fault) {
+         
+         uint32_t fault_duration = now - s_node_fault_first_seen_ms;
+         
+         if (fault_duration >= NODE_FAULT_UNBLOCK_MS) {
+             if (s_node_fault_last_none_ms == 0 ||
+                 (now - s_node_fault_last_none_ms) >= NODE_FAULT_NONE_PERIOD_MS) {
+                 
+                 ESP_LOGW(TAG, "ROOT: NODE in fault for %lu ms (> %d ms) "
+                               "but ROOT is OK -> send fault:none to unblock",
+                          (unsigned long)fault_duration, NODE_FAULT_UNBLOCK_MS);
+                 
+                 transport_send_cmd_noack("fault:none", strlen("fault:none"));
+                 s_node_fault_last_none_ms = now;
+             }
+         }
+     }
+     /* === END FIX NODE-FAULT-UNBLOCK === */
+
          if (!has_node && was_connected) {
             ESP_LOGW(TAG, "ROOT: NODE lost -> sync_handshake");
             /* === FIX ROOT-START-DELAY: гасим отложенный старт === */
@@ -831,17 +930,23 @@ static void root_start_delay_fire(void)
     if (traffic_light_get_fault() != s_root_delay_fault) {
         ESP_LOGW(TAG, "ROOT start delay: fault changed during delay "
                       "(sched=%d now=%d) → skip local start",
-                 (int)s_root_delay_fault,
-                 (int)traffic_light_get_fault());
+                 (int)s_root_delay_fault, (int)traffic_light_get_fault());
         return;
     }
+
     ESP_LOGI(TAG, "ROOT start delay expired (%lu ms) → local start_with_red",
              (unsigned long)g_config.root_start_delay_ms);
+
     SET_REMOTE_FLAG(true);
     traffic_light_set_fault(TRAFFIC_FAULT_NONE);
     SET_REMOTE_FLAG(false);
+
     traffic_light_set_follow_root(false);
     traffic_light_start_with_red();
+
+    /* === FIX CONFIG-APPLIED-PUSH-START === */
+    s_start_push_pending = true;   /* NODE получит fault:none+traffic:start+c: */
+    /* === END FIX === */
 }
 
 static void root_delay_timer_cb(void *arg)
@@ -878,5 +983,37 @@ void root_start_delay_schedule(void)
 void root_start_delay_cancel(void)
 {
     if (s_root_delay_timer) esp_timer_stop(s_root_delay_timer);
+    s_start_push_pending = false;   /* связь потеряна / новый конфиг — не пушим */
 }
 /* === END FIX ROOT-START-DELAY === */
+
+/* ============================================================
+   root_wd_update_node_fault_state
+   === FIX NODE-FAULT-UNBLOCK ===
+   Вызывается из node_proto.c при получении STATUS от NODE
+   или событий fault:*. Обновляет внутреннее состояние аварии
+   NODE для последующего принудительного снятия.
+   ============================================================ */
+void root_wd_update_node_fault_state(bool has_fault)
+{
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    
+    if (has_fault) {
+        if (!s_node_has_fault) {
+            /* Авария только что появилась на NODE */
+            s_node_fault_first_seen_ms = now;
+            ESP_LOGW(TAG, "NODE fault detected (first seen at %lu ms)",
+                     (unsigned long)now);
+        }
+        s_node_has_fault = true;
+    } else {
+        if (s_node_has_fault) {
+            ESP_LOGI(TAG, "NODE fault cleared (duration %lu ms)",
+                     (unsigned long)(now - s_node_fault_first_seen_ms));
+        }
+        s_node_has_fault = false;
+        s_node_fault_first_seen_ms = 0;
+        s_node_fault_last_none_ms = 0;
+    }
+}
+/* === END FIX NODE-FAULT-UNBLOCK === */

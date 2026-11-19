@@ -388,7 +388,6 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
         }
         break;
     }
-    
     default: break;
     }
 }

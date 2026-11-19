@@ -332,7 +332,7 @@ static esp_modem_dce_t *create_dce_synced(uint32_t baud, const char *apn)
         }
         ESP_LOGW(TAG, "sync %d/%d failed (baud=%lu)",
                  i + 1, MODEM_SYNC_RETRIES, (unsigned long)baud);
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(1500));
     }
 
     ESP_LOGE(TAG, "sync FAILED at baud=%lu", (unsigned long)baud);
@@ -412,7 +412,7 @@ esp_err_t modem_ppp_start(const char *apn, uint32_t timeout_ms)
                                &ip_event_handler, NULL);
 
     /* 4. ATE0 */
-    esp_modem_at(s_dce, "ATE0", NULL, 1000);
+    esp_modem_at(s_dce, "ATE0", NULL, 2000);
 
     /* === FIX CGATT-CGDCONT-BEFORE-NEWDEV ===
        Явно ставим PDP context и attach, если ещё не attached.

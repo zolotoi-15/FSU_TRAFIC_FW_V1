@@ -45,6 +45,7 @@
 #include "ble_transport.h"
 #include "sync_config.h"
 #include "modem_ppp.h"
+#include "can_bus.h"
 
 extern const uint8_t config_json_start[] asm("_binary_config_json_start");
 extern const uint8_t config_json_end[]   asm("_binary_config_json_end");
@@ -548,8 +549,8 @@ void app_main(void)
     buttons_start_tasks();
 
     /* --- WiFi: AP всегда + STA (если creds) --- */
-   // wifi_init();
-  //  wifi_bringup(is_root);
+    wifi_init();
+    wifi_bringup(is_root);
 
     /* --- BLE (для настройки через телефон) --- */
     /* BLE disabled — config via WiFi AP */
@@ -565,6 +566,9 @@ void app_main(void)
 /*#else
     ESP_LOGW(TAG, "BLE disabled (CONFIG_BT_ENABLED=n) — config via WiFi AP 192.168.4.1");
 #endif*/
+
+ esp_err_t can_err= can_bus_init(500000);
+can_err= can_bus_start();
 
     /* --- RS485/CAN transport + протокол --- */
     connectivity_register_rs485_can();
