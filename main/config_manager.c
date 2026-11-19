@@ -85,8 +85,8 @@ static void set_defaults_to(app_config_t *cfg)
     strcpy(cfg->timezone, "MSK-3");
 
     cfg->mqtt_enabled = true;
-    strcpy(cfg->mqtt_uri, "mqtts://mqtt.xologie.ru");
-    cfg->mqtt_port = 8883;
+    strcpy(cfg->mqtt_uri, "mqtt://mqtt.xologie.ru");
+    cfg->mqtt_port = 1883;
     strcpy(cfg->mqtt_user, "LS2024");
     strcpy(cfg->mqtt_password, "Zavulon56");
     cfg->mqtt_timepause_min = 5;

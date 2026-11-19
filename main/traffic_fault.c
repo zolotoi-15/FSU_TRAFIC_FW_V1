@@ -50,7 +50,8 @@ extern void      board_diag_en_all_off(void);
 extern int       board_read_iload_raw(uint8_t channel,
                                       imon_state_t *out_state,
                                       int *out_mv);
-
+extern void wifi_mqtt_publish_event(const char *type, const char *detail,
+                             const void *data, size_t data_len);
 extern volatile bool s_mask_received;
 extern volatile bool s_fault_from_remote_ex;
 

@@ -37,7 +37,7 @@
 
 static const char *TAG = "buttons";
 
-#define BOOT_HOLD_MS          3000
+#define BOOT_HOLD_MS          500
 #define BOOT_POLL_MS          50
 #define LED_MASTER_PERIOD_MS  500
 #define LED_SLAVE_PERIOD_MS   100
@@ -47,12 +47,15 @@ static const char *TAG = "buttons";
 #define BTN_POLL_MS           10
 /* === FIX P7-DEBOUNCE === */
 #define BTN_DEBOUNCE_COUNT    5      /* 50 мс при poll 10 мс */
-#define P7_MIN_INTERVAL_MS    1000   /* не чаще 1 раза в секунду */
+#define P7_MIN_INTERVAL_MS    500   /* не чаще 1 раза в секунду */
 /* === END FIX P7-DEBOUNCE === */
 #define BTN_IDLE_POLL_MS      50
 
 static volatile device_role_t s_role = DEVICE_ROLE_MASTER;
 static volatile bool          s_role_changing = false;
+
+extern void wifi_mqtt_publish_event(const char *type, const char *detail,
+                             const void *data, size_t data_len);
 
 static inline void led_set(bool on) { gpio_set_level(LED_PIN, on ? 1 : 0); }
 
@@ -105,7 +108,7 @@ static void role_button_task(void *arg) {
                     led_set(true);  vTaskDelay(pdMS_TO_TICKS(LED_CONFIRM_PERIOD_MS));
                 }
                 s_role_changing = false;
-                vTaskDelay(pdMS_TO_TICKS(200));
+                vTaskDelay(pdMS_TO_TICKS(100));
                 esp_restart();
             }
         } else if (!raw && pressed) {

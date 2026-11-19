@@ -1,10 +1,3 @@
-/* ============================================================
-   wifi_mqtt.c — публичный API + MQTT-клиент.
-
-   === FIX #7: URI с портом (esp-mqtt игнорирует broker.address.port) ===
-   === FIX #8: MQTT_DOWN_RESTART_MS 5 мин → 90 с ===
-   ============================================================ */
-
 #include "mqtt_internal.h"
 #include "config_manager.h"
 #include "wifi_ap.h"
@@ -22,6 +15,16 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "time_sync.h"
+#include "cJSON.h"
+
+/* === FIX MQTT-TLS-CA ===
+   Без этого заголовка не видно esp_crt_bundle_attach(). Компонент
+   esp-tls (транзитивно тянется esp-mqtt), содержит CA bundle из
+   CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL (~200 публичных CA:
+   Let's Encrypt, DigiCert, GlobalSign, ISRG и т.д.). */
+#include "esp_crt_bundle.h"
+/* === END FIX MQTT-TLS-CA === */
 
 static const char *TAG = "wifi_mqtt";
 
@@ -36,6 +39,8 @@ char       s_json_topic[192];
 char       s_layer_topic[192];
 char       s_kp_topic[192];
 char       s_node_json_topic[192];
+char       s_node_channels_topic[192];
+char       s_events_topic[192];
 
 TickType_t s_last_event_time = 0;
 int        s_publish_fail_count = 0;
@@ -43,8 +48,10 @@ int        s_publish_fail_count = 0;
 static bool       s_restart_in_progress = false;
 static SemaphoreHandle_t s_restart_mutex = NULL;
 
-/* === FIX #8: 5 мин → 90 с === */
-#define MQTT_DOWN_RESTART_MS   (90 * 1000)
+static bool s_mqtt_tasks_started = false;
+
+#define MQTT_DOWN_RESTART_MS    (30 * 1000)
+#define MQTT_FORCE_MODEM_MS     (5 * 60 * 1000)
 
 static volatile uint32_t s_mqtt_last_connected_ms    = 0;
 static volatile uint32_t s_mqtt_last_disconnected_ms = 0;
@@ -68,16 +75,59 @@ static inline uint32_t mqtt_get_down_since(void)
     return v;
 }
 
+void wifi_mqtt_publish_event(const char *type, const char *detail,
+                             const void *data, size_t data_len)
+{
+    if (!s_mqtt_connected || !g_mqtt_client) return;
+    if (!type) return;
+    if (s_events_topic[0] == '\0') {
+        ESP_LOGW(TAG, "publish_event: s_events_topic empty (build_topics not called?)");
+        return;
+    }
+
+    uint32_t sec = 0; uint16_t ms = 0;
+    char ts[40] = "1970-01-01T00:00:00.000Z";
+    if (time_sync_get(&sec, &ms)) {
+        time_t t = (time_t)sec;
+        struct tm tm_utc;
+        gmtime_r(&t, &tm_utc);
+        char date[24] = {0};
+        strftime(date, sizeof(date), "%Y-%m-%dT%H:%M:%S", &tm_utc);
+        snprintf(ts, sizeof(ts), "%s.%03uZ", date, (unsigned)(ms % 1000));
+    }
+
+    char buf[512];
+    int n;
+    if (data && data_len > 0 && data_len < 256) {
+        n = snprintf(buf, sizeof(buf),
+                     "{\"ts\":\"%s\",\"type\":\"%s\",\"detail\":\"%s\","
+                     "\"data\":\"%.*s\",\"role\":\"%s\"}",
+                     ts, type, detail ? detail : "",
+                     (int)data_len, (const char *)data,
+                     g_config.role == DEVICE_ROLE_MASTER ? "root" : "node");
+    } else {
+        n = snprintf(buf, sizeof(buf),
+                     "{\"ts\":\"%s\",\"type\":\"%s\",\"detail\":\"%s\","
+                     "\"role\":\"%s\"}",
+                     ts, type, detail ? detail : "",
+                     g_config.role == DEVICE_ROLE_MASTER ? "root" : "node");
+    }
+    if (n > 0) {
+        esp_mqtt_client_publish(g_mqtt_client, s_events_topic, buf, n, 1, 1);
+        ESP_LOGI(TAG, "EVENT → %s: %s", s_events_topic, buf);
+    }
+}
+
 #define NVS_NS_MQTT "mqtt_cfg"
 
 void wifi_mqtt_load_config(void)
 {
     nvs_handle_t nvs;
     mqtt_config_t def = {
-        .broker_url = "mqtt://m2.wqtt.ru",
-        .port       = 13257,
-        .username   = "u_GGENLB",
-        .password   = "LTHNW22D",
+        .broker_url = "mqtt://mqtt.xologie.ru",
+        .port       = 1883,
+        .username   = "LS2024",
+        .password   = "Zavulon56",
         .base_topic = "FSU_Trafic",
         .lwt_msg    = "offline"
     };
@@ -123,14 +173,13 @@ void wifi_mqtt_save_config(void)
     }
 }
 
-/* === FIX #7: собираем URI с портом вручную === */
 static void build_broker_uri(char *out, size_t out_len)
 {
     const char *uri = g_mqtt_config.broker_url;
     uint16_t port = g_mqtt_config.port;
 
     if (!uri || !*uri) {
-        snprintf(out, out_len, "mqtt://127.0.0.1:%u", port);
+        snprintf(out, out_len, "mqtts://127.0.0.1:%u", port);
         return;
     }
 
@@ -174,23 +223,43 @@ static void build_topics(void)
     snprintf(s_layer_topic, sizeof(s_layer_topic), "%s/Layer",     s_topic);
     snprintf(s_kp_topic,    sizeof(s_kp_topic),    "%s/key_pressed", s_topic);
     snprintf(s_node_json_topic, sizeof(s_node_json_topic), "%s/Node", s_topic);
+    snprintf(s_node_channels_topic, sizeof(s_node_channels_topic),
+             "%s/Node/Channels", s_topic);
+    snprintf(s_events_topic, sizeof(s_events_topic), "%s/Events", s_topic);
 
     ESP_LOGI(TAG, "Topic:      %s", s_topic);
     ESP_LOGI(TAG, "Subscribe:  %s", s_sub_topic);
     ESP_LOGI(TAG, "JSON in:    %s", s_json_topic);
     ESP_LOGI(TAG, "Node JSON:  %s", s_node_json_topic);
+    ESP_LOGI(TAG, "NodeChannels: %s", s_node_channels_topic);
+    ESP_LOGI(TAG, "Events:     %s", s_events_topic);
 }
 
 int wifi_mqtt_fault_priority_ex(traffic_fault_t f) { return mqtt_fault_priority(f); }
 traffic_fault_t wifi_mqtt_get_node_fault(void) { return mqtt_fault_get_node(); }
-void wifi_mqtt_publish_node_json(const char *json, size_t len) { mqtt_fault_publish_node_json(json, len); }
-void wifi_mqtt_publish_node_fault(const char *fault_str, size_t len) { mqtt_fault_publish_node(fault_str, len); }
-void wifi_mqtt_apply_remote_fault(const char *fault_str, size_t len) { mqtt_fault_apply_remote(fault_str, len); }
+void wifi_mqtt_publish_node_json(const char *json, size_t len) {
+    mqtt_fault_publish_node_json(json, len);
+}
+void wifi_mqtt_publish_node_fault(const char *fault_str, size_t len) {
+    mqtt_fault_publish_node(fault_str, len);
+}
+void wifi_mqtt_apply_remote_fault(const char *fault_str, size_t len) {
+    mqtt_fault_apply_remote(fault_str, len);
+}
 void wifi_mqtt_reset_node_fault_tracking(void) { mqtt_fault_reset_tracking(); }
 void wifi_mqtt_apply_config_runtime(void) { mqtt_apply_config_runtime(); }
-void wifi_mqtt_notify_phase(uint8_t phase, uint32_t phase_ms, uint32_t duration_ms) { mqtt_notify_phase(phase, phase_ms, duration_ms); }
-void wifi_mqtt_set_phase_sync_enabled(bool en) { ESP_LOGI(TAG, "phase-sync flag=%d (ignored, sync: always on)", en); }
+void wifi_mqtt_notify_phase(uint8_t phase, uint32_t phase_ms,
+                            uint32_t duration_ms) {
+    mqtt_notify_phase(phase, phase_ms, duration_ms);
+}
+void wifi_mqtt_set_phase_sync_enabled(bool en) {
+    ESP_LOGI(TAG, "phase-sync flag=%d (ignored, sync: always on)", en);
+}
 const char *wifi_mqtt_last_node_fault(void) { return ""; }
+
+void wifi_mqtt_publish_node_channels(const char *json, size_t len) {
+    mqtt_fault_publish_node_channels(json, len);
+}
 
 uint32_t wifi_mqtt_get_down_ms(void)
 {
@@ -205,7 +274,6 @@ uint32_t wifi_mqtt_get_down_ms(void)
 void wifi_mqtt_force_restart_modem(void)
 {
     ESP_LOGE(TAG, "wifi_mqtt: force restart modem (PPP stop)");
-    modem_ppp_stop();
 }
 
 static void mqtt_event_handler(void *args, esp_event_base_t base,
@@ -225,6 +293,10 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
         esp_mqtt_client_subscribe(g_mqtt_client, s_sub_topic,  1);
         esp_mqtt_client_subscribe(g_mqtt_client, s_json_topic, 1);
         esp_mqtt_client_subscribe(g_mqtt_client, s_kp_topic,   0);
+        break;
+
+    case MQTT_EVENT_SUBSCRIBED:
+        ESP_LOGI(TAG, "MQTT subscribed msg_id=%d", event->msg_id);
         break;
 
     case MQTT_EVENT_DISCONNECTED:
@@ -247,41 +319,68 @@ static void mqtt_event_handler(void *args, esp_event_base_t base,
 
     case MQTT_EVENT_DATA:
     {
-        bool is_json_topic = (event->topic_len > 0 &&
-                              event->topic_len <= (int)strlen(s_json_topic) &&
+        ESP_LOGI(TAG, "MQTT_EVENT_DATA: topic='%.*s' data_len=%d "
+                      "total_data_len=%d offset=%d",
+                 event->topic_len, event->topic,
+                 event->data_len, event->total_data_len,
+                 event->current_data_offset);
+
+        /* === FIX MQTT-TOPIC-PREFIX-COLLISION ===
+           Раньше: is_json_topic = strncmp(topic, ".../SetJson", 13) == 0.
+           Для сообщения в ".../Set" (13 символов) это тоже true,
+           потому что "/Set" — префикс "/SetJson". Команда Set
+           уходила в mqtt_json_accum_feed, а не в mqtt_handle_command.
+
+           Теперь: topic_len должен СОВПАДАТЬ с strlen(full_topic).
+           Это единственный корректный способ отличить /Set от
+           /SetJson при одинаковом префиксе. */
+        bool is_json_topic = (event->topic_len == (int)strlen(s_json_topic) &&
                               strncmp(event->topic, s_json_topic,
                                       event->topic_len) == 0);
+        bool is_kp_topic   = (event->topic_len == (int)strlen(s_kp_topic) &&
+                              strncmp(event->topic, s_kp_topic,
+                                      event->topic_len) == 0);
+        bool is_sub_topic  = (event->topic_len == (int)strlen(s_sub_topic) &&
+                              strncmp(event->topic, s_sub_topic,
+                                      event->topic_len) == 0);
+        /* === END FIX MQTT-TOPIC-PREFIX-COLLISION === */
 
         if (is_json_topic) {
             int total = event->total_data_len > 0
                         ? event->total_data_len : event->data_len;
             bool done = mqtt_json_accum_feed(event->data, event->data_len,
                                              event->current_data_offset, total);
+            ESP_LOGI(TAG, "accum_feed: offset=%d len=%d total=%d done=%d",
+                     event->current_data_offset, event->data_len,
+                     total, (int)done);
             if (done) mqtt_json_accum_process();
             break;
         }
 
-        if (event->topic_len > 0 &&
-            event->topic_len <= (int)strlen(s_kp_topic) &&
-            strncmp(event->topic, s_kp_topic, event->topic_len) == 0) {
+        if (is_kp_topic) {
             ESP_LOGW(TAG, "Keypressed via MQTT: %.*s",
                      event->data_len, event->data);
             break;
         }
 
-        if (event->topic_len > 0 &&
-            event->topic_len <= (int)strlen(s_sub_topic) &&
-            strncmp(event->topic, s_sub_topic, event->topic_len) == 0) {
+        if (is_sub_topic) {
             mqtt_handle_command(event->data, event->data_len);
         }
         break;
     }
+    
     default: break;
     }
 }
 
 void wifi_mqtt_restart(void)
 {
+    extern bool modem_ppp_is_connected(void);
+    if (!modem_ppp_is_connected()) {
+        ESP_LOGW(TAG, "wifi_mqtt_restart: no PPP IP → skip");
+        return;
+    }
+
     if (!s_restart_mutex) s_restart_mutex = xSemaphoreCreateMutex();
     if (!s_restart_mutex) return;
     if (xSemaphoreTake(s_restart_mutex, pdMS_TO_TICKS(15000)) != pdTRUE) return;
@@ -303,6 +402,17 @@ void wifi_mqtt_restart(void)
 
     esp_mqtt_client_config_t cfg = {
         .broker.address.uri  = s_broker_uri,
+
+        /* === FIX MQTT-TLS-CA ===
+           Без этой строки esp-tls-mbedtls пишет
+             "No server verification option set in esp_tls_cfg_t"
+           и делает SSL_SETUP_FAILED до TCP-connect.
+           crt_bundle_attach = встроенный ~200 CA (Let's Encrypt,
+           DigiCert, GlobalSign, ISRG и т.д.). Этого достаточно
+           для mqtt.xologie.ru (сертификат публичного CA). */
+       // .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
+        /* === END FIX MQTT-TLS-CA === */
+
         .credentials.username = g_mqtt_config.username,
         .credentials.authentication.password = g_mqtt_config.password,
         .session.last_will.topic = s_lwt_topic,
@@ -310,9 +420,9 @@ void wifi_mqtt_restart(void)
         .session.last_will.msg_len = strlen(g_mqtt_config.lwt_msg),
         .session.last_will.qos = 1,
         .session.last_will.retain = true,
-        .buffer.size     = 4096,
+        .buffer.size     = 8192,
         .buffer.out_size = 4096,
-        .network.timeout_ms = 30000,
+        .network.timeout_ms = 20000,
         .network.disable_auto_reconnect = false,
         .network.reconnect_timeout_ms = 5000,
         .session.keepalive = 60,
@@ -368,16 +478,19 @@ static void mqtt_publish_task(void *arg)
     if (!json) { vTaskDelete(NULL); return; }
     ESP_LOGI(TAG, "mqtt_publish_task started");
     while (1) {
-        if (s_mqtt_connected) {
-            extern const char *modem_ppp_get_ip(void);
-            extern bool modem_ppp_is_connected(void);
-            const char *ip = modem_ppp_is_connected() ? modem_ppp_get_ip() : "0.0.0.0";
+        extern const char *modem_ppp_get_ip(void);
+        extern bool modem_ppp_is_connected(void);
+        bool ppp_up = modem_ppp_is_connected();
+
+        if (ppp_up && s_mqtt_connected) {
+            const char *ip = modem_ppp_get_ip();
             snprintf(layer_ip, sizeof(layer_ip),
                      "role:%s IP:%s ppp:%d",
                      g_config.role == DEVICE_ROLE_SLAVE ? "node" : "root",
                      ip,
-                     modem_ppp_is_connected() ? 1 : 0);
-            esp_mqtt_client_publish(g_mqtt_client, s_layer_topic, layer_ip, 0, 1, 0);
+                     ppp_up ? 1 : 0);
+            esp_mqtt_client_publish(g_mqtt_client, s_layer_topic,
+                                    layer_ip, 0, 1, 0);
             mqtt_build_json(json, MQTT_JSON_BUFFER_SIZE);
             if (wifi_mqtt_publish(json) == ESP_OK) {
                 s_publish_fail_count = 0;
@@ -403,20 +516,49 @@ static void mqtt_watchdog_task(void *arg)
         int32_t since = (int32_t)(now_tick - s_last_event_time);
         if (since < 0) since = 0;
 
+        extern bool modem_ppp_is_connected(void);
+        bool ppp_up = modem_ppp_is_connected();
+
         if (s_mqtt_connected) {
             if (since > MQTT_STUCK_TIMEOUT_MS) {
                 ESP_LOGW(TAG, "MQTT stuck (no events %ld ms) → restart",
                          (long)since);
-                wifi_mqtt_restart();
+                if (ppp_up) {
+                    wifi_mqtt_restart();
+                } else {
+                    ESP_LOGW(TAG, "MQTT stuck but PPP down → skip restart");
+                }
                 s_last_event_time = xTaskGetTickCount();
             }
         } else {
             uint32_t down_ms = wifi_mqtt_get_down_ms();
-            if (down_ms > MQTT_DOWN_RESTART_MS) {
+
+            if (!ppp_up) {
+                if (down_ms > MQTT_FORCE_MODEM_MS) {
+                    ESP_LOGE(TAG, "MQTT down %lu ms + PPP down → "
+                                  "force restart modem",
+                             (unsigned long)down_ms);
+                    wifi_mqtt_force_restart_modem();
+                    mqtt_set_down_since((uint32_t)(esp_timer_get_time() / 1000));
+                    s_last_event_time = xTaskGetTickCount();
+                } else {
+                    ESP_LOGD(TAG, "MQTT down %lu ms, PPP down → "
+                                  "wait modem_retry", (unsigned long)down_ms);
+                }
+                continue;
+            }
+
+            if (down_ms > MQTT_FORCE_MODEM_MS) {
                 ESP_LOGE(TAG, "MQTT down %lu ms (> %d) → force restart modem",
-                         (unsigned long)down_ms, MQTT_DOWN_RESTART_MS);
+                         (unsigned long)down_ms, MQTT_FORCE_MODEM_MS);
                 wifi_mqtt_force_restart_modem();
                 mqtt_set_down_since((uint32_t)(esp_timer_get_time() / 1000));
+                s_last_event_time = xTaskGetTickCount();
+            } else if (down_ms > MQTT_DOWN_RESTART_MS) {
+                ESP_LOGW(TAG, "MQTT down %lu ms (> %d) → "
+                              "wifi_mqtt_restart() (fast)",
+                         (unsigned long)down_ms, MQTT_DOWN_RESTART_MS);
+                wifi_mqtt_restart();
                 s_last_event_time = xTaskGetTickCount();
             } else if (since > MQTT_STUCK_TIMEOUT_MS) {
                 ESP_LOGW(TAG, "MQTT down %ld ms → wifi_mqtt_restart()",
@@ -434,11 +576,26 @@ esp_err_t wifi_mqtt_init(void)
         ESP_LOGI(TAG, "wifi_mqtt_init: NODE — MQTT disabled");
         return ESP_OK;
     }
+
+    extern bool modem_ppp_is_connected(void);
+    if (!modem_ppp_is_connected()) {
+        ESP_LOGW(TAG, "wifi_mqtt_init: no PPP IP yet → defer");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     wifi_mqtt_load_config();
     build_topics();
     wifi_mqtt_restart();
-    xTaskCreate(mqtt_publish_task, "mqtt_pub", 8192, NULL, 4, NULL);
-    xTaskCreate(mqtt_watchdog_task, "mqtt_wd", 4096, NULL, 3, NULL);
+
+    if (!s_mqtt_tasks_started) {
+        s_mqtt_tasks_started = true;
+        xTaskCreate(mqtt_publish_task, "mqtt_pub", 8192, NULL, 4, NULL);
+        xTaskCreate(mqtt_watchdog_task, "mqtt_wd", 4096, NULL, 3, NULL);
+        ESP_LOGI(TAG, "wifi_mqtt: tasks created (mqtt_pub + mqtt_wd)");
+    } else {
+        ESP_LOGI(TAG, "wifi_mqtt: tasks already running, skip");
+    }
+
     return ESP_OK;
 }
 
@@ -451,6 +608,62 @@ void wifi_mqtt_stop(void)
     }
     s_mqtt_connected = false;
     mqtt_json_accum_reset();
+}
+
+void wifi_mqtt_publish_comm_lost(uint32_t lost_ms)
+{
+    if (!s_mqtt_connected || !g_mqtt_client) {
+        ESP_LOGW(TAG, "publish_comm_lost: MQTT not connected");
+        return;
+    }
+    char msg[256];
+    int n = snprintf(msg, sizeof(msg),
+        "{\"error\":\"comm_lost\","
+        "\"role\":\"%s\","
+        "\"lost_ms\":%lu,"
+        "\"channels\":\"ALL_OFF\","
+        "\"action\":\"recovering\"}",
+        g_config.role == DEVICE_ROLE_MASTER ? "root" : "node",
+        (unsigned long)lost_ms);
+    if (n > 0) {
+        int id = esp_mqtt_client_publish(g_mqtt_client, s_topic,
+                                         msg, n, 1, 0);
+        ESP_LOGW(TAG, "COMM_LOST published (id=%d): %s", id, msg);
+    }
+}
+
+void wifi_mqtt_publish_comm_restored(void)
+{
+    if (!s_mqtt_connected || !g_mqtt_client) return;
+    char msg[192];
+    int n = snprintf(msg, sizeof(msg),
+        "{\"status\":\"comm_restored\","
+        "\"role\":\"%s\","
+        "\"action\":\"start_with_red\"}",
+        g_config.role == DEVICE_ROLE_MASTER ? "root" : "node");
+    if (n > 0) {
+        esp_mqtt_client_publish(g_mqtt_client, s_topic, msg, n, 1, 0);
+        ESP_LOGI(TAG, "COMM_RESTORED published: %s", msg);
+    }
+}
+
+/* === FIX ROOT-START-DELAY ===
+   Публикация в <base>/Set: {"root_start_delay_ms": 5000}
+   Действует сразу (root_wd читает g_config в момент вызова),
+   сохраняется в NVS через config_save(). */
+void mqtt_cmd_root_start_delay(const char *payload, int len)
+{
+    cJSON *root = cJSON_ParseWithLength(payload, len);
+    if (!root) return;
+    const cJSON *v = cJSON_GetObjectItemCaseSensitive(root, "root_start_delay_ms");
+    if (cJSON_IsNumber(v)) {
+        int d = v->valueint;
+        if (d < 0 || d > 60000) d = 2000;
+        g_config.root_start_delay_ms = (uint32_t)d;
+        config_save();
+        ESP_LOGI(TAG, "root_start_delay_ms = %d (saved)", d);
+    }
+    cJSON_Delete(root);
 }
 
 bool wifi_mqtt_is_connected(void) { return s_mqtt_connected; }

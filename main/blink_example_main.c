@@ -45,7 +45,6 @@
 #include "ble_transport.h"
 #include "sync_config.h"
 #include "modem_ppp.h"
-#include "can_bus.h"
 
 extern const uint8_t config_json_start[] asm("_binary_config_json_start");
 extern const uint8_t config_json_end[]   asm("_binary_config_json_end");
@@ -194,32 +193,25 @@ static void on_got_ip(void *arg, esp_event_base_t base,
     static bool sntp_started = false;
     if (g_config.role != DEVICE_ROLE_MASTER) return;
 
-    if (id == IP_EVENT_STA_GOT_IP) {
-        esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        if (sta_netif) {
-            esp_netif_set_default_netif(sta_netif);
-            ESP_LOGI(TAG, "Default netif → WiFi STA");
-        }
-    } else if (id == IP_EVENT_PPP_GOT_IP && !wifi_sta_has_ip()) {
+    /* Обработчик modem_ppp тоже ловит это событие — он обновит
+       s_connected под mutex. Небольшая задержка гарантирует, что
+       modem_ppp_is_connected() уже вернёт true. */
+    if (!sntp_started) {
         esp_netif_t *ppp_netif = modem_ppp_get_netif();
         if (ppp_netif) {
             esp_netif_set_default_netif(ppp_netif);
-            ESP_LOGI(TAG, "Default netif → PPPoS");
         }
-    }
-
-    if (!sntp_started) {
         time_sync_start_sntp();
         sntp_started = true;
     }
 
-    if (!wifi_mqtt_is_connected()) {
-        for (int i = 0; i < 5; i++) {
+   // if (!wifi_mqtt_is_connected()) {
+     //   for (int i = 0; i < 5; i++) {
             esp_err_t err = wifi_mqtt_init();
-            if (err == ESP_OK) break;
+           // if (err == ESP_OK) break;
             vTaskDelay(pdMS_TO_TICKS(100));
-        }
-    }
+      //  }
+   // }
 }
 
 /* ============================================================
@@ -556,13 +548,13 @@ void app_main(void)
     buttons_start_tasks();
 
     /* --- WiFi: AP всегда + STA (если creds) --- */
-   // wifi_init();
-  //  wifi_bringup(is_root);
+  //  wifi_init();
+   // wifi_bringup(is_root);
 
     /* --- BLE (для настройки через телефон) --- */
     /* BLE disabled — config via WiFi AP */
 //#if USE_BLE
-  /*  esp_err_t ble_err = fsu_ble_init();
+ /*   esp_err_t ble_err = fsu_ble_init();
     if (ble_err == ESP_ERR_NOT_SUPPORTED) {
     ESP_LOGW(TAG, "BLE disabled (CONFIG_BT_ENABLED=n) — config via WiFi AP 192.168.4.1");
 } else if (ble_err != ESP_OK) {
@@ -573,15 +565,6 @@ void app_main(void)
 /*#else
     ESP_LOGW(TAG, "BLE disabled (CONFIG_BT_ENABLED=n) — config via WiFi AP 192.168.4.1");
 #endif*/
-
- esp_err_t can_err= can_bus_init(500000);
- if (can_err != ESP_OK) {
-        ESP_LOGW(TAG, "CAN init failed: %s", esp_err_to_name(can_err));
-    }
-can_err= can_bus_start();
-if (can_err != ESP_OK) {
-        ESP_LOGW(TAG, "CAN start failed: %s", esp_err_to_name(can_err));
-    }
 
     /* --- RS485/CAN transport + протокол --- */
     connectivity_register_rs485_can();

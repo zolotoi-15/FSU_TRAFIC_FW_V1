@@ -14,8 +14,8 @@
 
   "mqtt": {
   "enabled": true,
-  "uri": "mqtts://mqtt.xologie.ru",
-  "port": 8883,
+  "uri": "mqtt://mqtt.xologie.ru",
+  "port": 1883,
   "user": "LS2024",
   "password": "Zavulon56",
   "base_topic": "FSU_Trafic",
