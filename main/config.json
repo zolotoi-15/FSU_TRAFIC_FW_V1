@@ -13,14 +13,14 @@
   "timezone": "MSK-3",
 
   "mqtt": {
-    "enabled": true,
-    "uri": "mqtt://mqtt.xologie.ru",
-    "port": 1883,
-    "user": "LS2024",
-    "password": "Zavulon56",
-    "base_topic": "FSU_Trafic",
-    "timepause_min": 5
-  },
+  "enabled": true,
+  "uri": "mqtts://mqtt.xologie.ru",
+  "port": 8883,
+  "user": "LS2024",
+  "password": "Zavulon56",
+  "base_topic": "FSU_Trafic",
+  "timepause_min": 5
+},
 
   "traffic": {
     "mode": 3,
